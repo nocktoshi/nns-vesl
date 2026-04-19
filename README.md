@@ -47,7 +47,7 @@ settlement. Split of authority:
   rules directly; no graft involvement, no STARK per registration:
     - **C1 — format**: stem is non-empty, `[a-z0-9]+.nock`.
     - **C2 — fee adequacy**: declared fee ≥ the tier for the stem's
-      length (`5000 / 500 / 100` nicks, matching the legacy worker).
+      length (`5000 / 500 / 100` $NOCK, matching the legacy worker).
     - **C3 — name uniqueness**: `name` must not already be in
       `names`. On duplicate the kernel emits `[%claim-error 'name
       already registered']` without mutating state; the hull turns
