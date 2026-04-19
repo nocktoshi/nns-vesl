@@ -1,0 +1,17 @@
+# nns-vesl configuration.
+# Environment variables override these; CLI flags override everything.
+
+nock_home = "../nockchain"
+
+# Hull HTTP API port (default: 3000)
+# api_port = 3000
+
+# --- Settlement mode ---
+# v1 runs in local: kernel verifies, no chain interaction.
+# Flip to "fakenet" or "dumbnet" to enable chain posting (requires chain_endpoint + key).
+settlement_mode = "local"
+
+# --- Chain settings (fakenet/dumbnet only) ---
+# chain_endpoint = "http://localhost:9090"
+# tx_fee = 256
+# accept_timeout_secs = 300

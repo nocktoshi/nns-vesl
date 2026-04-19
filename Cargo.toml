@@ -1,0 +1,40 @@
+[package]
+name = "nns-vesl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nns-vesl"
+path = "src/main.rs"
+
+[lib]
+name = "nns_vesl"
+path = "src/lib.rs"
+
+[dependencies]
+# NockVM — sibling clone at ~/nockchain
+nockapp = { path = "../nockchain/crates/nockapp", default-features = false }
+nockvm = { path = "../nockchain/crates/nockvm/rust/nockvm" }
+nockvm_macros = { path = "../nockchain/crates/nockvm/rust/nockvm_macros" }
+
+# Vesl SDK — sibling clone at ~/vesl
+vesl-core = { path = "../vesl/crates/vesl-core" }
+nock-noun-rs = { path = "../vesl/crates/nock-noun-rs" }
+nockchain-tip5-rs = { path = "../vesl/crates/nockchain-tip5-rs" }
+
+tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+anyhow = "1.0"
+thiserror = "1.0"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.6", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+tempfile = "3"
