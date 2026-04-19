@@ -6,6 +6,37 @@ NNS — the Nockchain Name Service. On-chain `.nock` name registrar,
 ported from the centralized Cloudflare Worker at `api.nocknames.com`
 to a Vesl-grafted NockApp.
 
+## Quick start
+
+```bash
+# 1. compile the kernel (writes out.jam alongside it)
+hoonc --new hoon/app/app.hoon hoon/
+
+# 2. build the hull
+cargo +nightly build --release
+
+# 3. run
+./target/release/nns-vesl
+```
+
+Once started:
+
+```bash
+curl -X POST http://127.0.0.1:3000/register \
+  -H 'content-type: application/json' \
+  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
+
+curl -X POST http://127.0.0.1:3000/claim \
+  -H 'content-type: application/json' \
+  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
+
+curl http://127.0.0.1:3000/resolve?name=nns.nock
+curl http://127.0.0.1:3000/resolve?address=8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5
+curl http://127.0.0.1:3000/status
+```
+
+## Implementation
+
 This follows the `data-registry` pattern from the Vesl templates: a
 small kernel holding the authoritative registry
 (`names=(map @t [owner tx-hash])`, `tx-hashes=(set @t)`, and
@@ -233,34 +264,6 @@ flip for no settlement benefit.
   (Paths are configurable via `Cargo.toml` — see "Moving the repo" below.)
 - `hoonc` on PATH (bundled in the nockchain clone; `cargo install --path
   .../nockchain/crates/hoonc` if needed).
-
-## Quick start
-
-```bash
-# 1. compile the kernel (writes out.jam alongside it)
-hoonc --new hoon/app/app.hoon hoon/
-
-# 2. build the hull
-cargo +nightly build --release
-
-# 3. run
-./target/release/nns-vesl
-```
-
-Once started:
-
-```bash
-curl -X POST http://127.0.0.1:3000/register \
-  -H 'content-type: application/json' \
-  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
-
-curl -X POST http://127.0.0.1:3000/claim \
-  -H 'content-type: application/json' \
-  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
-
-curl http://127.0.0.1:3000/resolve?name=nns.nock
-curl http://127.0.0.1:3000/status
-```
 
 ## HTTP API
 
