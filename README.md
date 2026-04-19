@@ -1,6 +1,6 @@
 # nns-vesl
 
-NNS — the `.nock` Name Service. On-kernel `.nock` name registrar,
+NNS — the Nockchain Name Service. On-kernel `.nock` name registrar,
 ported from the centralized Cloudflare Worker at `~/nock-names-worker`
 to a Vesl-grafted NockApp.
 
