@@ -1,6 +1,6 @@
 # nns-vesl
 
-<img width="1616" height="640" alt="NNS - Nockchain Name Service" src="https://github.com/user-attachments/assets/7793ed6f-766a-4e93-a2b4-834c04843c37" /> <br />
+<img width="1416" height="540" alt="NNS - Nockchain Name Service" src="https://github.com/user-attachments/assets/7793ed6f-766a-4e93-a2b4-834c04843c37" /> <br />
 
 NNS — the Nockchain Name Service. On-chain `.nock` name registrar,
 ported from the centralized Cloudflare Worker at `api.nocknames.com`
