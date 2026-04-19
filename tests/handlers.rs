@@ -896,3 +896,343 @@ async fn set_primary_rejects_unknown_name() {
         "expected 'name not registered', got: {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GET /proof
+// ---------------------------------------------------------------------------
+
+async fn register_and_claim(router: axum::Router, addr: &str, name: &str) {
+    let (s, _) = request_json(
+        router.clone(),
+        "POST",
+        "/register",
+        Some(&format!(r#"{{"address":"{addr}","name":"{name}"}}"#)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = request_json(
+        router,
+        "POST",
+        "/claim",
+        Some(&format!(r#"{{"address":"{addr}","name":"{name}"}}"#)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn proof_returns_full_bundle_for_registered_name() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    register_and_claim(router.clone(), ADDR1, "proof1.nock").await;
+
+    let (status, body) = request_json(router.clone(), "GET", "/proof?name=proof1.nock", None).await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+
+    assert_eq!(body["name"], "proof1.nock");
+    assert_eq!(body["owner"], ADDR1);
+    assert!(
+        body["txHash"].as_str().unwrap().starts_with("stub-"),
+        "txHash should be the stub payment id: {body}"
+    );
+    assert!(
+        body["claim_id"].as_u64().unwrap() >= 1,
+        "claim_id must be bumped: {body}"
+    );
+    assert!(
+        !body["root"].as_str().unwrap().is_empty(),
+        "root hex must be non-empty"
+    );
+    assert!(
+        !body["hull"].as_str().unwrap().is_empty(),
+        "hull hex must be non-empty"
+    );
+    // Single-leaf tree: proof is trivially empty (leaf IS the root).
+    assert_eq!(
+        body["proof"].as_array().map(|a| a.len()),
+        Some(0),
+        "one leaf -> empty proof: {body}"
+    );
+
+    // Cross-check: /snapshot's root must match /proof's root — both
+    // read the same kernel state.
+    let (_, snap) = request_json(router.clone(), "GET", "/snapshot", None).await;
+    assert_eq!(
+        snap["root"], body["root"],
+        "snapshot root should match proof root"
+    );
+}
+
+#[tokio::test]
+async fn proof_contains_sibling_chain_for_multi_leaf_tree() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    for name in ["p1.nock", "p2.nock", "p3.nock", "p4.nock"] {
+        register_and_claim(router.clone(), ADDR1, name).await;
+    }
+
+    let (status, body) = request_json(router.clone(), "GET", "/proof?name=p2.nock", None).await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+
+    let proof = body["proof"].as_array().unwrap();
+    // 4-leaf tree -> depth-2 proof (2 siblings).
+    assert_eq!(proof.len(), 2, "4-leaf tree has 2-step proof: {body}");
+    for node in proof {
+        assert!(!node["hash"].as_str().unwrap().is_empty());
+        let side = node["side"].as_str().unwrap();
+        assert!(side == "left" || side == "right", "got side={side}");
+    }
+}
+
+#[tokio::test]
+async fn proof_404s_for_unregistered_name() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    register_and_claim(router.clone(), ADDR1, "exists.nock").await;
+
+    let (status, body) = request_json(router.clone(), "GET", "/proof?name=nope.nock", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got: {body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("not registered"));
+}
+
+#[tokio::test]
+async fn proof_404s_when_address_does_not_match_owner() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    register_and_claim(router.clone(), ADDR1, "mine.nock").await;
+
+    // Right name, wrong owner -> 404 (we don't leak ownership to
+    // callers who didn't know the pair).
+    let (status, body) = request_json(
+        router.clone(),
+        "GET",
+        &format!("/proof?name=mine.nock&address={ADDR2}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got: {body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not own"));
+
+    // Matching address -> 200.
+    let (status, body) = request_json(
+        router.clone(),
+        "GET",
+        &format!("/proof?name=mine.nock&address={ADDR1}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert_eq!(body["owner"], ADDR1);
+}
+
+#[tokio::test]
+async fn proof_rejects_invalid_inputs() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, _) = request_json(router.clone(), "GET", "/proof", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = request_json(router.clone(), "GET", "/proof?name=Foo.nock", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = request_json(
+        router.clone(),
+        "GET",
+        "/proof?name=ok.nock&address=short",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end verify-chunk walk
+//
+// Confirms that the bundle `/proof` hands out is bit-compatible with a
+// Rust-side reimplementation of the same Hoon `verify-chunk` logic:
+//
+//   1. chunk = jam([name owner tx-hash])          (nock_noun_rs)
+//   2. cur   = hash-leaf(chunk)                   (nockchain_tip5_rs)
+//   3. for each proof node: cur = hash-pair(...)
+//   4. assert cur == root
+//
+// If this test starts failing, either the wire encoding drifted or the
+// Hoon / Rust tip5 ports diverged — both are load-bearing for any
+// client-side verifier we ship.
+// ---------------------------------------------------------------------------
+
+use nock_noun_rs::{jam_to_bytes, make_cord, new_stack, T as TupleIn};
+use nockchain_tip5_rs::{
+    verify_proof, ProofNode as Tip5ProofNode, Tip5Hash,
+};
+
+/// Goldilocks prime. Same constant `nockchain_math::belt::PRIME` uses;
+/// hard-coded here to keep the test free of an extra path dep.
+const GOLDILOCKS_PRIME: u64 = 18_446_744_069_414_584_321;
+
+/// Decode a lowercase hex string to LE bytes. Panics on malformed input
+/// — fine for test use against `state::hex_encode`'s output.
+fn hex_decode(s: &str) -> Vec<u8> {
+    assert!(s.len() % 2 == 0, "hex length must be even");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+        .collect()
+}
+
+/// Inverse of `nockchain_tip5_rs::tip5_to_atom_le_bytes`.
+///
+/// The forward direction is a base-PRIME Horner expansion
+/// `limb[0] + limb[1]*P + limb[2]*P^2 + ...`, emitted as LE atom bytes.
+/// We recover the limbs by repeated long-division (base 256) of that
+/// byte vector by PRIME and taking remainders.
+fn le_bytes_to_tip5(bytes: &[u8]) -> Tip5Hash {
+    let mut n: Vec<u8> = bytes.to_vec();
+    while n.last() == Some(&0) {
+        n.pop();
+    }
+
+    let mut limbs: Tip5Hash = [0u64; 5];
+    for limb in limbs.iter_mut() {
+        if n.is_empty() {
+            break;
+        }
+        // Long-divide n (LE byte integer) by PRIME.
+        //   rem <= PRIME - 1 < 2^64, so (rem << 8) | byte fits in u128
+        //   (max ~2^72), and the quotient byte ≤ 2^72 / PRIME < 2^8.
+        let mut rem: u128 = 0;
+        let mut quot = vec![0u8; n.len()];
+        for i in (0..n.len()).rev() {
+            let v = (rem << 8) | (n[i] as u128);
+            quot[i] = (v / GOLDILOCKS_PRIME as u128) as u8;
+            rem = v % GOLDILOCKS_PRIME as u128;
+        }
+        *limb = rem as u64;
+        while quot.last() == Some(&0) {
+            quot.pop();
+        }
+        n = quot;
+    }
+    limbs
+}
+
+/// Compute `jam([name owner tx-hash])` — the exact leaf-chunk bytes
+/// the kernel's `+leaf-chunk` produces and `+hash-leaf` absorbs.
+fn jam_leaf(name: &str, owner: &str, tx_hash: &str) -> Vec<u8> {
+    let mut stack = new_stack();
+    let n = make_cord(&mut stack, name);
+    let o = make_cord(&mut stack, owner);
+    let t = make_cord(&mut stack, tx_hash);
+    let triple = TupleIn(&mut stack, &[n, o, t]);
+    jam_to_bytes(&mut stack, triple)
+}
+
+#[tokio::test]
+async fn le_bytes_to_tip5_is_inverse_of_tip5_to_atom_le_bytes() {
+    // Round-trip sanity check: hash a few fixed inputs, encode with the
+    // crate's forward function, decode with ours, and confirm we got
+    // the original back. This keeps the inverse honest independent of
+    // the kernel so failures in the big end-to-end test localize.
+    use nockchain_tip5_rs::{hash_leaf, tip5_to_atom_le_bytes};
+    for data in [&b"alpha"[..], b"bravo.nock", b"", b"\x00\x01\x02\x03\x04\x05\x06\x07"] {
+        let h = hash_leaf(data);
+        let bytes = tip5_to_atom_le_bytes(&h);
+        let roundtrip = le_bytes_to_tip5(&bytes);
+        assert_eq!(
+            roundtrip, h,
+            "round-trip failed for {data:?}: {h:?} -> {bytes:?} -> {roundtrip:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proof_verifies_end_to_end_against_tip5() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    // Multi-leaf tree so the proof has a non-trivial sibling chain
+    // — a 1-leaf tree would make verification vacuous.
+    for name in ["v1.nock", "v2.nock", "v3.nock", "v4.nock", "v5.nock"] {
+        register_and_claim(router.clone(), ADDR1, name).await;
+    }
+
+    let (status, body) = request_json(router.clone(), "GET", "/proof?name=v3.nock", None).await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+
+    let name = body["name"].as_str().unwrap();
+    let owner = body["owner"].as_str().unwrap();
+    let tx_hash = body["txHash"].as_str().unwrap();
+    let root_hex = body["root"].as_str().unwrap();
+
+    // Server hands us the root + every sibling as hex LE atom bytes
+    // (output of `digest-to-atom:tip5`). Invert that to Tip5Hash form
+    // so we can feed it to nockchain_tip5_rs::verify_proof.
+    let root: Tip5Hash = le_bytes_to_tip5(&hex_decode(root_hex));
+    let proof_nodes: Vec<Tip5ProofNode> = body["proof"]
+        .as_array()
+        .expect("proof must be an array")
+        .iter()
+        .map(|n| {
+            let hash = le_bytes_to_tip5(&hex_decode(n["hash"].as_str().unwrap()));
+            let side = n["side"].as_str().unwrap() == "left";
+            Tip5ProofNode { hash, side }
+        })
+        .collect();
+
+    // 5 leaves -> tree depth 3 (padded to 8 at level 0).
+    assert_eq!(proof_nodes.len(), 3, "5-leaf tree has depth-3 proof");
+
+    // Reconstruct the leaf preimage = jam([name owner tx-hash]).
+    // This must byte-match what the kernel's +leaf-chunk produces,
+    // since tip5 hash-leaf ingests these bytes directly.
+    let leaf = jam_leaf(name, owner, tx_hash);
+
+    // Happy path: server proof + server root + correct triple verifies.
+    assert!(
+        verify_proof(&leaf, &proof_nodes, &root),
+        "end-to-end verify-chunk walk rejected a proof the server handed us — \
+         wire encoding or tip5 port has drifted from the Hoon kernel"
+    );
+
+    // Tampered leaf: same proof + same root, but wrong owner.
+    let bad_owner_leaf = jam_leaf(name, ADDR2, tx_hash);
+    assert!(
+        !verify_proof(&bad_owner_leaf, &proof_nodes, &root),
+        "leaf with forged owner must not verify"
+    );
+
+    // Tampered leaf: wrong tx_hash.
+    let bad_tx_leaf = jam_leaf(name, owner, "stub-forged-tx");
+    assert!(
+        !verify_proof(&bad_tx_leaf, &proof_nodes, &root),
+        "leaf with forged tx-hash must not verify"
+    );
+
+    // Tampered root: legitimate leaf + proof, but nudged root.
+    let mut bad_root = root;
+    bad_root[0] = bad_root[0].wrapping_add(1);
+    assert!(
+        !verify_proof(&leaf, &proof_nodes, &bad_root),
+        "nudged root must not verify"
+    );
+
+    // Tampered proof: flipping a sibling's side swaps hash-pair order
+    // and must break the walk.
+    let mut bad_proof = proof_nodes.clone();
+    bad_proof[0].side = !bad_proof[0].side;
+    assert!(
+        !verify_proof(&leaf, &bad_proof, &root),
+        "proof with a flipped side must not verify"
+    );
+}

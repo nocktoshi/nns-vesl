@@ -129,6 +129,63 @@ pub struct SettleResponse {
     pub note_id: String,
 }
 
+/// One sibling node in a Merkle inclusion proof.
+///
+/// `side` is a string — `"left"` or `"right"` — describing where
+/// the sibling hash sits relative to the running hash during
+/// verification. This matches the Hoon-side convention in
+/// `hoon/lib/vesl-merkle.hoon::verify-chunk`:
+///
+///   - `"left"`  (Hoon `%.y`): compute `hash-pair(sibling, cur)`
+///   - `"right"` (Hoon `%.n`): compute `hash-pair(cur, sibling)`
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofNodeView {
+    /// Hex-encoded little-endian sibling hash bytes.
+    pub hash: String,
+    pub side: ProofSide,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProofSide {
+    Left,
+    Right,
+}
+
+/// `GET /proof?name=...` success body. Everything a client needs
+/// to independently verify that `(name, owner, txHash)` is a row
+/// at the committed Merkle `root`:
+///
+/// 1. Compute `chunk = jam([name owner txHash])` (Hoon `+jam` on the
+///    tuple — Rust port in `nock_noun_rs`).
+/// 2. Run `verify-chunk(chunk, proof, root)` from
+///    `hoon/lib/vesl-merkle.hoon` (tip5 primitives `hash-leaf` and
+///    `hash-pair`).
+///
+/// `claim_id` is the kernel's `claim-id` counter at the time the
+/// row was written; `hull` is the current commitment hull-id. Both
+/// are included so a client can cross-reference the graft's
+/// `registered` map to establish which commitment the row lives in.
+///
+/// Caveat: this endpoint only attests Merkle inclusion at the
+/// current `root` — not that `txHash` is unique in history (kernel
+/// `tx-hashes` set, trusted) nor that the root is a deterministic
+/// result of honest claims (see README "Proof scope").
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofResponse {
+    pub name: String,
+    pub owner: String,
+    #[serde(rename = "txHash")]
+    pub tx_hash: String,
+    pub claim_id: u64,
+    /// Hex-encoded Merkle root the proof verifies against.
+    pub root: String,
+    /// Hex-encoded hull-id this root was committed under.
+    pub hull: String,
+    /// Sibling chain from leaf to root, leaf-first.
+    pub proof: Vec<ProofNodeView>,
+}
+
 /// `GET /pending-batch` success body.
 ///
 /// Preview of what the next `POST /settle` would bundle, without

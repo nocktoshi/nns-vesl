@@ -16,6 +16,8 @@
 //!   GET  /pending         list all pending reservations, newest first
 //!   GET  /verified        list all registered, newest first
 //!   GET  /resolve         ?name=... or ?address=...   (address -> primary)
+//!   GET  /proof           ?name=... [&address=...] — Merkle inclusion
+//!                         bundle for (name, owner, txHash) at current root
 //!   GET  /search          ?name=<label> or ?address=...
 //!   GET  /health          liveness
 //!   GET  /status          diagnostic
@@ -60,17 +62,18 @@ async fn poke_with_timeout(
 
 
 use crate::kernel::{
-    build_claim_poke, build_last_settled_peek, build_pending_batch_peek, build_set_primary_poke,
-    build_settle_batch_poke, build_snapshot_peek, decode_last_settled, decode_pending_batch,
-    decode_snapshot, first_batch_settled, first_claim_id_bumped, first_error_message,
-    first_primary_set, first_vesl_settled, has_effect,
+    build_claim_poke, build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
+    build_proof_peek, build_set_primary_poke, build_settle_batch_poke, build_snapshot_peek,
+    decode_last_settled, decode_owner, decode_pending_batch, decode_proof, decode_snapshot,
+    first_batch_settled, first_claim_id_bumped, first_error_message, first_primary_set,
+    first_vesl_settled, has_effect,
 };
 use crate::payment;
 use crate::state::{hex_encode, SharedState};
 use crate::types::{
-    ClaimRequest, ClaimResponse, PendingBatchResponse, RegisterRequest, Registration,
-    RegistrationStatus, SearchByAddressResponse, SearchByNameResponse, SearchStatus,
-    SetPrimaryRequest, SetPrimaryResponse, SettleResponse,
+    ClaimRequest, ClaimResponse, PendingBatchResponse, ProofNodeView, ProofResponse, ProofSide,
+    RegisterRequest, Registration, RegistrationStatus, SearchByAddressResponse,
+    SearchByNameResponse, SearchStatus, SetPrimaryRequest, SetPrimaryResponse, SettleResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +151,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/pending", get(pending_handler))
         .route("/verified", get(verified_handler))
         .route("/resolve", get(resolve_handler))
+        .route("/proof", get(proof_handler))
         .route("/search", get(search_handler))
         .layer(cors)
         .with_state(state)
@@ -588,6 +592,130 @@ async fn resolve_handler(
     }
 }
 
+/// `GET /proof?name=<name>[&address=<addr>]`
+///
+/// Returns a Merkle inclusion bundle that lets a client verify
+/// off-server that `(name, owner, tx-hash)` is a row in the kernel
+/// registry at the current commitment `root`.
+///
+/// Response body (see `ProofResponse`):
+///
+/// ```json
+/// {
+///   "name": "foo.nock",
+///   "owner": "<address>",
+///   "txHash": "<tx>",
+///   "claim_id": 7,
+///   "root": "<hex>",
+///   "hull": "<hex>",
+///   "proof": [ { "hash": "<hex>", "side": "left" | "right" }, ... ]
+/// }
+/// ```
+///
+/// Verification recipe (same check `nns-gate` G2 performs inside
+/// the STARK, but done client-side here):
+///
+///   1. `chunk = jam([name owner tx-hash])`.
+///   2. Walk `proof` with `hash-leaf` / `hash-pair` (tip5).
+///   3. Accept iff the result equals `root`.
+///
+/// If `address` is supplied and doesn't match the stored owner we
+/// return 404 ("address does not own this name") — same status as
+/// an unregistered name, so the endpoint doesn't leak ownership
+/// data to a caller who didn't know the right pair up front.
+///
+/// 404s on any kernel peek-miss (unregistered name, empty registry).
+async fn proof_handler(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ProofResponse>, (StatusCode, Json<ErrorBody>)> {
+    let name = params
+        .get("name")
+        .ok_or_else(|| bad_request("missing name parameter"))?
+        .trim()
+        .to_string();
+    if !is_valid_name(&name) {
+        return Err(bad_request("invalid name"));
+    }
+    let expected_address = match params.get("address") {
+        Some(a) if !a.is_empty() => {
+            if !is_valid_address(a) {
+                return Err(bad_request("invalid address"));
+            }
+            Some(a.trim().to_string())
+        }
+        _ => None,
+    };
+
+    let mut st = state.lock().await;
+
+    // Three peeks under one mutex guard — nothing else can mutate
+    // the kernel in between, so `entry`, `proof`, and `snapshot` all
+    // observe the same `claim-id`.
+    let owner_slab = st
+        .app
+        .peek(build_owner_peek(&name))
+        .await
+        .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+    let entry = decode_owner(&owner_slab)
+        .map_err(|e| server_error(format!("owner decode failed: {e}")))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "name not registered".into(),
+                }),
+            )
+        })?;
+
+    if let Some(ref addr) = expected_address {
+        if &entry.owner != addr {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: "address does not own this name".into(),
+                }),
+            ));
+        }
+    }
+
+    let proof_slab = st
+        .app
+        .peek(build_proof_peek(&name))
+        .await
+        .map_err(|e| server_error(format!("proof peek failed: {e:?}")))?;
+    let proof = decode_proof(&proof_slab)
+        .map_err(|e| server_error(format!("proof decode failed: {e}")))?;
+
+    let snap_slab = st
+        .app
+        .peek(build_snapshot_peek())
+        .await
+        .map_err(|e| server_error(format!("snapshot peek failed: {e:?}")))?;
+    let snap = decode_snapshot(&snap_slab)
+        .map_err(|e| server_error(format!("snapshot decode failed: {e}")))?;
+
+    Ok(Json(ProofResponse {
+        name,
+        owner: entry.owner,
+        tx_hash: entry.tx_hash,
+        claim_id: entry.claim_id,
+        root: hex_encode(&snap.root),
+        hull: hex_encode(&snap.hull),
+        proof: proof
+            .into_iter()
+            .map(|p| ProofNodeView {
+                hash: hex_encode(&p.hash),
+                side: if p.side {
+                    ProofSide::Left
+                } else {
+                    ProofSide::Right
+                },
+            })
+            .collect(),
+    }))
+}
+
 async fn search_handler(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
@@ -708,6 +836,7 @@ pub async fn serve(
     println!("  GET  /pending");
     println!("  GET  /verified");
     println!("  GET  /resolve?name=|address=");
+    println!("  GET  /proof?name=[&address=]");
     println!("  GET  /search?name=|address=");
     println!("  GET  /status");
     println!("  GET  /health");

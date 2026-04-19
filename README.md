@@ -285,6 +285,7 @@ open (`*`).
 | GET    | `/verified`              | All registered entries, newest first                  |
 | GET    | `/resolve?name=X`        | `{address}` or 404                                    |
 | GET    | `/resolve?address=X`     | `{name}` — the address's **primary** — or 404         |
+| GET    | `/proof?name=X[&address=Y]` | Merkle inclusion bundle `{name, owner, txHash, claim_id, root, hull, proof[]}` proving `(name, owner, txHash)` is a row at `root`. Optional `address` filter returns 404 on owner mismatch. |
 | GET    | `/search?name=X`         | `{name, price, status, owner?, registeredAt?}`        |
 | GET    | `/search?address=X`      | `{address, pending[], verified[], primary?}`          |
 | GET    | `/status`                | Diagnostic: counts, merkle root, settlement mode      |

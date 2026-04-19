@@ -137,10 +137,40 @@ pub fn build_last_settled_peek() -> NounSlab {
     single_tag_peek("last-settled")
 }
 
+/// Build a `/owner/<name>` peek path slab.
+///
+/// Kernel response: `[~ ~ (unit name-entry)]` where
+/// `name-entry = [owner=@t tx-hash=@t claim-id=@ud]`. The inner
+/// `(unit ...)` is `~` when the name is not in the registry.
+pub fn build_owner_peek(name: &str) -> NounSlab {
+    name_peek("owner", name)
+}
+
+/// Build a `/proof/<name>` peek path slab.
+///
+/// Kernel response: `[~ ~ (list [hash=@ side=?])]` where the list
+/// is the sibling-chain from the leaf for `name` up to the current
+/// Merkle root. Empty list means either:
+///   - the tree has a single leaf (proof is trivially empty), or
+///   - the name is not in the registry.
+/// Disambiguate by peeking `/owner/<name>` first.
+pub fn build_proof_peek(name: &str) -> NounSlab {
+    name_peek("proof", name)
+}
+
 fn single_tag_peek(tag_str: &str) -> NounSlab {
     let mut slab = NounSlab::new();
     let tag = make_tag_in(&mut slab, tag_str);
     let path = T(&mut slab, &[tag, D(0)]);
+    slab.set_root(path);
+    slab
+}
+
+fn name_peek(tag_str: &str, name: &str) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, tag_str);
+    let name_atom = make_cord_in(&mut slab, name);
+    let path = T(&mut slab, &[tag, name_atom, D(0)]);
     slab.set_root(path);
     slab
 }
@@ -216,6 +246,104 @@ pub fn decode_last_settled(result: &NounSlab) -> Result<u64, String> {
         .map_err(|_| "last-settled: expected atom".to_string())?
         .as_u64()
         .map_err(|_| "last-settled: overflows u64".to_string())
+}
+
+/// A row in the kernel's `names` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameEntry {
+    pub owner: String,
+    pub tx_hash: String,
+    pub claim_id: u64,
+}
+
+/// Decode the `[~ ~ (unit name-entry)]` peek result for
+/// `/owner/<name>`. Returns `Ok(None)` when the inner unit is `~`
+/// (the name is not registered).
+pub fn decode_owner(result: &NounSlab) -> Result<Option<NameEntry>, String> {
+    let inner = peek_unwrap_some(result)?;
+    // Inner is `(unit name-entry)`: atom 0 when missing, `[~ entry]`
+    // when present. `entry = [owner=@t tx-hash=@t claim-id=@ud]`.
+    if inner.as_atom().is_ok() {
+        return Ok(None);
+    }
+    let unit_cell = inner
+        .as_cell()
+        .map_err(|_| "owner: expected (unit entry) cell".to_string())?;
+    let entry = unit_cell.tail();
+    let entry_cell = entry
+        .as_cell()
+        .map_err(|_| "owner: entry not a cell".to_string())?;
+    let owner = atom_to_cord(entry_cell.head())?;
+    let rest = entry_cell
+        .tail()
+        .as_cell()
+        .map_err(|_| "owner: entry tail not a cell".to_string())?;
+    let tx_hash = atom_to_cord(rest.head())?;
+    let claim_id = rest
+        .tail()
+        .as_atom()
+        .map_err(|_| "owner: claim_id not an atom".to_string())?
+        .as_u64()
+        .map_err(|_| "owner: claim_id overflows u64".to_string())?;
+    Ok(Some(NameEntry {
+        owner,
+        tx_hash,
+        claim_id,
+    }))
+}
+
+/// A single sibling in a Merkle inclusion proof.
+///
+/// `side = true` means the sibling is on the **left** (matching
+/// Hoon's `%.y`): the verifier hashes as `hash-pair(sibling, cur)`.
+/// `side = false` means the sibling is on the **right** (Hoon's
+/// `%.n`): `hash-pair(cur, sibling)`. See `verify-chunk` in
+/// `hoon/lib/vesl-merkle.hoon`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofNode {
+    pub hash: Vec<u8>,
+    pub side: bool,
+}
+
+/// Decode the `[~ ~ (list [hash=@ side=?])]` peek result for
+/// `/proof/<name>`. An empty list is legitimate for a single-leaf
+/// registry; callers should cross-check `/owner/<name>` to tell a
+/// real empty proof from a missing name.
+pub fn decode_proof(result: &NounSlab) -> Result<Vec<ProofNode>, String> {
+    let inner = peek_unwrap_some(result)?;
+    let mut out = Vec::new();
+    let mut cur = inner;
+    loop {
+        if cur.as_atom().is_ok() {
+            // End of list (~).
+            break;
+        }
+        let cell = cur
+            .as_cell()
+            .map_err(|_| "proof: malformed list cell".to_string())?;
+        let node = cell
+            .head()
+            .as_cell()
+            .map_err(|_| "proof: node not a cell".to_string())?;
+        let hash = node
+            .head()
+            .as_atom()
+            .map_err(|_| "proof: hash not atom".to_string())?
+            .as_ne_bytes()
+            .to_vec();
+        let side_atom = node
+            .tail()
+            .as_atom()
+            .map_err(|_| "proof: side not atom".to_string())?;
+        // Hoon loobean: 0 = %.y (sibling LEFT), 1 = %.n (sibling RIGHT).
+        let side_val = side_atom
+            .as_u64()
+            .map_err(|_| "proof: side overflows u64".to_string())?;
+        let side = side_val == 0;
+        out.push(ProofNode { hash, side });
+        cur = cell.tail();
+    }
+    Ok(out)
 }
 
 // Strip the outer `(unit (unit *))` wrapping the kernel peek
