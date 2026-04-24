@@ -221,6 +221,29 @@ async fn register_handler(
         }
     }
 
+    // Mirror can be stale (e.g. if cache was cleared). Ask the kernel
+    // before creating a new pending reservation so register/claim stays
+    // consistent with kernel authority.
+    let owner_slab = st
+        .app
+        .peek(build_owner_peek(&name))
+        .await
+        .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+    if let Some(entry) =
+        decode_owner(&owner_slab).map_err(|e| server_error(format!("owner decode failed: {e}")))?
+    {
+        st.mirror.insert(Registration {
+            address: entry.owner,
+            name: name.clone(),
+            status: RegistrationStatus::Registered,
+            timestamp: now_millis(),
+            date: None,
+            tx_hash: Some(entry.tx_hash),
+        });
+        st.persist();
+        return Err(bad_request("Name already registered"));
+    }
+
     let now = now_millis();
     let reg = Registration {
         address: address.clone(),
@@ -582,7 +605,7 @@ async fn resolve_handler(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let st = state.lock().await;
+    let mut st = state.lock().await;
 
     if let Some(name) = params.get("name") {
         if !is_valid_name(name) {
@@ -595,10 +618,36 @@ async fn resolve_handler(
             .filter(|r| r.status == RegistrationStatus::Registered);
         match existing {
             Some(r) => Ok(Json(json!({ "address": r.address }))),
-            None => Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody { error: "not found".into() }),
-            )),
+            None => {
+                // Fallback to kernel authority when mirror is stale.
+                let owner_slab = st
+                    .app
+                    .peek(build_owner_peek(name))
+                    .await
+                    .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+                let entry = decode_owner(&owner_slab)
+                    .map_err(|e| server_error(format!("owner decode failed: {e}")))?;
+                match entry {
+                    Some(entry) => {
+                        st.mirror.insert(Registration {
+                            address: entry.owner.clone(),
+                            name: name.clone(),
+                            status: RegistrationStatus::Registered,
+                            timestamp: now_millis(),
+                            date: None,
+                            tx_hash: Some(entry.tx_hash),
+                        });
+                        st.persist();
+                        Ok(Json(json!({ "address": entry.owner })))
+                    }
+                    None => Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorBody {
+                            error: "not found".into(),
+                        }),
+                    )),
+                }
+            }
         }
     } else if let Some(address) = params.get("address") {
         if !is_valid_address(address) {

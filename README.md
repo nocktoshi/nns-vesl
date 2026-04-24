@@ -740,7 +740,7 @@ scripts/
 tests/
   handlers.rs               full HTTP integration tests
 vesl.toml                   settlement config
-Cargo.toml                  hybrid deps (nockchain core path + nockapp-grpc git + local ../vesl)
+Cargo.toml                  local path deps (../nockchain + ../vesl)
 out.jam                     compiled kernel (built by hoonc)
 ```
 

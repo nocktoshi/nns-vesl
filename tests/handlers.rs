@@ -322,10 +322,8 @@ async fn claim_without_tx_hash_is_allowed_in_local_mode() {
 /// The mirror's uniqueness check is a courtesy — the kernel is the
 /// actual gatekeeper. Clear the mirror mid-session, leave the kernel
 /// state intact, and retry the same name from a different owner: the
-/// kernel's %claim emits [%claim-error 'name already registered']
-/// without mutating state, and the hull surfaces that as 400 "Name
-/// already registered". This is the regression test for the silent
-/// re-registration bug.
+/// hull now peeks kernel ownership during `/register` and rejects the
+/// duplicate immediately, instead of reopening registration.
 #[tokio::test]
 async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
     let (_tmp, state) = setup().await;
@@ -361,21 +359,43 @@ async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
         Some(&format!(r#"{{"address":"{ADDR2}","name":"delta.nock"}}"#)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "mirror cleared: register reopens");
-
-    let (status, body) = request_json(
-        router.clone(),
-        "POST",
-        "/claim",
-        Some(&format!(r#"{{"address":"{ADDR2}","name":"delta.nock","txHash":"tx-delta-3"}}"#)),
-    )
-    .await;
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "kernel must reject duplicate: {body}"
+        "kernel-backed register check must reject duplicate"
     );
-    assert_eq!(body["error"], "Name already registered");
+}
+
+#[tokio::test]
+async fn resolve_by_name_falls_back_to_kernel_when_mirror_is_stale() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, _) = request_json(
+        router.clone(),
+        "POST",
+        "/register",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"echo.nock"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        router.clone(),
+        "POST",
+        "/claim",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"echo.nock","txHash":"tx-echo-1"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    {
+        let mut st = state.lock().await;
+        st.mirror.names.clear();
+    }
+
+    let (status, body) = request_json(router, "GET", "/resolve?name=echo.nock", None).await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert_eq!(body["address"], ADDR1);
 }
 
 /// Payment uniqueness: the kernel's `tx-hashes` set rejects a second

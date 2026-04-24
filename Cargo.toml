@@ -16,8 +16,7 @@ path = "src/lib.rs"
 nockapp = { path = "../nockchain/crates/nockapp", default-features = false }
 nockvm = { path = "../nockchain/crates/nockvm/rust/nockvm" }
 nockvm_macros = { path = "../nockchain/crates/nockvm/rust/nockvm_macros" }
-# Nockchain grpc client can come from git independently.
-nockapp-grpc = { git = "https://github.com/nockchain/nockchain.git", package = "nockapp-grpc" }
+nockapp-grpc = { path = "../nockchain/crates/nockapp-grpc" }
 
 # Vesl SDK — sibling clone at ~/vesl
 vesl-core = { path = "../vesl/crates/vesl-core" }
