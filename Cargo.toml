@@ -27,6 +27,7 @@ nockchain-tip5-rs = { path = "../vesl/crates/nockchain-tip5-rs" }
 nockchain-client-rs = { path = "../vesl/crates/nockchain-client-rs" }
 
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tonic = { version = "0.14", features = ["tls-webpki-roots"] }
 anyhow = "1.0"
 thiserror = "1.0"
 axum = "0.7"

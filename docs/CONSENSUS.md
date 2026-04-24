@@ -427,6 +427,50 @@ and both are useful even if you never decentralize.
 
 ---
 
+## 5a. Phase 2 — chain-input plumbing (2026-04-24)
+
+Landed:
+
+- **Kernel anchored-chain cursor.** `hoon/app/app.hoon` grew an
+  `anchored-chain` field (`tip-digest`, `tip-height`, 1 024-entry
+  `recent-headers` deque) plus a new cause
+  `%advance-tip headers=(list anchor-header)`. Kernel enforces strict
+  parent-chain linkage: every new header's `parent` must equal the
+  previous header's `digest`, heights must increment by 1, and the
+  first header must chain to the current tip (or be `parent=0` when
+  bootstrapping). Violations emit `%anchor-error` and do not mutate
+  state; the follower treats those as "reorg I did not replay cleanly"
+  signals and fails fast.
+- **Payment-address freeze.** A new `%set-payment-address address=@t`
+  cause stores a `(unit @t)` that the Phase 3 C5 predicate will pin
+  every claim payment against. The kernel refuses to change it after
+  `claim-count > 0`, so an operator cannot silently move the treasury
+  target once users have started paying in.
+- **Follower anchor-advance loop.** The hull's background follower
+  (`src/chain_follower.rs`) runs a second ticker every 10 s:
+  peek `/anchor`, ask `GetBlocks` for the current chain tip, fetch
+  `[current_anchor+1 .. min(tip - finality_depth, current_anchor +
+  max_batch)]` via `GetBlockDetails`, and poke `%advance-tip`. Default
+  finality depth is 10 blocks; default max advance batch is 64
+  headers. Local mode and endpoints without a chain are no-ops.
+- **Claim-note schema extension.** `ClaimNoteV1` now carries an
+  optional `ClaimChainBundle { raw_tx_jam, page_jam, block_proof_jam,
+  header_chain_jam }`. Absent fields are indistinguishable from a
+  legacy note on the wire (backward-compatible in local mode); a
+  Phase 3-strict follower will require `is_complete()` in non-local
+  mode and reject pre-anchor claims.
+- **Tests.** `tests/phase2_anchor.rs` covers bootstrap, extend,
+  parent-mismatch, height-gap, internal-break, empty-advance, address
+  one-shot bind, pre-claim re-bind, and post-claim freeze (9 cases).
+  Plus 3 new unit tests for the claim-note chain-bundle roundtrip.
+
+This is pure plumbing: the anchor and payment-address fields are
+stored but not yet read by the gate. Phase 3 lights them up by
+embedding `verify:sp-verifier` over the attached `block-proof_jam`
+and enforcing C5 against `payment-address`.
+
+---
+
 ## 6. Decision
 
 **Path A (Nockchain as sequencer), with the `nns-gate` upgrade to

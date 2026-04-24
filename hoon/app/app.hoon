@@ -127,6 +127,29 @@
 |%
 +$  name-entry  [owner=@t tx-hash=@t claim-count=@ud]
 ::
+::  +$anchor-header: minimal header triple sufficient for parent-chain
+::  verification. The full Nockchain page header carries a `proof:sp`,
+::  tx-ids z-set, coinbase split, etc. — none of which the kernel needs
+::  at Phase 2. We only need enough to walk parent pointers and commit
+::  to a specific block-id at a specific height for Phase 3's STARK.
+::
++$  anchor-header
+  $:  digest=@ux     :: Tip5 hash of this header
+      height=@ud    :: page-number
+      parent=@ux    :: Tip5 hash of parent header (anchor-tip of genesis is 0)
+  ==
+::
+::  +$anchored-chain: kernel's view of the Nockchain header chain. The
+::  follower advances this via `%advance-tip`; the Phase 3 recursive
+::  `nns-gate` will bind each batched claim to a block-id that must
+::  appear in `recent-headers` (or chain-link to `tip-digest`).
+::
++$  anchored-chain
+  $:  tip-digest=@ux                 :: follower-advanced canonical tip (0 = uninitialised)
+      tip-height=@ud                 :: page-number of tip
+      recent-headers=(list anchor-header)  :: bounded deque, newest first
+  ==
+::
 +$  versioned-state
   $:  %v2
       vesl=vesl-state
@@ -143,7 +166,22 @@
       ::  prove and verify). `~` when no batch has been proved yet.
       ::
       last-proved=(unit [subject=@ formula=*])
+      ::  Phase 2: follower-advanced anchor + frozen payment address.
+      ::
+      anchor=anchored-chain
+      ::  Payment address (base58 Nockchain address the C5 predicate
+      ::  will require payments to land on). `~` before bootstrap. Once
+      ::  set and a claim has been accepted (`claim-count > 0`), this
+      ::  is frozen — further %set-payment-address pokes emit an error.
+      ::
+      payment-address=(unit @t)
   ==
+::
+::  Max number of headers kept in `recent-headers`. The kernel stores
+::  only a sliding window — older headers are implicit in the chain
+::  commitment and don't need to be rebound to new tips.
+::
+++  max-anchor-headers  ^~((bex 10))
 ::
 +$  effect  *
 ::
@@ -168,6 +206,22 @@
       ::  of our batch-specific subject/formula.
       ::
       [%prove-identity ~]
+      ::  Phase 2: follower advances the anchored-chain tip. `headers`
+      ::  is ordered oldest-first; each must chain to the previous one
+      ::  by parent pointer and the first must chain to the current
+      ::  `tip-digest` (or be `parent=0` when bootstrapping from genesis).
+      ::  Fails hard on any inconsistency — indicates a reorg the
+      ::  follower did not replay cleanly, which would compromise
+      ::  Phase 3's chain-linkage claim.
+      ::
+      [%advance-tip headers=(list anchor-header)]
+      ::  Phase 2: one-shot (until `claim-count > 0`) payment address
+      ::  setter. The C5 payment predicate in Phase 3 will require
+      ::  claim payments to land on an output locked to this address's
+      ::  pkh. Freezing after the first accepted claim prevents a
+      ::  kernel operator from moving the payment target retroactively.
+      ::
+      [%set-payment-address address=@t]
       vesl-cause
   ==
 ::
@@ -427,6 +481,10 @@
   ::    /pending-batch     -> (list @t)                     names with
   ::                          entry.claim-count > last-settled-claim-id,
   ::                          sorted canonically by `aor`
+  ::    /anchor            -> anchored-chain               follower-advanced
+  ::                          chain tip + recent headers
+  ::    /payment-address   -> (unit @t)                    configured payment
+  ::                          address (~ before bootstrap)
   ::    [anything else]    -> vesl-peek  (registered / settled / root by hull)
   ::
   ++  peek
@@ -478,6 +536,12 @@
       ?:  (gth claim-count.e cutoff)
         $(keys t.keys, out [i.keys out])
       $(keys t.keys)
+        ::
+        [%anchor ~]
+      ``anchor.state
+        ::
+        [%payment-address ~]
+      ``payment-address.state
     ==
   ::
   ++  poke
@@ -608,6 +672,91 @@
       =/  ok=?  (verify:vv proof ~ 0 subject formula)
       :_  state
       ~[[%verify-stark-result ok]]
+      ::
+        ::  %advance-tip: follower-advanced anchor update.
+        ::
+        ::  `headers` is an oldest-first list of anchor-header triples
+        ::  that extend the current tip. Kernel enforces:
+        ::
+        ::    A1. Every header's parent pointer equals the previous
+        ::        header's digest (or the pre-existing tip-digest for
+        ::        the first header; or 0 when bootstrapping from an
+        ::        uninitialised state).
+        ::    A2. Heights are strictly increasing by 1. First header's
+        ::        height must be tip-height+1 (or equal to the sole
+        ::        header's height on bootstrap).
+        ::
+        ::  Violations emit [%anchor-error <msg>] without mutating
+        ::  state. Empty `headers` is a no-op. The full list is
+        ::  prepended onto `recent-headers` (newest first), capped at
+        ::  max-anchor-headers — older entries drop off the back.
+        ::
+        %advance-tip
+      =/  hs=(list anchor-header)  headers.u.act
+      ?~  hs
+        :_  state
+        ~[[%anchor-error 'empty advance']]
+      ::  Validate chain linkage against current tip (or bootstrap).
+      ::
+      =/  bootstrapping=?  =(0x0 tip-digest.anchor.state)
+      =/  expected-parent=@ux
+        ?:  bootstrapping
+          `@ux`0
+        tip-digest.anchor.state
+      =/  expected-height=@ud
+        ?:  bootstrapping
+          height.i.hs
+        +(tip-height.anchor.state)
+      ?.  =(parent.i.hs expected-parent)
+        :_  state
+        ~[[%anchor-error 'first header parent mismatch']]
+      ?.  =(height.i.hs expected-height)
+        :_  state
+        ~[[%anchor-error 'first header height off-by-one']]
+      ::  Walk the rest: each header's parent must be the prior
+      ::  header's digest; height must increment by 1.
+      ::
+      =/  ok=?
+        =|  prev=anchor-header
+        =.  prev  i.hs
+        =/  rest=(list anchor-header)  t.hs
+        |-  ^-  ?
+        ?~  rest  %.y
+        ?.  =(parent.i.rest digest.prev)  %.n
+        ?.  =(height.i.rest +(height.prev))  %.n
+        $(rest t.rest, prev i.rest)
+      ?.  ok
+        :_  state
+        ~[[%anchor-error 'header chain mismatch']]
+      ::  Prepend headers newest-first onto recent-headers, capped.
+      ::
+      =/  newest-first=(list anchor-header)  (flop hs)
+      ?>  ?=(^ newest-first)
+      =/  tip=anchor-header  i.newest-first
+      =/  existing=(list anchor-header)  recent-headers.anchor.state
+      =/  merged=(list anchor-header)  (weld newest-first existing)
+      =/  capped=(list anchor-header)  (scag max-anchor-headers merged)
+      =.  tip-digest.anchor.state  digest.tip
+      =.  tip-height.anchor.state  height.tip
+      =.  recent-headers.anchor.state  capped
+      :_  state
+      ^-  (list effect)
+      ~[[%anchor-advanced digest.tip height.tip (lent hs)]]
+      ::
+        ::  %set-payment-address: one-shot (until first claim) address
+        ::  setter. Freezing after `claim-count > 0` prevents the
+        ::  operator from silently moving the payment target once
+        ::  users have started paying in.
+        ::
+        %set-payment-address
+      =/  addr=@t  address.u.act
+      ?:  (gth claim-count.state 0)
+        :_  state
+        ~[[%payment-address-error 'already bound; cannot change after first claim']]
+      =.  payment-address.state  `addr
+      :_  state
+      ^-  (list effect)
+      ~[[%payment-address-set addr]]
       ::
         %set-primary
       =/  c  u.act

@@ -3,6 +3,48 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24 pm) — Phase 2 chain-input plumbing
+
+- ~~Kernel state grew an `anchored-chain` field (tip digest/height + a
+  1 024-entry `recent-headers` deque) and a frozen `payment-address=(unit @t)`.
+  New causes `%advance-tip headers=(list anchor-header)` and
+  `%set-payment-address address=@t` enforce parent-chain integrity and
+  payment-address freeze-after-first-claim. New peeks `/anchor` and
+  `/payment-address`.~~
+- ~~Rust poke builders + decoders for all four (`build_advance_tip_poke`,
+  `build_set_payment_address_poke`, `build_anchor_peek`,
+  `build_payment_address_peek`, `decode_anchor`, `decode_payment_address`)
+  plus effect extractors (`first_anchor_advanced`,
+  `first_payment_address_set`, extended `error_message` coverage).~~
+- ~~New NNS-local config module (`src/config.rs`) with CLI > env >
+  TOML > compiled-in default resolution for `payment_address`.
+  `main.rs` issues the bootstrap `%set-payment-address` poke before
+  HTTP serves, so the kernel always starts with a bound payment
+  target (frozen on the first successful claim).~~
+- ~~Chain fetchers in `src/chain.rs`: `fetch_block_details_by_height`,
+  `fetch_block_proof_bytes`, `fetch_transaction_details`,
+  `fetch_page_for_tx`, `fetch_header_chain`, `fetch_current_tip_height`,
+  `plan_anchor_advance`. `hash_to_atom_bytes` / `atom_bytes_to_hash`
+  convert between gRPC `common.v1.Hash` (5 × u64 Belts) and the
+  kernel's 40-byte LE-packed `noun-digest:tip5` atom shape.~~
+- ~~Follower gained a second background task (`advance_anchor_once`)
+  that peeks `/anchor`, asks the chain for the next batch of headers
+  up to the finality horizon (`DEFAULT_FINALITY_DEPTH = 10`,
+  `DEFAULT_MAX_ADVANCE_BATCH = 64`), and drives `%advance-tip`. Runs
+  every 10 s; logs the tip on every advance.~~
+- ~~`ClaimNoteV1` got an optional `ClaimChainBundle` with four new
+  `nns/v1/*` keys (`raw-tx`, `page`, `block-proof`, `header-chain`).
+  Missing fields decode as `None` so local-mode notes stay
+  backward-compatible; Phase 3/4 strict mode uses
+  `chain_bundle.is_complete()` to reject pre-anchor claims.~~
+- ~~9 new integration tests in `tests/phase2_anchor.rs` cover
+  bootstrap, extend, parent-mismatch, height-gap, internal-break,
+  empty-advance, one-shot address bind, pre-claim re-bind, and
+  post-claim freeze. 3 new unit tests cover the claim-note
+  chain-bundle roundtrip.~~
+
+Everything green: 10 unit + 30 HTTP handler + 9 Phase 2 = **49 tests passing**. Phase 2 closes; Phase 3 (recursive `nns-gate` circuit) is next.
+
 ## Today update (2026-04-24) — recursive-STARK plan
 
 - ~~Phase 0: wired the baseline STARK prover into NNS. `%prove-batch`
@@ -100,12 +142,12 @@ settlement-batch schema).
 
 ## Next todos (priority order)
 
-- [ ] Phase 2: kernel anchored-chain cursor (`anchored-chain`,
-  `%advance-tip`, `%set-payment-address`).
-- [ ] Phase 2: hull fetchers for raw-tx, page, block-proof, header chain
-  via `nockapp-grpc` private peeks.
-- [ ] Phase 2: extend `ClaimNoteV1` with `nns/v1/raw-tx`, `/page`,
-  `/block-proof`, `/header-chain` fields.
+- ~~Phase 2: kernel anchored-chain cursor (`anchored-chain`,
+  `%advance-tip`, `%set-payment-address`).~~
+- ~~Phase 2: hull fetchers for raw-tx, page, block-proof, header chain
+  via `nockapp-grpc` public peeks.~~
+- ~~Phase 2: extend `ClaimNoteV1` with `nns/v1/raw-tx`, `/page`,
+  `/block-proof`, `/header-chain` fields.~~
 - [ ] Phase 3: recursive `nns-gate` circuit — `verify:sp-verifier` on
   the batch's block PoW proof, `has:z-in` for tx inclusion, C5 payment
   predicates (sender pkh, amount >= fee), C1-C4 transitions.
@@ -114,6 +156,8 @@ settlement-batch schema).
 - [ ] Phase 5: rewrite `src/bin/light_verify.rs` to verify the single
   recursive settlement proof end-to-end; docs + wallet integration
   guide.
+- [ ] Wire follower `AnchorAdvance` path into `%claim` so each claim
+  also attaches a `ClaimChainBundle` (blocks Phase 3 consumption).
 - [ ] Implement chain-native claim-note discovery path (replace reliance on
   local submission queue for canonical replay input).
 - [ ] Add follower cursor persistence + reorg replay mechanics.

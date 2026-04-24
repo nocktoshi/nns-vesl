@@ -426,14 +426,21 @@ Three layers, in precedence order (highest wins): CLI flags, env vars,
 `vesl.toml`. The hull honors:
 
 
-| Env var          | Purpose                                           | Default     |
-| ---------------- | ------------------------------------------------- | ----------- |
-| `API_PORT`       | HTTP port                                         | `3000`      |
-| `BIND_ADDR`      | HTTP bind address                                 | `127.0.0.1` |
-| `NNS_DATA_DIR`   | Root dir for kernel checkpoints + mirror snapshot | `.`         |
-| `NNS_KERNEL_JAM` | Path to the compiled kernel                       | `out.jam`   |
-| `VESL_TOML`      | Path to settlement config                         | `vesl.toml` |
-| `RUST_LOG`       | Tracing filter (passed to `tracing_subscriber`)   | unset       |
+| Env var                 | Purpose                                           | Default                                                  |
+| ----------------------- | ------------------------------------------------- | -------------------------------------------------------- |
+| `API_PORT`              | HTTP port                                         | `3000`                                                   |
+| `BIND_ADDR`             | HTTP bind address                                 | `127.0.0.1`                                              |
+| `NNS_DATA_DIR`          | Root dir for kernel checkpoints + mirror snapshot | `.`                                                      |
+| `NNS_KERNEL_JAM`        | Path to the compiled kernel                       | `out.jam`                                                |
+| `NNS_PAYMENT_ADDRESS`   | Base58 NNS treasury address (Phase 2)             | `8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5` |
+| `VESL_TOML`             | Path to settlement config                         | `vesl.toml`                                              |
+| `RUST_LOG`              | Tracing filter (passed to `tracing_subscriber`)   | unset                                                    |
+
+`NNS_PAYMENT_ADDRESS` (added in Phase 2) is also readable from
+`vesl.toml` as `payment_address = "..."`. The hull issues a
+`%set-payment-address` kernel poke at boot, and the kernel freezes the
+binding on the first accepted `%claim` — operators cannot silently
+move the payment target after users have started paying in.
 
 
 Vesl settlement config in `vesl.toml`:
@@ -446,6 +453,10 @@ settlement_mode = "local"
 # chain_endpoint       = "http://localhost:9090"
 # tx_fee               = 256
 # accept_timeout_secs  = 300
+
+# NNS-local (Phase 2): override the treasury address. Frozen after the
+# first successful claim; setting it here is safe on a fresh install.
+# payment_address = "8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5"
 ```
 
 ## Data layout

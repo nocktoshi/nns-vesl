@@ -1,29 +1,73 @@
 use std::time::Duration;
 use std::future::Future;
 
-use nockapp::wire::Wire;
+use nockapp::wire::{SystemWire, Wire};
 use tokio::task::JoinHandle;
 
-use crate::chain::{confirmed_tx_position, ConfirmedTxPosition};
-use crate::kernel::{build_claim_poke, first_claim_count_bumped, first_error_message, first_primary_set, has_effect};
+use crate::chain::{
+    confirmed_tx_position, fetch_header_chain, plan_anchor_advance, AnchorAdvanceTarget,
+    ConfirmedTxPosition,
+};
+use crate::kernel::{
+    build_advance_tip_poke, build_anchor_peek, build_claim_poke, decode_anchor,
+    first_anchor_advanced, first_claim_count_bumped, first_error_message, first_primary_set,
+    has_effect, AnchorHeader,
+};
 use crate::state::SharedState;
 use crate::types::{ClaimLifecycleStatus, Registration, RegistrationStatus};
 
 const FOLLOWER_POLL: Duration = Duration::from_secs(2);
+const ANCHOR_POLL: Duration = Duration::from_secs(10);
 
-/// Spawn a lightweight follower loop.
-///
-/// Current implementation replays submitted claim notes from the mirror
-/// queue after they are accepted on-chain (or immediately in local mode).
+/// How far behind the chain tip the follower waits before committing a
+/// block to the kernel's anchor. Keeps Phase 3's STARK reasoning free
+/// of short reorgs without waiting on economic finality.
+pub const DEFAULT_FINALITY_DEPTH: u64 = 10;
+
+/// Max headers the follower ingests into a single `%advance-tip` poke.
+/// Bounded well under the kernel's `max-anchor-headers = 1024` so the
+/// deque never drops an entry mid-advance.
+pub const DEFAULT_MAX_ADVANCE_BATCH: u64 = 64;
+
+/// Spawn both follower loops: claim replay + anchor advance. Both run
+/// forever on the current tokio runtime; cancel by dropping the task
+/// handles (we don't hold onto them in production yet).
 pub fn spawn(state: SharedState) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = tick_once(&state).await {
-                tracing::warn!("chain follower tick failed: {err}");
+    let claim_task = {
+        let s = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = tick_once(&s).await {
+                    tracing::warn!("chain follower claim tick failed: {err}");
+                }
+                tokio::time::sleep(FOLLOWER_POLL).await;
             }
-            tokio::time::sleep(FOLLOWER_POLL).await;
-        }
-    })
+        })
+    };
+
+    let _anchor_task = {
+        let s = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match advance_anchor_once(&s).await {
+                    Ok(Some(advanced)) => {
+                        tracing::info!(
+                            tip_height = advanced.tip_height,
+                            count = advanced.count,
+                            "chain follower advanced anchor"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!("chain follower anchor tick failed: {err}");
+                    }
+                }
+                tokio::time::sleep(ANCHOR_POLL).await;
+            }
+        })
+    };
+
+    claim_task
 }
 
 pub async fn process_once(state: &SharedState) -> Result<(), String> {
@@ -153,4 +197,100 @@ where
         st.persist_all().await;
     }
     Ok(())
+}
+
+/// Outcome of one anchor-advance pass.
+#[derive(Debug, Clone)]
+pub struct AnchorAdvanceOutcome {
+    pub tip_height: u64,
+    pub tip_digest: Vec<u8>,
+    pub count: u64,
+}
+
+/// One pass of the anchor-advance loop.
+///
+/// 1. Peek the kernel's `/anchor` to learn the current tip height.
+/// 2. Ask the chain (via `plan_anchor_advance`) for the next range to
+///    ingest — bounded by `DEFAULT_FINALITY_DEPTH` and `DEFAULT_MAX_ADVANCE_BATCH`.
+/// 3. Fetch headers for that range and issue one `%advance-tip` poke.
+/// 4. Surface any `%anchor-error` as a follower warning.
+///
+/// Returns `Ok(None)` when there's nothing to advance (local mode, no
+/// chain endpoint, anchor already at the finality horizon, or we're
+/// racing a very young chain).
+pub async fn advance_anchor_once(
+    state: &SharedState,
+) -> Result<Option<AnchorAdvanceOutcome>, String> {
+    let (is_local_mode, chain_endpoint) = {
+        let st = state.lock().await;
+        (
+            matches!(st.settlement.mode, vesl_core::SettlementMode::Local),
+            st.settlement.chain_endpoint.clone(),
+        )
+    };
+    if is_local_mode {
+        return Ok(None);
+    }
+    let Some(endpoint) = chain_endpoint else {
+        return Ok(None);
+    };
+
+    // Read the kernel's current anchor height via peek. Missing peek
+    // responses mean the kernel is not ready; treat as transient.
+    let current_anchor_height = {
+        let mut st = state.lock().await;
+        let result = st
+            .app
+            .peek(build_anchor_peek())
+            .await
+            .map_err(|e| format!("anchor peek failed: {e:?}"))?;
+        match decode_anchor(&result) {
+            Ok(view) => view.tip_height,
+            Err(_) => 0,
+        }
+    };
+
+    let Some(plan) = plan_anchor_advance(
+        &endpoint,
+        current_anchor_height,
+        DEFAULT_FINALITY_DEPTH,
+        DEFAULT_MAX_ADVANCE_BATCH,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let AnchorAdvanceTarget {
+        from_height,
+        to_height,
+        current_chain_tip: _,
+    } = plan;
+
+    let headers: Vec<AnchorHeader> = fetch_header_chain(&endpoint, from_height, to_height)
+        .await
+        .map_err(|e| format!("header chain fetch failed [{from_height}..{to_height}]: {e}"))?;
+    if headers.is_empty() {
+        return Ok(None);
+    }
+
+    let mut st = state.lock().await;
+    let effects = st
+        .app
+        .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
+        .await
+        .map_err(|e| format!("advance-tip poke failed: {e:?}"))?;
+
+    if let Some(err) = first_error_message(&effects) {
+        return Err(format!("kernel rejected %advance-tip: {err}"));
+    }
+    let Some(advanced) = first_anchor_advanced(&effects) else {
+        return Err("kernel did not emit %anchor-advanced".into());
+    };
+    st.persist_all().await;
+
+    Ok(Some(AnchorAdvanceOutcome {
+        tip_height: advanced.tip_height,
+        tip_digest: advanced.tip_digest,
+        count: advanced.count,
+    }))
 }

@@ -3623,6 +3623,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml 0.8.23",
+ "tonic 0.14.5",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",

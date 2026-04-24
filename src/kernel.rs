@@ -170,6 +170,58 @@ pub fn build_verify_stark_poke(proof_jam: &[u8]) -> NounSlab {
     slab
 }
 
+/// One entry in the `%advance-tip` header list.
+///
+/// `digest` and `parent` are raw 40-byte Tip5 hashes (5 × 8-byte
+/// Goldilocks field elements, LE-packed). `height` is the Nockchain
+/// `page-number`. The kernel walks these oldest-first, enforcing
+/// `header[n].parent == header[n-1].digest` and monotonic heights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorHeader {
+    pub digest: Vec<u8>,
+    pub height: u64,
+    pub parent: Vec<u8>,
+}
+
+/// Build a `[%advance-tip headers=(list anchor-header)]` poke slab.
+///
+/// `headers` MUST be oldest-first (same convention as the follower
+/// receives blocks from Nockchain). On success the kernel emits
+/// `[%anchor-advanced tip-digest=@ux tip-height=@ud count=@ud]`; on
+/// validation failure it emits `[%anchor-error msg=@t]` and does NOT
+/// mutate state.
+pub fn build_advance_tip_poke(headers: &[AnchorHeader]) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "advance-tip");
+
+    let mut list_noun = D(0);
+    for h in headers.iter().rev() {
+        let digest = make_atom_in(&mut slab, &h.digest);
+        let parent = make_atom_in(&mut slab, &h.parent);
+        let height = atom_from_u64(&mut slab, h.height);
+        let cell = T(&mut slab, &[digest, height, parent]);
+        list_noun = T(&mut slab, &[cell, list_noun]);
+    }
+
+    let poke = T(&mut slab, &[tag, list_noun]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Build a `[%set-payment-address address=@t]` poke slab.
+///
+/// Kernel accepts only while `claim-count == 0` and emits
+/// `[%payment-address-set address]` on success,
+/// `[%payment-address-error msg=@t]` once frozen.
+pub fn build_set_payment_address_poke(address: &str) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "set-payment-address");
+    let addr = make_cord_in(&mut slab, address);
+    let poke = T(&mut slab, &[tag, addr]);
+    slab.set_root(poke);
+    slab
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------
@@ -216,6 +268,24 @@ pub fn build_owner_peek(name: &str) -> NounSlab {
 /// Disambiguate by peeking `/owner/<name>` first.
 pub fn build_proof_peek(name: &str) -> NounSlab {
     name_peek("proof", name)
+}
+
+/// Build a `/anchor ~` peek path slab.
+///
+/// Kernel response: `[~ ~ anchored-chain]`:
+///   - `tip-digest=@ux` (`0` before the first `%advance-tip`)
+///   - `tip-height=@ud`
+///   - `recent-headers=(list anchor-header)` newest-first
+pub fn build_anchor_peek() -> NounSlab {
+    single_tag_peek("anchor")
+}
+
+/// Build a `/payment-address ~` peek path slab.
+///
+/// Kernel response: `[~ ~ (unit @t)]` — `~` before the first
+/// `%set-payment-address` poke, `[~ <cord>]` afterwards.
+pub fn build_payment_address_peek() -> NounSlab {
+    single_tag_peek("payment-address")
 }
 
 fn single_tag_peek(tag_str: &str) -> NounSlab {
@@ -406,6 +476,90 @@ pub fn decode_proof(result: &NounSlab) -> Result<Vec<ProofNode>, String> {
     Ok(out)
 }
 
+/// Current anchored chain view from the kernel. `tip_digest` is the
+/// raw LE bytes of a 5-felt Tip5 hash (all-zero when uninitialised).
+/// `recent_headers` is newest-first — the head is the current tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorView {
+    pub tip_digest: Vec<u8>,
+    pub tip_height: u64,
+    pub recent_headers: Vec<AnchorHeader>,
+}
+
+/// Decode the `/anchor` peek result.
+pub fn decode_anchor(result: &NounSlab) -> Result<AnchorView, String> {
+    let inner = peek_unwrap_some(result)?;
+    let cell = inner
+        .as_cell()
+        .map_err(|_| "anchor: expected cell".to_string())?;
+    let tip_digest = atom_to_le_bytes(cell.head())?;
+    let rest = cell
+        .tail()
+        .as_cell()
+        .map_err(|_| "anchor: tail not cell".to_string())?;
+    let tip_height = rest
+        .head()
+        .as_atom()
+        .map_err(|_| "anchor: tip_height not atom".to_string())?
+        .as_u64()
+        .map_err(|_| "anchor: tip_height overflows u64".to_string())?;
+    let mut cur = rest.tail();
+    let mut recent_headers = Vec::new();
+    loop {
+        if cur.as_atom().is_ok() {
+            break;
+        }
+        let c = cur
+            .as_cell()
+            .map_err(|_| "anchor: list cell malformed".to_string())?;
+        let node = c
+            .head()
+            .as_cell()
+            .map_err(|_| "anchor: header not a cell".to_string())?;
+        let digest = atom_to_le_bytes(node.head())?;
+        let node_tail = node
+            .tail()
+            .as_cell()
+            .map_err(|_| "anchor: header tail not cell".to_string())?;
+        let height = node_tail
+            .head()
+            .as_atom()
+            .map_err(|_| "anchor: header height not atom".to_string())?
+            .as_u64()
+            .map_err(|_| "anchor: header height overflows u64".to_string())?;
+        let parent = atom_to_le_bytes(node_tail.tail())?;
+        recent_headers.push(AnchorHeader {
+            digest,
+            height,
+            parent,
+        });
+        cur = c.tail();
+    }
+    Ok(AnchorView {
+        tip_digest,
+        tip_height,
+        recent_headers,
+    })
+}
+
+/// Decode the `/payment-address` peek result into `Option<String>`.
+pub fn decode_payment_address(result: &NounSlab) -> Result<Option<String>, String> {
+    let inner = peek_unwrap_inner(result)?;
+    match inner {
+        None => Ok(None),
+        Some(noun) => {
+            // (unit @t) — `~` (atom 0) or `[~ cord]`.
+            if noun.as_atom().is_ok() {
+                return Ok(None);
+            }
+            let c = noun
+                .as_cell()
+                .map_err(|_| "payment-address: unit cell malformed".to_string())?;
+            Ok(Some(atom_to_cord(c.tail())?))
+        }
+    }
+}
+
 // Strip the outer `(unit (unit *))` wrapping the kernel peek
 // produces. Returns the innermost `*` or `None` if the inner unit
 // was null (recognized path, no value).
@@ -471,13 +625,16 @@ pub fn effect_tag(effect: &NounSlab) -> Option<String> {
 }
 
 /// Read the error message from a `[%claim-error msg=@t]`,
-/// `[%primary-error msg=@t]`, `[%batch-error msg=@t]`, or
+/// `[%primary-error msg=@t]`, `[%batch-error msg=@t]`,
+/// `[%anchor-error msg=@t]`, `[%payment-address-error msg=@t]`, or
 /// `[%vesl-error msg=@t]` effect.
 pub fn error_message(effect: &NounSlab) -> Option<String> {
     let tag = effect_tag(effect)?;
     if tag != "claim-error"
         && tag != "primary-error"
         && tag != "batch-error"
+        && tag != "anchor-error"
+        && tag != "payment-address-error"
         && tag != "vesl-error"
     {
         return None;
@@ -492,6 +649,56 @@ pub fn error_message(effect: &NounSlab) -> Option<String> {
             .trim_end_matches('\0')
             .to_string(),
     )
+}
+
+/// `[%anchor-advanced tip-digest=@ux tip-height=@ud count=@ud]` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorAdvanced {
+    pub tip_digest: Vec<u8>,
+    pub tip_height: u64,
+    pub count: u64,
+}
+
+pub fn anchor_advanced(effect: &NounSlab) -> Option<AnchorAdvanced> {
+    if effect_tag(effect)? != "anchor-advanced" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let tip_digest = rest.head().as_atom().ok()?.as_ne_bytes().to_vec();
+    let rest2 = rest.tail().as_cell().ok()?;
+    let tip_height = rest2.head().as_atom().ok()?.as_u64().ok()?;
+    let count = rest2.tail().as_atom().ok()?.as_u64().ok()?;
+    Some(AnchorAdvanced {
+        tip_digest,
+        tip_height,
+        count,
+    })
+}
+
+pub fn first_anchor_advanced(effects: &[NounSlab]) -> Option<AnchorAdvanced> {
+    effects.iter().find_map(anchor_advanced)
+}
+
+/// `[%payment-address-set address=@t]` payload.
+pub fn payment_address_set(effect: &NounSlab) -> Option<String> {
+    if effect_tag(effect)? != "payment-address-set" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let addr = cell.tail().as_atom().ok()?;
+    Some(
+        std::str::from_utf8(addr.as_ne_bytes())
+            .ok()?
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+
+pub fn first_payment_address_set(effects: &[NounSlab]) -> Option<String> {
+    effects.iter().find_map(payment_address_set)
 }
 
 /// Read `(address, name)` from a `[%primary-set address=@t name=@t]`
