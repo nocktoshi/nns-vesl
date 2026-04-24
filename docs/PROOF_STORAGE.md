@@ -282,14 +282,26 @@ total work is still bounded by one STARK verify.
 
 **What step 3 upgrades**: moves the `validate_claim_bundle`
 execution into the STARK trace so the wallet no longer runs it.
-Single-artifact trust; smaller wallet SDK. Requires:
+Single-artifact trust; smaller wallet SDK. Status (2026-04-24):
 
-- The Hoon predicates to be compilable to a Nock formula the prover
-  can embed in `prove-computation`'s `[subject formula]`. Either
-  hand-written or generated from the `++validate-claim-bundle` arm.
-- Level C predicates (`pays-sender`, `pays-amount`,
+- ✅ **Tip5-free validator variant landed**: `validate-claim-bundle-linear`
+  uses a list walk for tx-inclusion so nothing inside the trace
+  needs Tip5 jets.
+- ✅ **General-purpose prover primitive landed**: `%prove-arbitrary`
+  kernel cause accepts caller-built `(subject, formula)` jammed
+  bytes, cues them, traces `prove-computation:vp`, emits
+  `[%arbitrary-proof product proof]`. Verified end-to-end at
+  ~610 ms prove, ~602 ms verify in
+  `tests/prover.rs::phase3c_step3_prove_arbitrary_roundtrip`.
+- ⏳ **Pending**: Nock-formula encoding of `validate-claim-bundle-linear`.
+  See `docs/research/recursive-payment-proof.md` §"Step 3 —
+  Nock-formula encoding" for the three approaches under
+  consideration (hand-crafted, subject-bundled core, formula
+  rebasing pass).
+- ⏳ **Pending**: Level C predicates (`pays-sender`, `pays-amount`,
   `matches-block-commitment`) to close the payment + page-commitment
-  trust gaps.
+  trust gaps — needed for a complete step-3 trace regardless of
+  which encoding lands.
 
 ## Staleness and fork resistance
 

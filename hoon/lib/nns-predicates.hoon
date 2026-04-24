@@ -100,6 +100,30 @@
       anchored-tip=@ux                 :: kernel's current anchor tip
   ==
 ::
+::  +$claim-bundle-linear: Phase 3c step 3 variant of `claim-bundle`
+::  whose tx-ids field is a flat `(list @ux)` instead of a `(z-set
+::  @ux)`. Lets the validator check tx-inclusion via `has-tx-in-list`
+::  (pure Nock) rather than `has:z-in` (needs Tip5 jets).
+::
+::  Semantically equivalent to `claim-bundle` when the list contains
+::  the same elements as the z-set. The hull converts between the two
+::  shapes at poke-build time — for `%validate-claim` / `%prove-claim`
+::  we use the z-set form (z-silt-canonicalized on the kernel side);
+::  for `%prove-claim-in-stark` (step 3) we pass the list through
+::  unchanged so the trace stays Tip5-free.
+::
++$  claim-bundle-linear
+  $:  name=@t
+      owner=@t
+      fee=@ud
+      tx-hash=@ux
+      claim-block-digest=@ux
+      anchor-headers=(list anchor-header)
+      page-digest=@ux
+      page-tx-ids=(list @ux)
+      anchored-tip=@ux
+  ==
+::
 ::  +$validation-error: tag-only union that names which predicate
 ::  rejected a bundle. The kernel surfaces these as
 ::  `[%validate-error <tag>]` effects so the hull + wallet can
@@ -219,6 +243,27 @@
   ^-  ?
   =(digest.pag claimed-digest)
 ::
+::  +has-tx-in-list: Phase 3c step 3 variant of `has-tx-in-page`.
+::
+::  O(n) linear walk over a flat `(list @ux)`, no Tip5 hashing. Trades
+::  `has:z-in`'s O(log n) BST for a simpler Nock trace that stays
+::  inside `fink:fock` without any jet calls. Use when the validator
+::  needs to run INSIDE the STARK (Phase 3c step 3) — the extra CPU
+::  vs z-in is negligible for block sizes ≤ 1000 tx-ids (typical
+::  Nockchain blocks) and the reduced trace cost pays for itself.
+::
+::  Semantics identical to `has-tx-in-page` when the list contains
+::  exactly `page.tx-ids` with no duplicates: returns `%.y` iff
+::  `claimed-tx-id ∈ list`.
+::
+++  has-tx-in-list
+  |=  [tx-ids=(list @ux) claimed-tx-id=@ux]
+  ^-  ?
+  |-  ^-  ?
+  ?~  tx-ids  %.n
+  ?:  =(i.tx-ids claimed-tx-id)  %.y
+  $(tx-ids t.tx-ids)
+::
 ::  --- G1 format helpers (duplicated from app.hoon so the gate
 ::      library is self-contained — keep them in sync) ---
 ::
@@ -300,6 +345,48 @@
   ?.  (has-tx-in-page page.bundle tx-hash.bundle)
     [%| %tx-not-in-page]
   ::  Level A — claim-block chains to the kernel's anchored tip.
+  ?.  %-  chain-links-to
+      :*  claim-block-digest.bundle
+          anchor-headers.bundle
+          anchored-tip.bundle
+      ==
+    [%| %chain-broken]
+  [%& ~]
+::
+::  +validate-claim-bundle-linear: Phase 3c step 3 variant.
+::
+::  Identical semantics to `validate-claim-bundle`, but with every
+::  predicate replaced by a Tip5-jet-free alternative so the function
+::  can run INSIDE the STARK trace without needing jet support:
+::
+::    - `has-tx-in-list` (O(n) list walk) replaces `has-tx-in-page`
+::      (O(log n) z-in `has` that calls `gor-tip` → `hash-noun-varlen`).
+::    - All other predicates (`is-valid-name`, `fee-for-name`,
+::      `matches-block-digest`-as-atom-equality, `chain-links-to`)
+::      are already pure Nock.
+::
+::  Trade-off: linear walk over tx-ids costs O(n) Nock steps per
+::  claim vs O(log n) for z-in. Real Nockchain blocks carry tens to
+::  a few hundred tx-ids; the extra Nock steps are negligible vs the
+::  STARK trace's overall footprint.
+::
+::  This is the gate body Phase 3c step 3 will eventually trace
+::  inside `prove-computation`. See `docs/research/recursive-payment-proof.md`
+::  §"Step 3: Nock-formula encoding" for the remaining
+::  encoding work required to get this arm's compiled formula
+::  embedded in a `fink:fock`-traceable `[subject formula]` pair.
+::
+++  validate-claim-bundle-linear
+  |=  bundle=claim-bundle-linear
+  ^-  (each ~ validation-error)
+  ?.  (is-valid-name name.bundle)
+    [%| %invalid-name]
+  ?.  (gte fee.bundle (fee-for-name name.bundle))
+    [%| %fee-below-schedule]
+  ?.  =(page-digest.bundle claim-block-digest.bundle)
+    [%| %page-digest-mismatch]
+  ?.  (has-tx-in-list page-tx-ids.bundle tx-hash.bundle)
+    [%| %tx-not-in-page]
   ?.  %-  chain-links-to
       :*  claim-block-digest.bundle
           anchor-headers.bundle

@@ -310,3 +310,100 @@ Revised recursion projection (replaces the earlier 50 s–10 min table):
 ### Decision: GO on per-batch recursion, keep per-claim in scope
 
 **Phase 1-redo closes with GO.** The baseline STARK prover works end-to-end, the matched verifier works end-to-end, and the verifier's internal work is modest enough that per-claim recursion is not ruled out by raw wall-clock. The Phase 3 circuit should still target per-batch recursion first (better amortization), but can move to per-claim without re-architecting once Phase 2's chain-input plumbing lands.
+
+## Step 3 — Nock-formula encoding
+
+Phase 3c step 3 landed the foundation (2026-04-24): a Tip5-free
+`validate-claim-bundle-linear` arm and a general-purpose
+`%prove-arbitrary` kernel cause that accepts caller-supplied
+`(subject, formula)` pairs. The remaining work to close
+"single-artifact trust" is translating the Hoon validator arm into
+a self-contained Nock formula suitable for tracing.
+
+### Why it's not mechanical
+
+Hoon compiles to Nock with **axis references tied to the
+compile-time subject**. When hoonc compiles
+`(validate-claim-bundle-linear bundle)` at the kernel poke site, the
+resulting formula expects:
+
+- `bundle` at some specific axis (usually `+<` of the enclosing
+  gate, ~axis 6)
+- `validate-claim-bundle-linear` at some other axis pointing into
+  the kernel's core tree
+- Every sub-arm (`is-valid-name`, `chain-links-to`, etc.) at its own
+  axis within the `np` core
+
+When we hand that formula to `prove-computation` with `subject =
+bundle` (just the bundle, nothing else), every axis reference
+breaks. `fink:fock` walks right off the tree.
+
+### Three approaches, ordered by immediacy
+
+**1. Hand-written Nock (1–2 day spike).**
+
+Write the formula by direct Nock composition. Each predicate
+becomes a small sub-formula; the whole validator is a
+conditional chain. Example sub-formula shapes:
+
+- `is-valid-name` → a byte-loop over the name cord; uses Nock-6
+  (if), Nock-5 (equality), atom cutting (Nock-4/decrement or jet).
+- `has-tx-in-list` → list walk via Nock-6; each element compared
+  to `tx-hash` via Nock-5.
+- `chain-links-to` → nested list walk; each link is two equality
+  checks.
+
+Estimate: ~100–300 lines of Nock. Auditable but brittle to
+validator changes — any Hoon edit invalidates the hand-encoding.
+
+**2. Subject-bundled core (works for any arm without rewriting).**
+
+Construct `subject = [bundle validator-core]` and formula =
+`[9 <arm-axis> 10 [6 0 2] 0 3]`, which:
+
+1. Fetches `validator-core` at axis 3 of the subject.
+2. Replaces the core's sample (axis 6) with `bundle` at axis 2.
+3. Slams arm `<arm-axis>` of the modified core.
+
+`<arm-axis>` needs to be extracted from hoonc. Reliable techniques:
+`!=(arm:np)` produces the Nock formula for accessing the arm in
+the compile-time context; the head of that formula is `[9 <axis>
+<core-formula>]`, so `<axis>` is readable via `+<.!=(arm:np)`.
+
+Advantage: arm changes propagate without manual Nock rewrites.
+Disadvantage: trace includes the full serialized core as part of
+the subject, ballooning prove-time. For our small validator that's
+probably fine.
+
+**3. Formula rebasing pass (most general).**
+
+A tool that takes any Hoon-compiled formula + a spec of the
+caller's intended subject layout and rewrites axis references. This
+becomes reusable for every future validator-in-STARK case.
+
+Non-trivial to implement — has to track Nock-9's "editing the
+sample" behaviour, Nock-2's "subject for subformula" divergence,
+etc. Probably a week of work but delivers a reusable primitive.
+
+### Recommended next spike
+
+**Try approach 2 first.** Lowest effort; if the trace cost turns
+out unacceptable (>20 s prove, or proof bytes >300 KiB), fall back
+to approach 1. Approach 3 is the right long-term investment but
+shouldn't gate Phase 3c step 3 completion.
+
+Reference implementation sketch for approach 2 lives in
+`hoon/app/app.hoon`'s `%prove-arbitrary` arm — the cause is
+already in place. What's needed is a Hoon arm (`+build-validator-formula`
+or similar) that returns the `(subject, formula)` jammed bytes for
+a given bundle, ready to pass into `%prove-arbitrary`.
+
+### What lands when step 3 closes
+
+- Wallet verification drops from three checks (STARK verify +
+  bundle-hash check + re-run validator) to two (STARK verify + hash
+  check). The validator no longer runs on the wallet.
+- The committed product becomes the validator's *output*
+  (`[%& ~]` or `[%| <err>]`) rather than the bundle-digest alone.
+- Wallet SDK shrinks by ~150 lines (no Hoon → Rust validator
+  mirror needed).

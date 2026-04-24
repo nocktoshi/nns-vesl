@@ -21,11 +21,11 @@ use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
 use nns_vesl::kernel::{
-    build_prove_batch_poke, build_prove_claim_poke, build_prove_identity_poke,
-    build_verify_stark_poke, first_batch_proof, first_batch_settled, first_claim_proof,
-    first_prove_failed, first_prove_identity_result, first_validate_claim_result,
-    first_verify_stark_error, first_verify_stark_result, AnchorHeader, ClaimBundle,
-    ValidateClaimResult,
+    build_prove_arbitrary_poke, build_prove_batch_poke, build_prove_claim_poke,
+    build_prove_identity_poke, build_verify_stark_poke, first_arbitrary_proof, first_batch_proof,
+    first_batch_settled, first_claim_proof, first_prove_failed, first_prove_identity_result,
+    first_validate_claim_result, first_verify_stark_error, first_verify_stark_result, AnchorHeader,
+    ClaimBundle, ValidateClaimResult,
 };
 use nns_vesl::{api, state::AppState};
 use tokio::sync::Mutex;
@@ -442,5 +442,100 @@ async fn phase3c_prove_claim_roundtrip() {
     assert!(
         ok,
         "claim proof must round-trip through vesl-verifier on the same kernel",
+    );
+}
+
+/// Phase 3c step 3 spike: prove a caller-constructed Nock formula via
+/// the general-purpose `%prove-arbitrary` cause. This is the
+/// foundational primitive the full validator-in-STARK flow will use
+/// once someone publishes a canonical Nock encoding for
+/// `validate-claim-bundle-linear`.
+///
+/// Concrete trace: `[subject=42 formula=[0 1]]` — evaluating "return
+/// the subject" on atom 42. Trivial, but it exercises:
+///
+///   - The kernel accepts caller-built subject + formula via jam
+///     atoms and cues them correctly.
+///   - `prove-computation:vp` traces a trivial formula without
+///     crashing.
+///   - The committed product matches the caller's expectation.
+///   - The emitted proof verifies via `%verify-stark` — confirming
+///     that arbitrary user formulas can be proved + verified, not
+///     just the hard-coded `fs-formula` from `%prove-batch`.
+///
+/// Marked `#[ignore]` because it's prover-heavy (~5 s).
+#[ignore]
+#[tokio::test]
+async fn phase3c_step3_prove_arbitrary_roundtrip() {
+    use nock_noun_rs::{jam_to_bytes, new_stack, Cell, D};
+
+    let (_tmp, state) = boot_nns_with_prover().await;
+
+    // Build noun `42` and jam it.
+    let mut sub_stack = new_stack();
+    let subject_noun = D(42);
+    let subject_jam = jam_to_bytes(&mut sub_stack, subject_noun);
+
+    // Build noun `[4 [4 [4 [0 1]]]]` and jam it. Three nested nock-4
+    // increments over the subject = adds 3. Picking a non-trivial
+    // formula avoids the degenerate-table-heights edge case that
+    // Phase 1-redo exposed with `[0 1]`.
+    let mut form_stack = new_stack();
+    let base = Cell::new(&mut form_stack, D(0), D(1)).as_noun();          // [0 1]
+    let inc1 = Cell::new(&mut form_stack, D(4), base).as_noun();          // [4 [0 1]]
+    let inc2 = Cell::new(&mut form_stack, D(4), inc1).as_noun();          // [4 [4 ...]]
+    let formula_noun = Cell::new(&mut form_stack, D(4), inc2).as_noun();  // [4 [4 [4 ...]]]
+    let formula_jam = jam_to_bytes(&mut form_stack, formula_noun);
+
+    let t_prove = Instant::now();
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(
+                SystemWire.to_wire(),
+                build_prove_arbitrary_poke(&subject_jam, &formula_jam),
+            )
+            .await
+            .expect("%prove-arbitrary poke")
+    };
+    let prove_elapsed = t_prove.elapsed();
+
+    if let Some(trace_jam) = first_prove_failed(&effects) {
+        panic!(
+            "prove-computation crashed inside %prove-arbitrary; trace len={} bytes",
+            trace_jam.len()
+        );
+    }
+    let ap = first_arbitrary_proof(&effects).expect("%arbitrary-proof effect");
+    println!(
+        "[phase3c-step3] %prove-arbitrary wall-clock: {:.3?} (product {} B, proof jam {} B)",
+        prove_elapsed,
+        ap.product_jam.len(),
+        ap.proof_jam.len()
+    );
+    assert!(!ap.proof_jam.is_empty());
+
+    // Round-trip via %verify-stark on the same kernel.
+    let verify_poke = build_verify_stark_poke(&ap.proof_jam);
+    let t_verify = Instant::now();
+    let vfx = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(SystemWire.to_wire(), verify_poke)
+            .await
+            .expect("%verify-stark poke")
+    };
+    let verify_elapsed = t_verify.elapsed();
+    println!(
+        "[phase3c-step3] %verify-stark wall-clock: {:.3?}",
+        verify_elapsed
+    );
+    if let Some(msg) = first_verify_stark_error(&vfx) {
+        panic!("verify-stark rejected the arbitrary proof: {msg}");
+    }
+    let ok = first_verify_stark_result(&vfx).expect("%verify-stark-result effect");
+    assert!(
+        ok,
+        "arbitrary proof of [subject=42 formula=[0 1]] must verify on the same kernel",
     );
 }

@@ -182,7 +182,7 @@
       ::  inputs the prover traced (`batch` contents may change between
       ::  prove and verify). `~` when no batch has been proved yet.
       ::
-      last-proved=(unit [subject=@ formula=*])
+      last-proved=(unit [subject=* formula=*])
       ::  Phase 2: follower-advanced anchor + frozen payment address.
       ::
       anchor=anchored-chain
@@ -314,6 +314,36 @@
           page-tx-ids=(list @ux)
           anchored-tip=@ux
       ==
+      ::  Phase 3c step 3: general-purpose prover primitive. Takes an
+      ::  arbitrary `[subject formula]` pair and traces
+      ::  `(fink:fock [subject formula])` via `prove-computation:vp`
+      ::  bound to the kernel's current `(root, hull)`.
+      ::
+      ::  The fundamental trust boundary: whatever the formula
+      ::  evaluates to becomes the committed product. A caller
+      ::  building a formula that computes `validate-claim-bundle`
+      ::  gets in-STARK validation; a caller building `[1 42]` gets a
+      ::  STARK over the constant 42. This primitive is
+      ::  caller-responsibility — the kernel does not inspect or
+      ::  constrain the formula's semantics.
+      ::
+      ::  Wallet verification then runs `verify:vesl-verifier` on the
+      ::  emitted proof against the same `[subject formula]` pair.
+      ::  The wallet's own cross-check — "does this subject/formula
+      ::  actually express the property I care about?" — closes the
+      ::  loop. For the NNS use case that's "is this the Nock of
+      ::  validate-claim-bundle-linear applied to my bundle?", which
+      ::  is tractable to pattern-match once a canonical encoding is
+      ::  published (see `docs/research/recursive-payment-proof.md`
+      ::  §"Step 3 Nock-formula encoding").
+      ::
+      ::  `subject-jam` and `formula-jam` are the JAM bytes of the
+      ::  two nouns. The kernel cues them before handing to
+      ::  `prove-computation`, keeping the Rust poke-builder side
+      ::  simple (bytes in, bytes out) and the kernel in charge of
+      ::  Nock-noun shape.
+      ::
+      [%prove-arbitrary subject-jam=@ formula-jam=@]
       ::  nockup:cause
       ::  graft-inject would add `vesl-cause` here on a fresh
       ::  kernel. Already present below; marker is idempotent.
@@ -782,7 +812,7 @@
       ?~  last-proved.state
         :_  state
         ~[[%verify-stark-error 'no-cached-sf']]
-      =/  subject=@  subject.u.last-proved.state
+      =/  subject=*  subject.u.last-proved.state
       =/  formula=*  formula.u.last-proved.state
       =/  ok=?  (verify:vv proof ~ 0 subject formula)
       :_  state
@@ -997,6 +1027,55 @@
       :_  state
       ^-  (list effect)
       ~[[%claim-proof bundle-digest the-proof]]
+      ::
+        ::  %prove-arbitrary: trace an arbitrary [subject formula] via
+        ::  `prove-computation:vp` and emit a proof bound to
+        ::  `(root, hull)`. No validation — caller is responsible for
+        ::  constructing the pair.
+        ::
+        ::  Emits `[%arbitrary-proof product proof]` on prover
+        ::  success (product is what the formula evaluated to on the
+        ::  subject) or `[%prove-failed trace]` on crash. Caches
+        ::  `(subject, formula)` in `last-proved` so subsequent
+        ::  `%verify-stark` pokes find the right replay inputs.
+        ::
+        ::  This is the Phase 3c step 3 primitive — see `docs/PROOF_STORAGE.md`
+        ::  §"What the current proof attests to".
+        ::
+        %prove-arbitrary
+      =/  subject-cue  (mule |.((cue subject-jam.u.act)))
+      ?.  ?=(%& -.subject-cue)
+        :_  state
+        ~[[%prove-failed (jam p.subject-cue)]]
+      =/  formula-cue  (mule |.((cue formula-jam.u.act)))
+      ?.  ?=(%& -.formula-cue)
+        :_  state
+        ~[[%prove-failed (jam p.formula-cue)]]
+      =/  subj=*  p.subject-cue
+      =/  form=*  p.formula-cue
+      =/  attempt
+        %-  mule  |.
+        (prove-computation:vp subj form root.state hull.state)
+      ?.  ?=(%& -.attempt)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.attempt)]]
+      =/  pr  p.attempt
+      ?.  ?=(%& -.pr)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.pr)]]
+      =/  the-proof=proof:sp  p.pr
+      ::  Run the formula directly to capture the evaluated product
+      ::  for inclusion in the emitted effect. Same semantics as the
+      ::  STARK's trace — `.*` and `fink:fock` agree on products,
+      ::  they only differ in whether the execution is traced.
+      ::
+      =/  product=*  .*(subj form)
+      =.  last-proved.state  `[subj form]
+      :_  state
+      ^-  (list effect)
+      ~[[%arbitrary-proof product the-proof]]
       ::
         %set-primary
       =/  c  u.act

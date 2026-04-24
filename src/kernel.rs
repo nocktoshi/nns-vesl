@@ -532,6 +532,69 @@ pub fn first_claim_proof(effects: &[NounSlab]) -> Option<ClaimProof> {
     effects.iter().find_map(claim_proof)
 }
 
+/// Build a `[%prove-arbitrary subject=* formula=*]` poke slab. Used
+/// by Phase 3c step 3 tests and future callers that want to prove a
+/// caller-constructed Nock formula under the kernel's current
+/// `(root, hull)`.
+///
+/// `subject_jam` and `formula_jam` are JAM'd noun bytes that the
+/// kernel cues before handing to `prove-computation:vp`. Using jam
+/// bytes keeps the Rust builder honest about noun construction —
+/// the Hoon side does the real work.
+pub fn build_prove_arbitrary_poke(subject_jam: &[u8], formula_jam: &[u8]) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-arbitrary");
+    // We pass the pre-jammed bytes as a cell `[subject formula]`
+    // where each element is itself an atom carrying its jammed form.
+    // The kernel will cue them. This is a temporary API surface —
+    // once the validator Nock encoding stabilises we'll switch to
+    // typed helpers that build the pair from a `ClaimBundle`.
+    let subject = make_atom_in(&mut slab, subject_jam);
+    let formula = make_atom_in(&mut slab, formula_jam);
+    let poke = T(&mut slab, &[tag, subject, formula]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Payload of `[%arbitrary-proof product=* proof=*]`. `product_jam`
+/// is the JAM of whatever the formula evaluated to on the subject;
+/// `proof_jam` is the STARK proof noun JAM'd for transport.
+pub struct ArbitraryProof {
+    pub product_jam: Vec<u8>,
+    pub proof_jam: Vec<u8>,
+}
+
+impl std::fmt::Debug for ArbitraryProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArbitraryProof")
+            .field("product_jam_len", &self.product_jam.len())
+            .field("proof_jam_len", &self.proof_jam.len())
+            .finish()
+    }
+}
+
+pub fn arbitrary_proof(effect: &NounSlab) -> Option<ArbitraryProof> {
+    if effect_tag(effect)? != "arbitrary-proof" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let product_noun = rest.head();
+    let proof_noun = rest.tail();
+    let mut stack = new_stack();
+    let product_jam = jam_to_bytes(&mut stack, product_noun);
+    let proof_jam = jam_to_bytes(&mut stack, proof_noun);
+    Some(ArbitraryProof {
+        product_jam,
+        proof_jam,
+    })
+}
+
+pub fn first_arbitrary_proof(effects: &[NounSlab]) -> Option<ArbitraryProof> {
+    effects.iter().find_map(arbitrary_proof)
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------

@@ -11,6 +11,75 @@ implementation sequence.
 > [§Phase 7](#phase-7--staleness--fork-resistance-blocking-before-production)
 > below for the acceptance criteria.
 
+## Today update (2026-04-24 pm) — Phase 3c step 3 foundation
+
+Landed the infrastructure Phase 3c step 3 needs, without yet closing
+the last trust gap. The concrete deliverables:
+
+1. **Tip5-free validator variant**: new `++has-tx-in-list` (O(n)
+   linear walk, no Tip5 jets in the trace) + `++validate-claim-bundle-linear`
+   that uses it. Semantically identical to `validate-claim-bundle`
+   on realistic inputs (blocks carry tens to low-hundreds of
+   tx-ids; O(n) is negligible vs total trace cost).
+2. **General-purpose prover primitive**: new `%prove-arbitrary`
+   kernel cause accepting jammed `(subject, formula)` bytes from the
+   hull. Kernel cues both, runs `prove-computation:vp`, emits
+   `[%arbitrary-proof product proof]`. This is the cause that a
+   future canonical Nock-encoding of `validate-claim-bundle-linear`
+   will be piped through.
+3. **Spike test**: `phase3c_step3_prove_arbitrary_roundtrip` builds
+   a trivial `[subject=42 formula=[4 [4 [4 [0 1]]]]]` pair from
+   Rust, pokes `%prove-arbitrary`, verifies the proof through
+   `%verify-stark`. **Measured: 610 ms prove, 602 ms verify,
+   ok=true, 59 235 B proof JAM**. Confirms the pipeline accepts
+   caller-supplied formulas end-to-end.
+
+### What's still deferred
+
+The remaining gap to full "validator inside the STARK" is the
+**Nock-formula encoding** of `validate-claim-bundle-linear`. The
+Hoon arm exists; what doesn't exist yet is a self-contained Nock
+formula that `fink:fock [subject=bundle formula]` can trace without
+depending on the kernel's compile-time context axes. This is
+non-trivial because Hoon-compiled formulas inherit axis references
+from the compile-time subject — when handed to
+`prove-computation` with a bundle-only subject, those references
+break.
+
+Approaches to attempt in a follow-up:
+
+1. **Hand-crafted Nock** — write the formula directly by
+   translating the validator arm's Nock tree, with axis 1 pointing
+   at the bundle. ~100 lines of Nock, tedious but tractable.
+2. **Subject-bundled core** — build `subject = [bundle validator-core]`,
+   formula = `[9 <arm-axis> 10 [6 0 2] 0 3]` (Nock-9 slam). Needs
+   hoonc introspection to extract `<arm-axis>` reliably.
+3. **Formula rebasing tool** — generic Hoon-to-self-contained-Nock
+   pass that walks a compiled formula and rewrites axis refs to a
+   caller-supplied subject layout. Useful for every future
+   validator-in-STARK use case.
+
+All three are compatible with the shipped `%prove-arbitrary` cause
+— whichever one lands first plugs in without changes to the kernel
+or Rust builders.
+
+### Updated Phase 3 status table
+
+| Level / step | Arms | Status |
+|---|---|---|
+| A | `fee-for-name`, `chain-links-to` | **shipped** |
+| B | `has-tx-in-page`, `matches-block-digest` | **shipped** (hull-trusted page summary) |
+| C | `matches-block-commitment`, `pays-sender`, `pays-amount` | pending `tx-witness.hoon` vendor |
+| 3c step 1 | `validate-claim-bundle` + `%validate-claim` cause | **shipped** |
+| 3c step 2 | `%prove-claim` = validator + committed STARK over bundle-digest | **shipped** (option-B recursion) |
+| 3c step 3 foundation | `has-tx-in-list` + `validate-claim-bundle-linear` + `%prove-arbitrary` | **shipped** |
+| 3c step 3 completion | Nock-formula encoding of `validate-claim-bundle-linear` + wire into `%prove-arbitrary` | pending encoding spike |
+
+### Totals
+
+**75 active tests, all green** (10 unit + 30 handlers + 9 phase2 +
+26 phase3 + 5 ignored prover — step 3 added one prover-heavy test).
+
 ## Today update (2026-04-24 pm) — Phase 3c validator + committed proof
 
 Landed Phase 3c in two steps — the gate validator, and a STARK-wrapped
