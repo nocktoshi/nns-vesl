@@ -25,8 +25,10 @@ use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
 use nns_vesl::kernel::{
-    build_fee_for_name_peek, build_verify_chain_link_poke, build_verify_tx_in_page_poke,
-    decode_fee_for_name, first_chain_link_result, first_tx_in_page_result, AnchorHeader,
+    build_fee_for_name_peek, build_validate_claim_poke, build_verify_chain_link_poke,
+    build_verify_tx_in_page_poke, decode_fee_for_name, first_chain_link_result,
+    first_tx_in_page_result, first_validate_claim_result, AnchorHeader, ClaimBundle,
+    ValidateClaimResult,
 };
 use nns_vesl::payment::fee_for_name;
 use nns_vesl::state::AppState;
@@ -369,5 +371,212 @@ async fn tx_in_page_forty_byte_two() {
     );
     assert!(
         !run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(3)).await
+    );
+}
+
+// =========================================================================
+// validate-claim-bundle — Phase 3c gate validator
+// =========================================================================
+
+/// Build a bundle that should pass every predicate (baseline good
+/// input). Individual tests mutate one field at a time to trigger
+/// the specific rejection they're exercising.
+fn good_bundle() -> ClaimBundle {
+    // 2-digit stem @ 5000 nicks fee. Shortest stable-atom inputs for
+    // the z-silt code path (see the tx_in_page_* note at the top of
+    // the file about jet edge cases with 3+ 40-byte atoms).
+    let page_digest = vec![0x42];
+    let tx_hash = vec![0x07];
+    let other_tx = vec![0x08];
+
+    ClaimBundle {
+        name: "ab.nock".to_string(),
+        owner: "owner-address".to_string(),
+        fee: 5_000,
+        tx_hash: tx_hash.clone(),
+        claim_block_digest: page_digest.clone(),
+        // Claim block IS the anchored tip — no intermediate headers.
+        anchor_headers: vec![],
+        page_digest: page_digest.clone(),
+        page_tx_ids: vec![tx_hash, other_tx],
+        anchored_tip: page_digest,
+    }
+}
+
+async fn run_validate(
+    state: &nns_vesl::state::SharedState,
+    bundle: &ClaimBundle,
+) -> ValidateClaimResult {
+    let poke = build_validate_claim_poke(bundle);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("validate-claim poke")
+    };
+    first_validate_claim_result(&effects).expect("validate-claim effect")
+}
+
+#[tokio::test]
+async fn validate_claim_happy_path() {
+    let (_tmp, state) = boot_kernel().await;
+    let bundle = good_bundle();
+    assert_eq!(run_validate(&state, &bundle).await, ValidateClaimResult::Ok);
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_invalid_name() {
+    let (_tmp, state) = boot_kernel().await;
+
+    // Missing `.nock` suffix.
+    let mut b = good_bundle();
+    b.name = "plain-name".to_string();
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("invalid-name".into())
+    );
+
+    // Uppercase — invalid-char.
+    let mut b = good_bundle();
+    b.name = "Ab.nock".to_string();
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("invalid-name".into())
+    );
+
+    // Empty stem.
+    let mut b = good_bundle();
+    b.name = ".nock".to_string();
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("invalid-name".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_fee_below_schedule() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // 2-char stem requires 5000; send 4999.
+    b.fee = 4_999;
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("fee-below-schedule".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_accepts_fee_above_schedule() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Overpaying is fine (the gate only checks fee >= fee-for-name).
+    b.fee = 1_000_000;
+    assert_eq!(run_validate(&state, &b).await, ValidateClaimResult::Ok);
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_page_digest_mismatch() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // claim-block-digest says block=0x42 but page.digest says block=0x99.
+    b.claim_block_digest = vec![0x99];
+    b.anchored_tip = vec![0x99];
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("page-digest-mismatch".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_tx_not_in_page() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Claim references tx_hash=0x07, but page.tx-ids doesn't contain it.
+    b.page_tx_ids = vec![vec![0x08], vec![0x09]];
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("tx-not-in-page".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_chain_broken() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Claim-block-digest (0x42) doesn't match anchored-tip (0x99) and
+    // no headers link them.
+    b.anchored_tip = vec![0x99];
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("chain-broken".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_accepts_chain_with_headers() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Claim block 0x42 at some past height. Anchor tip is 0x44.
+    // Chain: claim (0x42, height=10) <- 0x43 (height=11) <- 0x44 (height=12).
+    b.claim_block_digest = vec![0x42];
+    b.page_digest = vec![0x42];
+    b.anchor_headers = vec![
+        AnchorHeader {
+            digest: vec![0x43],
+            height: 11,
+            parent: vec![0x42],
+        },
+        AnchorHeader {
+            digest: vec![0x44],
+            height: 12,
+            parent: vec![0x43],
+        },
+    ];
+    b.anchored_tip = vec![0x44];
+    assert_eq!(run_validate(&state, &b).await, ValidateClaimResult::Ok);
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_broken_header_chain() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Headers don't chain — second header's parent should be 0x43
+    // but is 0x99.
+    b.claim_block_digest = vec![0x42];
+    b.page_digest = vec![0x42];
+    b.anchor_headers = vec![
+        AnchorHeader {
+            digest: vec![0x43],
+            height: 11,
+            parent: vec![0x42],
+        },
+        AnchorHeader {
+            digest: vec![0x44],
+            height: 12,
+            parent: vec![0x99],
+        },
+    ];
+    b.anchored_tip = vec![0x44];
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("chain-broken".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_short_circuits_on_first_error() {
+    let (_tmp, state) = boot_kernel().await;
+    // Deliberately construct a bundle that fails MULTIPLE predicates.
+    // The validator should report the first one (invalid-name) and
+    // not continue.
+    let mut b = good_bundle();
+    b.name = "BAD".to_string(); // G1 fails
+    b.fee = 0; // C2 would also fail
+    b.claim_block_digest = vec![0x99]; // page-digest-mismatch would also fail
+    b.page_tx_ids = vec![]; // tx-not-in-page would also fail
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("invalid-name".into())
     );
 }

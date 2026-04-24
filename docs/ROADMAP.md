@@ -11,6 +11,80 @@ implementation sequence.
 > [§Phase 7](#phase-7--staleness--fork-resistance-blocking-before-production)
 > below for the acceptance criteria.
 
+## Today update (2026-04-24 pm) — Phase 3c validator + committed proof
+
+Landed Phase 3c in two steps — the gate validator, and a STARK-wrapped
+committed proof over a validated bundle.
+
+### Step 1 — `validate-claim-bundle` + `%validate-claim` cause
+
+- `hoon/lib/nns-predicates.hoon` grew `+$claim-bundle`,
+  `+$validation-error`, G1 name-format helpers (`is-valid-name`,
+  `valid-char`, `all-valid-chars`, `has-nock-suffix`, `stem-len`),
+  and `++validate-claim-bundle` — the composition arm that checks,
+  in order: G1 (`is-valid-name`), C2 (`fee >= fee-for-name`), Level B
+  (`matches-block-digest`, `has-tx-in-page`), Level A
+  (`chain-links-to`). Short-circuits on the first failing predicate.
+- New kernel cause `%validate-claim` (read-only; does not mutate
+  state) emits `[%validate-claim-ok]` on pass or
+  `[%validate-claim-error <tag>]` where `<tag>` is one of
+  `invalid-name | fee-below-schedule | page-digest-mismatch |
+  tx-not-in-page | chain-broken`.
+- Rust: `ClaimBundle`, `build_validate_claim_poke`,
+  `ValidateClaimResult`, `first_validate_claim_result` in
+  `src/kernel.rs`.
+- 10 integration tests covering happy path + each rejection path +
+  chain-with-headers + short-circuit ordering.
+
+### Step 2 — `%prove-claim` cause + STARK
+
+- New kernel cause `%prove-claim` runs the validator first, only
+  proceeds to produce a STARK if validation passes. On pass, folds
+  `(jam bundle)` into a belt-digest and runs `prove-computation:vp`
+  over it under the kernel's current `(root, hull)`. Emits
+  `[%claim-proof bundle-digest proof]` on success.
+- The bundle-digest commitment is Fiat-Shamir-bound to `(root, hull)`
+  via vesl-prover's puzzle header/nonce absorption — a different
+  registry snapshot cannot produce a verifying proof for the same
+  bundle.
+- Rust: `build_prove_claim_poke`, `ClaimProof`, `claim_proof`,
+  `first_claim_proof` in `src/kernel.rs`.
+- `#[ignore]`d integration test `phase3c_prove_claim_roundtrip`:
+  validates a bundle, proves it, round-trips through
+  `%verify-stark`. **Measured: 4.997 s prove, 615 ms verify,
+  ok=true, proof JAM 76 537 B, peak RSS 1.0 GB** — in line with the
+  Phase 0 baseline (~4.7 s / 75 KiB).
+
+### What the proof attests to (and what it does NOT)
+
+**Attested** (inside the STARK):
+- A kernel whose registry is committed at `(root, hull)` asserted
+  the bundle-digest at that snapshot.
+- Fiat-Shamir binding means the proof cannot be rebound to a
+  different registry state.
+
+**Not yet attested in-STARK** (the wallet must check externally):
+- Validator predicates passed on the bundle → wallet re-runs
+  `validate-claim-bundle` locally on the received bundle.
+- Bundle-digest matches the committed subject → wallet re-folds
+  `(jam bundle)` to belt-digest, compares.
+- Payment semantics (C5 sender + amount) → deferred to Level C's
+  `tx-witness.hoon` vendor.
+- Block PoW STARK verification inside the gate → deferred to Phase
+  3c step 3 (embed `verify:sp-verifier` inside the trace).
+
+This is the "option B" recursion the research memo called out as the
+pragmatic intermediate. Level C and step 3 move the validator
+execution *inside* the STARK, eliminating the need for the wallet to
+re-run the validator itself. Tracked in the
+[Phase 3 status](#phase-3-status) table below.
+
+### Totals
+
+**75 tests green** (10 unit + 30 handlers + 9 phase2 + 26 phase3 +
+4 ignored prover — Phase 3c added one prover-heavy test marked
+`#[ignore]`).
+
 ## Today update (2026-04-24 pm) — slim-anchor refactor
 
 - ~~Collapsed kernel `+$anchored-chain` from `[tip-digest tip-height
@@ -80,7 +154,9 @@ implementation sequence.
 | A | `fee-for-name`, `chain-links-to` | **shipped** |
 | B | `has-tx-in-page`, `matches-block-digest` | **shipped** (hull-trusted page summary) |
 | C | `matches-block-commitment`, `pays-sender`, `pays-amount` | pending narrow `tx-witness.hoon` vendor |
-| Gate rewrite (3c) | Compose all predicates under `prove-computation` | pending Level C |
+| 3c step 1 | `validate-claim-bundle` + `%validate-claim` cause | **shipped** |
+| 3c step 2 | `%prove-claim` = validator + committed STARK over bundle-digest | **shipped** (option-B recursion; wallet re-runs validator) |
+| 3c step 3 | Validator execution inside the STARK (single-artifact trust) | pending Level C + Nock-formula encoding of predicates |
 
 ## Today update (2026-04-24 pm) — Phase 3 Level A predicates
 

@@ -21,9 +21,11 @@ use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
 use nns_vesl::kernel::{
-    build_prove_batch_poke, build_prove_identity_poke, build_verify_stark_poke, first_batch_proof,
-    first_batch_settled, first_prove_failed, first_prove_identity_result,
-    first_verify_stark_error, first_verify_stark_result,
+    build_prove_batch_poke, build_prove_claim_poke, build_prove_identity_poke,
+    build_verify_stark_poke, first_batch_proof, first_batch_settled, first_claim_proof,
+    first_prove_failed, first_prove_identity_result, first_validate_claim_result,
+    first_verify_stark_error, first_verify_stark_result, AnchorHeader, ClaimBundle,
+    ValidateClaimResult,
 };
 use nns_vesl::{api, state::AppState};
 use tokio::sync::Mutex;
@@ -332,4 +334,113 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
     // measured verify wall-clock is still representative of the
     // composition/FRI-dominated cost the recursion multiplier needs.
     let _ = ok;
+}
+
+/// Phase 3c step 2 acceptance: `%prove-claim` produces a STARK that
+/// commits to a bundle which PASSES the Phase 3c validator, and the
+/// proof round-trips through `%verify-stark` under the kernel's own
+/// `(root, hull)`.
+///
+/// This is the "option B" flow — validator outside the trace, STARK
+/// commits to the validated bundle's hash. A wallet-side equivalent
+/// would re-run `validate_claim_bundle` locally on the received
+/// bundle and match the hash against the proof's committed subject.
+///
+/// Marked `#[ignore]` because it's prover-heavy (~5 s). Run with
+///
+///   cargo test --test prover phase3c_prove_claim_roundtrip \
+///       -- --nocapture --ignored
+#[ignore]
+#[tokio::test]
+async fn phase3c_prove_claim_roundtrip() {
+    let (_tmp, state) = boot_nns_with_prover().await;
+
+    // Build a bundle that passes every Phase 3c validator predicate.
+    // Small 1-byte digests sidestep the z-silt jet edge-case
+    // documented in tests/phase3_predicates.rs.
+    let page_digest = vec![0x42];
+    let tx_hash = vec![0x07];
+    let other_tx = vec![0x08];
+    let bundle = ClaimBundle {
+        name: "ab.nock".to_string(),
+        owner: "owner-addr".to_string(),
+        fee: 5_000,
+        tx_hash: tx_hash.clone(),
+        claim_block_digest: page_digest.clone(),
+        anchor_headers: Vec::<AnchorHeader>::new(),
+        page_digest: page_digest.clone(),
+        page_tx_ids: vec![tx_hash, other_tx],
+        anchored_tip: page_digest,
+    };
+
+    // Sanity: bundle must validate before we ask for a proof.
+    {
+        let mut st = state.lock().await;
+        let v = st
+            .app
+            .poke(
+                SystemWire.to_wire(),
+                nns_vesl::kernel::build_validate_claim_poke(&bundle),
+            )
+            .await
+            .expect("validate poke");
+        assert_eq!(
+            first_validate_claim_result(&v),
+            Some(ValidateClaimResult::Ok),
+            "bundle must validate before attempting to prove"
+        );
+    }
+
+    // Produce the proof. Expected wall-clock: ~5 s (vesl-style trace,
+    // same shape as Phase 0 %prove-batch since the underlying
+    // fs-formula is identical).
+    let t_prove = Instant::now();
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(SystemWire.to_wire(), build_prove_claim_poke(&bundle))
+            .await
+            .expect("%prove-claim poke")
+    };
+    let prove_elapsed = t_prove.elapsed();
+
+    if let Some(trace_jam) = first_prove_failed(&effects) {
+        panic!(
+            "prove-computation crashed inside %prove-claim; trace len={} bytes",
+            trace_jam.len()
+        );
+    }
+    let proof = first_claim_proof(&effects).expect("%claim-proof effect");
+    println!(
+        "[phase3c] %prove-claim wall-clock: {:.3?} (bundle-digest {} B, proof jam {} B)",
+        prove_elapsed,
+        proof.bundle_digest.len(),
+        proof.proof_jam.len()
+    );
+    assert!(!proof.proof_jam.is_empty());
+
+    // Round-trip via %verify-stark, same kernel instance (so `root`
+    // and `hull` match what the prover Fiat-Shamir'd).
+    let verify_poke = build_verify_stark_poke(&proof.proof_jam);
+    let t_verify = Instant::now();
+    let vfx = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(SystemWire.to_wire(), verify_poke)
+            .await
+            .expect("%verify-stark poke")
+    };
+    let verify_elapsed = t_verify.elapsed();
+    println!(
+        "[phase3c] %verify-stark wall-clock: {:.3?}",
+        verify_elapsed
+    );
+    if let Some(msg) = first_verify_stark_error(&vfx) {
+        panic!("verify-stark rejected the claim proof: {msg}");
+    }
+    let ok = first_verify_stark_result(&vfx).expect("%verify-stark-result effect");
+    assert!(
+        ok,
+        "claim proof must round-trip through vesl-verifier on the same kernel",
+    );
 }

@@ -246,6 +246,51 @@ The wallet holds its own Nockchain view. No duplication.
   covers the recursive-STARK spike that validated the "gate
   verifies block-PoW inside its own trace" step.
 
+## What the current proof attests to (Phase 3c option-B recursion)
+
+Phase 3c landed the proof scaffolding in two steps: a `validate-claim`
+cause that runs Level A + Level B + G1/C2 predicates on a bundle, and
+a `prove-claim` cause that validates and then emits a STARK
+committing to `(bundle-digest, root, hull)`. Full tests land in
+`tests/prover.rs::phase3c_prove_claim_roundtrip` (#[ignore], ~5 s
+prove, ~615 ms verify).
+
+This is **option-B recursion** — the validator runs *outside* the
+STARK trace, and the STARK serves as a tamper-evident commitment to
+"this kernel, at this (root, hull), asserted this specific
+bundle-hash". A full Phase 3c step 3 (validator execution *inside*
+the trace) waits on Level C's tx-witness vendor + Nock-formula
+encoding of the predicate composition.
+
+**Wallet verification flow today**:
+
+1. Receive `(bundle, proof, bundle_digest)` from any NNS server.
+2. Verify the STARK via `verify:vesl-verifier` → confirms some
+   kernel at some `(root, hull)` committed `bundle_digest`.
+3. Re-fold `(jam bundle)` to belt-digest locally → must equal
+   `bundle_digest`. (Blocks a server from shipping a proof over a
+   different bundle than the one it sent you.)
+4. Re-run `validate_claim_bundle(bundle)` locally → must return
+   `Ok`. (Blocks a server from lying about the bundle passing the
+   gate.)
+5. Cross-reference `(root, hull, t_nns)` against the wallet's own
+   view (see [Staleness and fork resistance](#staleness-and-fork-resistance)).
+
+Steps 3 + 4 are cheap (no Tip5 sponge, no FRI). Step 2 is the
+~100 KB STARK verify. Steps 1 + 5 are network RTTs. The wallet's
+total work is still bounded by one STARK verify.
+
+**What step 3 upgrades**: moves the `validate_claim_bundle`
+execution into the STARK trace so the wallet no longer runs it.
+Single-artifact trust; smaller wallet SDK. Requires:
+
+- The Hoon predicates to be compilable to a Nock formula the prover
+  can embed in `prove-computation`'s `[subject formula]`. Either
+  hand-written or generated from the `++validate-claim-bundle` arm.
+- Level C predicates (`pays-sender`, `pays-amount`,
+  `matches-block-commitment`) to close the payment + page-commitment
+  trust gaps.
+
 ## Staleness and fork resistance
 
 The "wallet trusts Nockchain independently" story handles honest-but-

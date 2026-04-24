@@ -76,6 +76,44 @@
       tx-ids=(z-set @ux)       :: ordered set of tx-ids in this block
   ==
 ::
+::  +$claim-bundle: the complete per-claim input the Phase 3c gate
+::  consumes. The hull assembles this from the HTTP `/claim` request
+::  (claim tuple) + the Phase 2c chain fetchers (page-summary,
+::  anchor-headers) + the Phase 2a kernel anchor (anchored-tip).
+::
+::  Deliberately NOT included:
+::    - raw-tx noun (Level C — needs `tx-witness.hoon` vendor)
+::    - block PoW STARK proof (Level C+ — needs recursive-gate work)
+::
+::  Once Level C lands these get added as extra fields and the gate
+::  composes `pays-sender` / `pays-amount` / `verify:sp-verifier`
+::  alongside the Level A/B predicates.
+::
++$  claim-bundle
+  $:  name=@t                          :: the .nock name
+      owner=@t                         :: base58 Nockchain address
+      fee=@ud                          :: declared fee in nicks
+      tx-hash=@ux                      :: Tip5 tx-id of the paying tx
+      claim-block-digest=@ux           :: block where the paying tx landed
+      anchor-headers=(list anchor-header)
+      page=nns-page-summary            :: the claim's block summary
+      anchored-tip=@ux                 :: kernel's current anchor tip
+  ==
+::
+::  +$validation-error: tag-only union that names which predicate
+::  rejected a bundle. The kernel surfaces these as
+::  `[%validate-error <tag>]` effects so the hull + wallet can
+::  distinguish "malformed name" from "chain linkage broken" without
+::  parsing a cord.
+::
++$  validation-error
+  $?  %invalid-name                    :: G1 — name format
+      %fee-below-schedule              :: C2 — fee < fee-for-name
+      %page-digest-mismatch            :: claim-block-digest ≠ page.digest
+      %tx-not-in-page                  :: tx-hash not in page.tx-ids
+      %chain-broken                    :: anchor-headers don't link page to tip
+  ==
+::
 ::  +fee-for-name: NNS fee schedule, keyed on the stem length of a
 ::  `<stem>.nock` name. Mirror of [src/payment.rs::fee_for_name] —
 ::  when changing either side, update both and run the cross-repo
@@ -180,4 +218,93 @@
   |=  [pag=nns-page-summary claimed-digest=@ux]
   ^-  ?
   =(digest.pag claimed-digest)
+::
+::  --- G1 format helpers (duplicated from app.hoon so the gate
+::      library is self-contained — keep them in sync) ---
+::
+++  valid-char
+  |=  c=@
+  ^-  ?
+  ?|  &((gte c 'a') (lte c 'z'))
+      &((gte c '0') (lte c '9'))
+  ==
+::
+++  all-valid-chars
+  |=  cord=@t
+  ^-  ?
+  =/  n  (met 3 cord)
+  =/  i=@  0
+  |-
+  ?:  =(i n)  %.y
+  ?.  (valid-char (cut 3 [i 1] cord))  %.n
+  $(i +(i))
+::
+++  has-nock-suffix
+  |=  cord=@t
+  ^-  ?
+  =/  n  (met 3 cord)
+  ?:  (lth n 6)  %.n
+  =((cut 3 [(sub n 5) 5] cord) '.nock')
+::
+++  stem-len
+  |=  cord=@t
+  ^-  @ud
+  (sub (met 3 cord) 5)
+::
+::  +is-valid-name: G1 — `<nonempty lowercase+digit stem>.nock`.
+::
+++  is-valid-name
+  |=  name=@t
+  ^-  ?
+  ?.  (has-nock-suffix name)  %.n
+  =/  slen  (stem-len name)
+  ?:  =(slen 0)  %.n
+  (all-valid-chars (cut 3 [0 slen] name))
+::
+::  +validate-claim-bundle: Phase 3c gate validator. Composes the
+::  Level A + Level B predicates + the cheap G1/C2 format/fee checks
+::  into a single arm. Returns either `[%.y ~]` on success, or
+::  `[%.n err]` naming the first predicate that rejected the bundle.
+::
+::  Ordering is cheap-to-expensive so we short-circuit quickly on bad
+::  input. The expensive step is `chain-links-to`, which walks the
+::  full header chain with Tip5 equality comparisons (the follower
+::  should never submit a bundle whose chain isn't sound anyway).
+::
+::  Predicates NOT yet enforced (Level C, pending tx-witness vendor):
+::    - `verify:sp-verifier` on a block PoW STARK (block-proof field
+::      is not yet in the bundle)
+::    - `compute-id:raw-tx:t`             — claimed tx-hash really is
+::                                          this raw-tx
+::    - `pays-sender` / `pays-amount`     — C5 payment semantics
+::    - `matches-block-commitment`        — recompute page commitment
+::                                          from full page noun
+::  Until Level C lands, the hull must be trusted to have built the
+::  `page-summary` and `anchor-headers` from real chain data. The
+::  wallet-side freshness check (Phase 7) handles the remaining gap;
+::  see `docs/PROOF_STORAGE.md`.
+::
+++  validate-claim-bundle
+  |=  bundle=claim-bundle
+  ^-  (each ~ validation-error)
+  ::  G1 — name format.
+  ?.  (is-valid-name name.bundle)
+    [%| %invalid-name]
+  ::  C2 — fee >= fee-for-name.
+  ?.  (gte fee.bundle (fee-for-name name.bundle))
+    [%| %fee-below-schedule]
+  ::  Level B — claim-block-digest matches page.digest.
+  ?.  (matches-block-digest page.bundle claim-block-digest.bundle)
+    [%| %page-digest-mismatch]
+  ::  Level B — tx-hash is in the claimed block.
+  ?.  (has-tx-in-page page.bundle tx-hash.bundle)
+    [%| %tx-not-in-page]
+  ::  Level A — claim-block chains to the kernel's anchored tip.
+  ?.  %-  chain-links-to
+      :*  claim-block-digest.bundle
+          anchor-headers.bundle
+          anchored-tip.bundle
+      ==
+    [%| %chain-broken]
+  [%& ~]
 --

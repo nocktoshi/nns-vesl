@@ -314,6 +314,224 @@ pub fn first_tx_in_page_result(effects: &[NounSlab]) -> Option<bool> {
     effects.iter().find_map(tx_in_page_result)
 }
 
+/// Full per-claim bundle fed to the Phase 3c validator. Mirrors
+/// `+$claim-bundle` in `hoon/lib/nns-predicates.hoon`.
+///
+/// All digests (`tx_hash`, `claim_block_digest`, `page_digest`,
+/// `anchored_tip`, and every `AnchorHeader.{digest,parent}`) are raw
+/// 40-byte LE-packed Tip5 hashes. `page_tx_ids` is the list of all
+/// tx-ids in the claim's block — the kernel canonicalises these
+/// into the on-chain `(z-set @ux)` via `z-silt` before calling
+/// `has-tx-in-page`, so insertion order here doesn't matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimBundle {
+    pub name: String,
+    pub owner: String,
+    pub fee: u64,
+    pub tx_hash: Vec<u8>,
+    pub claim_block_digest: Vec<u8>,
+    pub anchor_headers: Vec<AnchorHeader>,
+    pub page_digest: Vec<u8>,
+    pub page_tx_ids: Vec<Vec<u8>>,
+    pub anchored_tip: Vec<u8>,
+}
+
+/// Build a `[%validate-claim ...]` poke slab.
+///
+/// Kernel runs Level A + Level B + G1/C2 predicates and emits
+/// `[%validate-claim-ok ~]` on success, or
+/// `[%validate-claim-error <tag>]` where `<tag>` is one of
+/// `invalid-name`, `fee-below-schedule`, `page-digest-mismatch`,
+/// `tx-not-in-page`, `chain-broken`.
+pub fn build_validate_claim_poke(bundle: &ClaimBundle) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "validate-claim");
+
+    let name_atom = make_cord_in(&mut slab, &bundle.name);
+    let owner_atom = make_cord_in(&mut slab, &bundle.owner);
+    let fee_atom = atom_from_u64(&mut slab, bundle.fee);
+    let tx_hash_atom = make_atom_in(&mut slab, &bundle.tx_hash);
+    let claim_digest_atom = make_atom_in(&mut slab, &bundle.claim_block_digest);
+
+    let mut headers_list = D(0);
+    for h in bundle.anchor_headers.iter().rev() {
+        let digest = make_atom_in(&mut slab, &h.digest);
+        let parent = make_atom_in(&mut slab, &h.parent);
+        let height = atom_from_u64(&mut slab, h.height);
+        let cell = T(&mut slab, &[digest, height, parent]);
+        headers_list = T(&mut slab, &[cell, headers_list]);
+    }
+
+    let page_digest_atom = make_atom_in(&mut slab, &bundle.page_digest);
+
+    let mut tx_ids_list = D(0);
+    for id in bundle.page_tx_ids.iter().rev() {
+        let key = make_atom_in(&mut slab, id);
+        tx_ids_list = T(&mut slab, &[key, tx_ids_list]);
+    }
+
+    let anchored_tip_atom = make_atom_in(&mut slab, &bundle.anchored_tip);
+
+    let poke = T(
+        &mut slab,
+        &[
+            tag,
+            name_atom,
+            owner_atom,
+            fee_atom,
+            tx_hash_atom,
+            claim_digest_atom,
+            headers_list,
+            page_digest_atom,
+            tx_ids_list,
+            anchored_tip_atom,
+        ],
+    );
+    slab.set_root(poke);
+    slab
+}
+
+/// Result of `%validate-claim`: either a pass, or a rejection tag
+/// naming which predicate refused the bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidateClaimResult {
+    Ok,
+    Error(String),
+}
+
+/// Extract the first `%validate-claim-ok` / `%validate-claim-error`
+/// effect from a poke's effect list. Returns `None` if no such effect
+/// was emitted (kernel crash or wrong cause).
+pub fn validate_claim_result(effect: &NounSlab) -> Option<ValidateClaimResult> {
+    let tag = effect_tag(effect)?;
+    match tag.as_str() {
+        "validate-claim-ok" => Some(ValidateClaimResult::Ok),
+        "validate-claim-error" => {
+            let noun = unsafe { effect.root() };
+            let cell = noun.as_cell().ok()?;
+            let atom = cell.tail().as_atom().ok()?;
+            let bytes = atom.as_ne_bytes();
+            let s = std::str::from_utf8(bytes)
+                .ok()?
+                .trim_end_matches('\0')
+                .to_string();
+            Some(ValidateClaimResult::Error(s))
+        }
+        _ => None,
+    }
+}
+
+pub fn first_validate_claim_result(effects: &[NounSlab]) -> Option<ValidateClaimResult> {
+    effects.iter().find_map(validate_claim_result)
+}
+
+/// Build a `[%prove-claim ...]` poke slab.
+///
+/// Same payload shape as `%validate-claim`; the kernel runs the
+/// validator first and only produces a proof on pass. On rejection
+/// the kernel emits the usual `%validate-claim-error <tag>` effect.
+///
+/// Success effect: `[%claim-proof bundle-digest proof]` — see
+/// [`ClaimProof`].
+pub fn build_prove_claim_poke(bundle: &ClaimBundle) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-claim");
+
+    let name_atom = make_cord_in(&mut slab, &bundle.name);
+    let owner_atom = make_cord_in(&mut slab, &bundle.owner);
+    let fee_atom = atom_from_u64(&mut slab, bundle.fee);
+    let tx_hash_atom = make_atom_in(&mut slab, &bundle.tx_hash);
+    let claim_digest_atom = make_atom_in(&mut slab, &bundle.claim_block_digest);
+
+    let mut headers_list = D(0);
+    for h in bundle.anchor_headers.iter().rev() {
+        let digest = make_atom_in(&mut slab, &h.digest);
+        let parent = make_atom_in(&mut slab, &h.parent);
+        let height = atom_from_u64(&mut slab, h.height);
+        let cell = T(&mut slab, &[digest, height, parent]);
+        headers_list = T(&mut slab, &[cell, headers_list]);
+    }
+
+    let page_digest_atom = make_atom_in(&mut slab, &bundle.page_digest);
+
+    let mut tx_ids_list = D(0);
+    for id in bundle.page_tx_ids.iter().rev() {
+        let key = make_atom_in(&mut slab, id);
+        tx_ids_list = T(&mut slab, &[key, tx_ids_list]);
+    }
+
+    let anchored_tip_atom = make_atom_in(&mut slab, &bundle.anchored_tip);
+
+    let poke = T(
+        &mut slab,
+        &[
+            tag,
+            name_atom,
+            owner_atom,
+            fee_atom,
+            tx_hash_atom,
+            claim_digest_atom,
+            headers_list,
+            page_digest_atom,
+            tx_ids_list,
+            anchored_tip_atom,
+        ],
+    );
+    slab.set_root(poke);
+    slab
+}
+
+/// Payload of `[%claim-proof bundle-digest=@ proof=*]` emitted on a
+/// successful `%prove-claim`.
+///
+/// `bundle_digest` is the Goldilocks-belt fold of `(jam bundle)` —
+/// the commitment the STARK's Fiat-Shamir absorbed. `proof_jam` is
+/// the raw vesl-style `proof:sp` noun JAM'd for transport. Wallet
+/// flow:
+///
+///   1. Receive the bundle + this proof from any NNS server.
+///   2. Jam the bundle locally; fold to belt-digest via the same
+///      procedure. Must equal `bundle_digest`.
+///   3. Verify the STARK via `verify:vesl-verifier` with the
+///      recomputed bundle-digest as the subject.
+///   4. Re-run `validate_claim_bundle` on the bundle locally.
+///   5. Check `(root, hull)` against the expected registry snapshot
+///      (e.g. from a `/snapshot` peek or prior commitment).
+pub struct ClaimProof {
+    pub bundle_digest: Vec<u8>,
+    pub proof_jam: Vec<u8>,
+}
+
+impl std::fmt::Debug for ClaimProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimProof")
+            .field("bundle_digest_len", &self.bundle_digest.len())
+            .field("proof_jam_len", &self.proof_jam.len())
+            .finish()
+    }
+}
+
+pub fn claim_proof(effect: &NounSlab) -> Option<ClaimProof> {
+    if effect_tag(effect)? != "claim-proof" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let bundle_digest = rest.head().as_atom().ok()?.as_ne_bytes().to_vec();
+    let proof_noun = rest.tail();
+    let mut stack = new_stack();
+    let proof_jam = jam_to_bytes(&mut stack, proof_noun);
+    Some(ClaimProof {
+        bundle_digest,
+        proof_jam,
+    })
+}
+
+pub fn first_claim_proof(effects: &[NounSlab]) -> Option<ClaimProof> {
+    effects.iter().find_map(claim_proof)
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------

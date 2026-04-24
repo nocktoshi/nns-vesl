@@ -258,6 +258,62 @@
       ::  lie about `tx-ids`.
       ::
       [%verify-tx-in-page digest=@ux tx-ids=(list @ux) claimed-tx-id=@ux]
+      ::  Phase 3c: compose all Level A + Level B + G1/C2 predicates
+      ::  into one bundled validation call. Read-only — the cause does
+      ::  not mutate state. Emits `[%validate-claim-ok]` on success or
+      ::  `[%validate-claim-error <tag>]` on the first failing
+      ::  predicate. The hull uses this pre-%claim to give users an
+      ::  early rejection + structured error tag before committing a
+      ::  claim that would only be rejected during chain replay.
+      ::
+      ::  `tx-ids` is a flat list (kernel canonicalises into a
+      ::  `(z-set @ux)` via `z-silt` — see `%verify-tx-in-page` for
+      ::  why the caller can't ship a tree directly).
+      ::
+      $:  %validate-claim
+          name=@t
+          owner=@t
+          fee=@ud
+          tx-hash=@ux
+          claim-block-digest=@ux
+          anchor-headers=(list anchor-header)
+          page-digest=@ux
+          page-tx-ids=(list @ux)
+          anchored-tip=@ux
+      ==
+      ::  Phase 3c step 2: validated proof of a single claim.
+      ::
+      ::  Same payload shape as %validate-claim. Kernel runs the
+      ::  full validator first; on pass, produces a STARK committing
+      ::  to `belt-digest(jam(bundle))` under the current (root, hull)
+      ::  registry snapshot. On validator rejection, emits the usual
+      ::  `%validate-claim-error <tag>` — no proof is produced.
+      ::
+      ::  What the STARK attests:
+      ::    - a kernel whose registry is committed at (root, hull)
+      ::    - asserted the bundle-hash at that snapshot.
+      ::
+      ::  What the wallet still verifies (out of the STARK):
+      ::    - validator passes on the received bundle.
+      ::    - bundle-hash matches the STARK's committed hash.
+      ::    - (root, hull) match the expected registry anchor.
+      ::  This is option-B recursion: the STARK commits to a hashed
+      ::  witness, the wallet re-checks the witness's validity. A
+      ::  future follow-up (Level C + Phase 3c step 3) will embed the
+      ::  validator execution INSIDE the STARK so the wallet needs
+      ::  only to verify the proof — see `docs/PROOF_STORAGE.md`.
+      ::
+      $:  %prove-claim
+          name=@t
+          owner=@t
+          fee=@ud
+          tx-hash=@ux
+          claim-block-digest=@ux
+          anchor-headers=(list anchor-header)
+          page-digest=@ux
+          page-tx-ids=(list @ux)
+          anchored-tip=@ux
+      ==
       ::  nockup:cause
       ::  graft-inject would add `vesl-cause` here on a fresh
       ::  kernel. Already present below; marker is idempotent.
@@ -839,6 +895,108 @@
       :_  state
       ^-  (list effect)
       ~[[%tx-in-page-result ok]]
+      ::
+        ::  %validate-claim: Phase 3c gate validator. Composes Level A
+        ::  + Level B + G1/C2 predicates on the full claim bundle.
+        ::  Read-only; emits `[%validate-claim-ok]` on success or
+        ::  `[%validate-claim-error <tag>]` where <tag> names the
+        ::  first predicate that rejected. State is not mutated.
+        ::
+        %validate-claim
+      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
+      =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
+      =/  bundle=claim-bundle:np
+        :*  name.u.act
+            owner.u.act
+            fee.u.act
+            tx-hash.u.act
+            claim-block-digest.u.act
+            anchor-headers.u.act
+            pag
+            anchored-tip.u.act
+        ==
+      =/  res=(each ~ validation-error:np)
+        (validate-claim-bundle:np bundle)
+      ?-  -.res
+          %&
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-ok ~]]
+      ::
+          %|
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-error p.res]]
+      ==
+      ::
+        ::  %prove-claim: validator + STARK in one poke. Reject before
+        ::  proving if any predicate fails; only emit a proof for a
+        ::  bundle the gate accepts. The proof commits to the
+        ::  bundle's belt-digest under the kernel's current
+        ::  (root, hull) registry snapshot — a wallet re-runs the
+        ::  validator locally against the received bundle and checks
+        ::  the hash matches.
+        ::
+        %prove-claim
+      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
+      =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
+      =/  bundle=claim-bundle:np
+        :*  name.u.act
+            owner.u.act
+            fee.u.act
+            tx-hash.u.act
+            claim-block-digest.u.act
+            anchor-headers.u.act
+            pag
+            anchored-tip.u.act
+        ==
+      =/  v-res=(each ~ validation-error:np)
+        (validate-claim-bundle:np bundle)
+      ?.  ?=(%& -.v-res)
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-error p.v-res]]
+      ::  Bundle passed validation. Compute the commitment we'll
+      ::  embed in the STARK: belt-digest over `(jam bundle)`, same
+      ::  shape as %prove-batch's belt-digest so the Rust side can
+      ::  reuse its decoder.
+      ::
+      =/  bundle-bytes=@  (jam bundle)
+      =/  bundle-digest=@
+        =/  belts=(list @)  (split-to-belts bundle-bytes)
+        =/  p=@  (add (sub (bex 64) (bex 32)) 1)
+        %+  roll  belts
+        |=  [a=@ b=@]
+        (mod (add a b) p)
+      ::  Deterministic Nock formula — 64 nested [4 f] increments,
+      ::  identical to %prove-batch. Keeps trace length bounded and
+      ::  lets us reuse the vesl-prover path unchanged.
+      ::
+      =/  fs-formula=*
+        =/  f=*  [0 1]
+        =|  i=@
+        |-
+        ?:  =(i 64)  f
+        $(f [4 f], i +(i))
+      =/  proof-attempt
+        %-  mule  |.
+        (prove-computation:vp bundle-digest fs-formula root.state hull.state)
+      ?.  ?=(%& -.proof-attempt)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.proof-attempt)]]
+      =/  pr  p.proof-attempt
+      ?.  ?=(%& -.pr)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.pr)]]
+      =/  the-proof=proof:sp  p.pr
+      ::  Cache for later verification via %verify-stark (Phase 1-redo).
+      ::
+      =.  last-proved.state  `[bundle-digest fs-formula]
+      :_  state
+      ^-  (list effect)
+      ~[[%claim-proof bundle-digest the-proof]]
       ::
         %set-primary
       =/  c  u.act
