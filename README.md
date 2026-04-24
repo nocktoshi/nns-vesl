@@ -56,6 +56,50 @@ curl http://127.0.0.1:3000/resolve?address=8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrx
 curl http://127.0.0.1:3000/status
 ```
 
+## HTTP API
+
+Endpoint names mirror the kernel's pokes (`POST /claim` →
+`%claim`, `POST /primary` → `%set-primary`). This is a breaking
+departure from the legacy Cloudflare worker, which used
+`POST /verify`; migrate clients by renaming the path. CORS is
+open (`*`).
+
+Terminology note:
+
+- `claim_id` in HTTP (`/claim`, `/claim-status`) is the hull-level async
+submission handle for follower tracking.
+- The kernel's monotonic state counter is `claim-count` (historically called
+`claim-id` in older docs/effects).
+
+
+| Method | Path                        | Purpose                                                                                                                                                                                                                                                                                                                                                                     |
+| ------ | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/register`                 | Create a pending reservation (`{address, name}`)                                                                                                                                                                                                                                                                                                                            |
+| POST   | `/claim`                    | Submit claim-note + enqueue replay (`{address, name, txHash?}`); `txHash` is required in non-local modes. Returns `{claim_id, status}` and follower applies in chain order when mined                                                                                                                                                                                       |
+| GET    | `/claim-status?claim_id=X`  | Query: `GET http://127.0.0.1:3000/claim-status?claim_id=<id>`. Returns `{claim_id, status, txHash?, registration?, reason?}` where lifecycle statuses are `submitted` (queued), `confirmed` (mined/applying), `finalized` (kernel accepted; includes `registration`), `rejected` (replay failed; includes `reason`). Unknown ids return `404 {"error":"unknown claim_id"}`. |
+| POST   | `/primary`                  | Designate which of caller's names is primary (`{address, name}`), pokes kernel `%set-primary`                                                                                                                                                                                                                                                                               |
+| POST   | `/settle`                   | Produce one batch receipt for every name claimed since the last settle (empty body); pokes kernel `%settle-batch`                                                                                                                                                                                                                                                           |
+| GET    | `/snapshot`                 | Current commitment `{claim_id, hull, root}` (hex-encoded)                                                                                                                                                                                                                                                                                                                   |
+| GET    | `/pending-batch`            | Names waiting to be settled `{count, names[], last_settled_claim_id}`                                                                                                                                                                                                                                                                                                       |
+| GET    | `/pending`                  | All pending entries, newest first                                                                                                                                                                                                                                                                                                                                           |
+| GET    | `/verified`                 | All registered entries, newest first                                                                                                                                                                                                                                                                                                                                        |
+| GET    | `/resolve?name=X`           | `{address}` or 404                                                                                                                                                                                                                                                                                                                                                          |
+| GET    | `/resolve?address=X`        | `{name}` — the address's **primary** — or 404                                                                                                                                                                                                                                                                                                                               |
+| GET    | `/proof?name=X[&address=Y]` | Inclusion bundle + transition anchor `{name, owner, txHash, claim_id, root, hull, proof[], transition, transition_proof?}`. Optional `address` filter returns 404 on owner mismatch.                                                                                                                                                                                        |
+| GET    | `/search?name=X`            | `{name, price, status, owner?, registeredAt?}`                                                                                                                                                                                                                                                                                                                              |
+| GET    | `/search?address=X`         | `{address, pending[], verified[], primary?}`                                                                                                                                                                                                                                                                                                                                |
+| GET    | `/status`                   | Diagnostic: counts, merkle root, settlement mode                                                                                                                                                                                                                                                                                                                            |
+| GET    | `/health`                   | `{status: "ok"}`                                                                                                                                                                                                                                                                                                                                                            |
+
+
+One address can own any number of names. `/resolve?address=` returns
+the owner's **primary** name (set by the kernel to the first claim
+for that owner, or to whatever the user last sent to `/primary`).
+`/primary` is owner-gated in the kernel — a `%set-primary` whose
+`address` does not match `names[name].owner` is rejected with a
+`%primary-error` and the mirror is not updated.
+
+
 ## Implementation
 
 This follows the `data-registry` pattern from the Vesl templates: a
@@ -365,48 +409,6 @@ domain invariant, so changing it does NOT bump the claim-count or the
 root — `/settle` would otherwise churn a new hull on every primary
 flip for no settlement benefit.
 
-## HTTP API
-
-Endpoint names mirror the kernel's pokes (`POST /claim` →
-`%claim`, `POST /primary` → `%set-primary`). This is a breaking
-departure from the legacy Cloudflare worker, which used
-`POST /verify`; migrate clients by renaming the path. CORS is
-open (`*`).
-
-Terminology note:
-
-- `claim_id` in HTTP (`/claim`, `/claim-status`) is the hull-level async
-submission handle for follower tracking.
-- The kernel's monotonic state counter is `claim-count` (historically called
-`claim-id` in older docs/effects).
-
-
-| Method | Path                        | Purpose                                                                                                                                                                                                                                                                                                                                                                     |
-| ------ | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/register`                 | Create a pending reservation (`{address, name}`)                                                                                                                                                                                                                                                                                                                            |
-| POST   | `/claim`                    | Submit claim-note + enqueue replay (`{address, name, txHash?}`); `txHash` is required in non-local modes. Returns `{claim_id, status}` and follower applies in chain order when mined                                                                                                                                                                                       |
-| GET    | `/claim-status?claim_id=X`  | Query: `GET http://127.0.0.1:3000/claim-status?claim_id=<id>`. Returns `{claim_id, status, txHash?, registration?, reason?}` where lifecycle statuses are `submitted` (queued), `confirmed` (mined/applying), `finalized` (kernel accepted; includes `registration`), `rejected` (replay failed; includes `reason`). Unknown ids return `404 {"error":"unknown claim_id"}`. |
-| POST   | `/primary`                  | Designate which of caller's names is primary (`{address, name}`), pokes kernel `%set-primary`                                                                                                                                                                                                                                                                               |
-| POST   | `/settle`                   | Produce one batch receipt for every name claimed since the last settle (empty body); pokes kernel `%settle-batch`                                                                                                                                                                                                                                                           |
-| GET    | `/snapshot`                 | Current commitment `{claim_id, hull, root}` (hex-encoded)                                                                                                                                                                                                                                                                                                                   |
-| GET    | `/pending-batch`            | Names waiting to be settled `{count, names[], last_settled_claim_id}`                                                                                                                                                                                                                                                                                                       |
-| GET    | `/pending`                  | All pending entries, newest first                                                                                                                                                                                                                                                                                                                                           |
-| GET    | `/verified`                 | All registered entries, newest first                                                                                                                                                                                                                                                                                                                                        |
-| GET    | `/resolve?name=X`           | `{address}` or 404                                                                                                                                                                                                                                                                                                                                                          |
-| GET    | `/resolve?address=X`        | `{name}` — the address's **primary** — or 404                                                                                                                                                                                                                                                                                                                               |
-| GET    | `/proof?name=X[&address=Y]` | Inclusion bundle + transition anchor `{name, owner, txHash, claim_id, root, hull, proof[], transition, transition_proof?}`. Optional `address` filter returns 404 on owner mismatch.                                                                                                                                                                                        |
-| GET    | `/search?name=X`            | `{name, price, status, owner?, registeredAt?}`                                                                                                                                                                                                                                                                                                                              |
-| GET    | `/search?address=X`         | `{address, pending[], verified[], primary?}`                                                                                                                                                                                                                                                                                                                                |
-| GET    | `/status`                   | Diagnostic: counts, merkle root, settlement mode                                                                                                                                                                                                                                                                                                                            |
-| GET    | `/health`                   | `{status: "ok"}`                                                                                                                                                                                                                                                                                                                                                            |
-
-
-One address can own any number of names. `/resolve?address=` returns
-the owner's **primary** name (set by the kernel to the first claim
-for that owner, or to whatever the user last sent to `/primary`).
-`/primary` is owner-gated in the kernel — a `%set-primary` whose
-`address` does not match `names[name].owner` is rejected with a
-`%primary-error` and the mirror is not updated.
 
 Fee tiers (ported from `nock-names-worker/src/utils/constants.ts`):
 
