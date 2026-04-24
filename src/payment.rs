@@ -1,13 +1,11 @@
 //! Payment verification.
 //!
-//! v1 behavior is chain-aware when a caller supplies `txHash` on
-//! `POST /claim`: the hull checks whether that tx is accepted on the
-//! configured chain endpoint. In local mode (or when no `txHash` is
-//! provided) we fall back to a synthetic tx id for development.
-
-use uuid::Uuid;
+//! v1 behavior supports optional `txHash` on `POST /claim`.
+//! In non-local modes, txHash is required by the API handler.
+//! In local mode, missing txHash falls back to a synthetic id.
 
 use crate::chain::transaction_is_accepted;
+use uuid::Uuid;
 
 /// Verify payment and return the tx hash that should be committed in
 /// kernel state for C4 payment-replay protection.
@@ -19,10 +17,10 @@ pub async fn verify(
     claimed_tx_hash: Option<&str>,
 ) -> Result<String, PaymentError> {
     match claimed_tx_hash.map(str::trim).filter(|s| !s.is_empty()) {
-        // Local/dev mode fallback: keep deterministic shape while
-        // avoiding mandatory chain integration in tests.
-        None => Ok(format!("stub-{}", Uuid::new_v4())),
         Some(tx_hash) => {
+            if matches!(settlement.mode, vesl_core::SettlementMode::Local) {
+                return Ok(tx_hash.to_string());
+            }
             let endpoint = settlement
                 .chain_endpoint
                 .as_deref()
@@ -45,6 +43,7 @@ pub async fn verify(
             let _ = required_fee;
             Ok(tx_hash.to_string())
         }
+        None => Ok(format!("stub-{}", Uuid::new_v4())),
     }
 }
 

@@ -5,20 +5,20 @@
 //!
 //!   - `%claim` — hot path. The hull sends one per `POST /claim`
 //!     and the kernel writes `names` + `tx-hashes`, bumps the
-//!     claim-id counter, recomputes the Merkle root over the full
+//!     claim-count counter, recomputes the Merkle root over the full
 //!     `names` map, and auto-registers a fresh hull in the graft.
 //!     Effects: `%claimed`, optional `%primary-set`,
-//!     `%claim-id-bumped`, and graft's `%vesl-registered`. Returns
+//!     `%claim-count-bumped`, and graft's `%vesl-registered`. Returns
 //!     `%claim-error <msg>` on a user-visible failure without
 //!     mutating state.
 //!
 //!   - `%set-primary` — owner-gated reverse-lookup update. Writes
-//!     `primaries` only; does NOT bump the claim-id. Effects:
+//!     `primaries` only; does NOT bump the claim-count. Effects:
 //!     `%primary-set` on success, `%primary-error <msg>` on
 //!     rejection.
 //!
 //!   - `%settle-batch` — batch settlement. Kernel-side: selects
-//!     every name with `entry.claim-id > last-settled-claim-id`,
+//!     every name with `entry.claim-count > last-settled-claim-id`,
 //!     builds one `graft-payload` holding the whole batch, and
 //!     internally dispatches a single `%vesl-settle`. Effects:
 //!     `%batch-settled claim-id count note-id` plus graft's
@@ -30,7 +30,7 @@
 //!     historical roots.
 //!
 //! Peek paths (see `hoon/app/app.hoon::peek`):
-//!   `/owner/<name>`, `/primary/<addr>`, `/entries`, `/claim-id`,
+//!   `/owner/<name>`, `/primary/<addr>`, `/entries`, `/claim-count`,
 //!   `/last-settled`, `/hull`, `/root`, `/snapshot`, `/proof/<name>`,
 //!   `/pending-batch`, plus the graft's `/registered/<hull>`,
 //!   `/settled/<note-id>`, `/root/<hull>`.
@@ -48,7 +48,7 @@ use nockvm::noun::{Noun, D, T};
 ///
 ///   - `[%claimed name owner tx-hash]` on success; both `names`
 ///     and `tx-hashes` get updated. Also emits
-///     `[%claim-id-bumped claim-id hull root]` and the graft's
+///     `[%claim-count-bumped claim-count hull root]` and the graft's
 ///     `[%vesl-registered hull root]` so the hull can update its
 ///     snapshot cache without an extra peek. On a first claim for
 ///     this owner, `[%primary-set owner name]` is emitted too.
@@ -124,7 +124,7 @@ pub fn build_snapshot_peek() -> NounSlab {
 /// Build a `/pending-batch ~` peek path slab.
 ///
 /// Kernel response: `[~ ~ (list @t)]` — the sorted list of names
-/// with `entry.claim-id > last-settled-claim-id`. An empty list
+/// with `entry.claim-count > last-settled-claim-id`. An empty list
 /// means there is nothing to settle right now.
 pub fn build_pending_batch_peek() -> NounSlab {
     single_tag_peek("pending-batch")
@@ -140,7 +140,7 @@ pub fn build_last_settled_peek() -> NounSlab {
 /// Build a `/owner/<name>` peek path slab.
 ///
 /// Kernel response: `[~ ~ (unit name-entry)]` where
-/// `name-entry = [owner=@t tx-hash=@t claim-id=@ud]`. The inner
+/// `name-entry = [owner=@t tx-hash=@t claim-count=@ud]`. The inner
 /// `(unit ...)` is `~` when the name is not in the registry.
 pub fn build_owner_peek(name: &str) -> NounSlab {
     name_peek("owner", name)
@@ -253,7 +253,7 @@ pub fn decode_last_settled(result: &NounSlab) -> Result<u64, String> {
 pub struct NameEntry {
     pub owner: String,
     pub tx_hash: String,
-    pub claim_id: u64,
+    pub claim_count: u64,
 }
 
 /// Decode the `[~ ~ (unit name-entry)]` peek result for
@@ -262,7 +262,7 @@ pub struct NameEntry {
 pub fn decode_owner(result: &NounSlab) -> Result<Option<NameEntry>, String> {
     let inner = peek_unwrap_some(result)?;
     // Inner is `(unit name-entry)`: atom 0 when missing, `[~ entry]`
-    // when present. `entry = [owner=@t tx-hash=@t claim-id=@ud]`.
+    // when present. `entry = [owner=@t tx-hash=@t claim-count=@ud]`.
     if inner.as_atom().is_ok() {
         return Ok(None);
     }
@@ -279,16 +279,16 @@ pub fn decode_owner(result: &NounSlab) -> Result<Option<NameEntry>, String> {
         .as_cell()
         .map_err(|_| "owner: entry tail not a cell".to_string())?;
     let tx_hash = atom_to_cord(rest.head())?;
-    let claim_id = rest
+    let claim_count = rest
         .tail()
         .as_atom()
-        .map_err(|_| "owner: claim_id not an atom".to_string())?
+        .map_err(|_| "owner: claim_count not an atom".to_string())?
         .as_u64()
-        .map_err(|_| "owner: claim_id overflows u64".to_string())?;
+        .map_err(|_| "owner: claim_count overflows u64".to_string())?;
     Ok(Some(NameEntry {
         owner,
         tx_hash,
-        claim_id,
+        claim_count,
     }))
 }
 
@@ -456,32 +456,36 @@ pub fn primary_set(effect: &NounSlab) -> Option<(String, String)> {
     Some((addr, name))
 }
 
-/// Payload of a `[%claim-id-bumped claim-id=@ud hull=@ root=@]` effect
+/// Payload of a `[%claim-count-bumped claim-count=@ud hull=@ root=@]` effect
 /// emitted by `%claim`. `hull` and `root` are the raw LE atom bytes
 /// (opaque — cached in the hull's snapshot view).
 #[derive(Debug, Clone)]
-pub struct ClaimIdBumped {
-    pub claim_id: u64,
+pub struct ClaimCountBumped {
+    pub claim_count: u64,
     pub hull: Vec<u8>,
     pub root: Vec<u8>,
 }
 
-pub fn claim_id_bumped(effect: &NounSlab) -> Option<ClaimIdBumped> {
-    if effect_tag(effect)? != "claim-id-bumped" {
+pub fn claim_count_bumped(effect: &NounSlab) -> Option<ClaimCountBumped> {
+    if effect_tag(effect)? != "claim-count-bumped" {
         return None;
     }
     let noun = unsafe { effect.root() };
     let cell = noun.as_cell().ok()?;
     let rest = cell.tail().as_cell().ok()?;
-    let claim_id = rest.head().as_atom().ok()?.as_u64().ok()?;
+    let claim_count = rest.head().as_atom().ok()?.as_u64().ok()?;
     let rest2 = rest.tail().as_cell().ok()?;
     let hull = rest2.head().as_atom().ok()?.as_ne_bytes().to_vec();
     let root = rest2.tail().as_atom().ok()?.as_ne_bytes().to_vec();
-    Some(ClaimIdBumped { claim_id, hull, root })
+    Some(ClaimCountBumped {
+        claim_count,
+        hull,
+        root,
+    })
 }
 
-pub fn first_claim_id_bumped(effects: &[NounSlab]) -> Option<ClaimIdBumped> {
-    effects.iter().find_map(claim_id_bumped)
+pub fn first_claim_count_bumped(effects: &[NounSlab]) -> Option<ClaimCountBumped> {
+    effects.iter().find_map(claim_count_bumped)
 }
 
 /// Payload of a graft `[%vesl-settled note=[id hull root [%settled ~]]]`
@@ -514,13 +518,13 @@ pub fn first_vesl_settled(effects: &[NounSlab]) -> Option<VeslSettled> {
     effects.iter().find_map(vesl_settled)
 }
 
-/// Payload of a `[%batch-settled claim-id=@ud count=@ud note-id=@]`
-/// effect emitted by the kernel's `%settle-batch` arm. `claim-id` is
+/// Payload of a `[%batch-settled claim-count=@ud count=@ud note-id=@]`
+/// effect emitted by the kernel's `%settle-batch` arm. `claim-count` is
 /// the commitment at which the batch was packaged, which the hull
 /// stores as its new `last-settled-claim-id`.
 #[derive(Debug, Clone)]
 pub struct BatchSettled {
-    pub claim_id: u64,
+    pub claim_count: u64,
     pub count: u64,
     pub note_id: Vec<u8>,
 }
@@ -532,12 +536,12 @@ pub fn batch_settled(effect: &NounSlab) -> Option<BatchSettled> {
     let noun = unsafe { effect.root() };
     let cell = noun.as_cell().ok()?;
     let rest = cell.tail().as_cell().ok()?;
-    let claim_id = rest.head().as_atom().ok()?.as_u64().ok()?;
+    let claim_count = rest.head().as_atom().ok()?.as_u64().ok()?;
     let rest2 = rest.tail().as_cell().ok()?;
     let count = rest2.head().as_atom().ok()?.as_u64().ok()?;
     let note_id = rest2.tail().as_atom().ok()?.as_ne_bytes().to_vec();
     Some(BatchSettled {
-        claim_id,
+        claim_count,
         count,
         note_id,
     })

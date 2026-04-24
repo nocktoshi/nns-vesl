@@ -16,16 +16,16 @@
 ::    A hull is an immutable commitment (see vesl-graft: "A given
 ::    hull-id can hold exactly one root, forever."). The registry
 ::    state is mutable (names get added). We reconcile these with
-::    a claim-id counter: every successful %claim bumps `claim-id`,
+::    a claim-count counter: every successful %claim bumps `claim-count`,
 ::    recomputes the Merkle root over the entire `names` map, and
-::    registers a fresh hull with id `hull-for(claim-id)`.  The graft's
+::    registers a fresh hull with id `hull-for(claim-count)`.  The graft's
 ::    `registered` map thus becomes an append-only history of
-::    claim-id -> root commitments. Any past commitment is still
+::    claim-count -> root commitments. Any past commitment is still
 ::    independently settleable as long as the caller still has the
-::    leaf and proof from that claim-id.
+::    leaf and proof from that claim-count.
 ::
 ::    Settlement is batched: %settle-batch selects every name claimed
-::    since `last-settled-claim-id` (via the per-entry claim-id tag),
+::    since `last-settled-claim-id` (via the per-entry claim-count tag),
 ::    builds one Merkle-inclusion payload covering all of them, and
 ::    pokes the graft with a SINGLE %vesl-settle. The graft records one
 ::    note whose id is a hash of the sorted batch contents, so replay
@@ -33,12 +33,12 @@
 ::
 ::  Split of authority:
 ::
-::    - names=(map @t [owner=@t tx-hash=@t claim-id=@ud])
+::    - names=(map @t [owner=@t tx-hash=@t claim-count=@ud])
 ::        authoritative registry (name -> {owner, paying tx-hash,
-::        claim-id-at-which-added}). %claim writes it; name-uniqueness
+::        claim-count-at-which-added}). %claim writes it; name-uniqueness
 ::        is enforced here. There is no constraint that a given owner
 ::        appears only once — one address can own many names. The
-::        per-entry `claim-id` is kernel-local bookkeeping only; it
+::        per-entry `claim-count` is kernel-local bookkeeping only; it
 ::        is NOT part of the Merkle leaf content.
 ::    - tx-hashes=(set @t)
 ::        secondary index of payment tx-hashes that have been used
@@ -49,23 +49,23 @@
 ::        that address wants to resolve to). Written by %claim on
 ::        first-claim-per-address, and by %set-primary thereafter.
 ::        Uniqueness is in the map's key: one primary per address.
-::    - claim-id=@ud
+::    - claim-count=@ud
 ::        monotonic counter, bumped on every successful %claim.
 ::        Hull ids are derived from it via `hull-for`, so re-using
 ::        a hull is structurally impossible as long as we never
-::        roll back `claim-id`.
+::        roll back `claim-count`.
 ::    - last-settled-claim-id=@ud
-::        monotonic counter tracking the highest `claim-id` that has
+::        monotonic counter tracking the highest `claim-count` that has
 ::        been packaged into a settled batch. `%settle-batch` selects
-::        `{entry | entry.claim-id > last-settled-claim-id}` and, on
-::        success, advances this to the current `claim-id`. Invariant:
-::        `last-settled-claim-id <= claim-id`.
+::        `{entry | entry.claim-count > last-settled-claim-id}` and, on
+::        success, advances this to the current `claim-count`. Invariant:
+::        `last-settled-claim-id <= claim-count`.
 ::    - root=@
-::        cached Merkle root over `names` at the current `claim-id`.
+::        cached Merkle root over `names` at the current `claim-count`.
 ::        Re-computed on %claim (O(n)); peeks read it in O(1).
 ::    - hull=@
-::        cached hull-id for the current `claim-id`
-::        (= `(hull-for claim-id)`). Cached for symmetry with `root`.
+::        cached hull-id for the current `claim-count`
+::        (= `(hull-for claim-count)`). Cached for symmetry with `root`.
 ::    - vesl=vesl-state
 ::        graft bookkeeping. `registered` gets one entry per claim
 ::        (the append-only commitment history); `settled` gets one
@@ -97,7 +97,7 @@
 ::     claimed name becomes their primary — %claim also emits
 ::     [%primary-set owner name] alongside [%claimed ...].)
 ::    (On success, the kernel also auto-registers a fresh hull:
-::     emits [%claim-id-bumped claim-id hull root] and passes through
+::     emits [%claim-count-bumped claim-count hull root] and passes through
 ::     the graft's [%vesl-registered hull root]. The caller can
 ::     use those plus `peek /proof/<name>` to build a settle
 ::     payload any time.)
@@ -109,7 +109,7 @@
 ::        `address`. No one but the owner can designate which of
 ::        their names is primary.
 ::    (Violations emit [%primary-error <msg>] without mutating.
-::     %set-primary does NOT bump claim-id: the `primaries` map is
+::     %set-primary does NOT bump claim-count: the `primaries` map is
 ::     not part of the committed Merkle tree, only `names` is.)
 ::
 ::  Compile: hoonc --new hoon/app/app.hoon hoon/
@@ -120,7 +120,7 @@
 ::
 =>
 |%
-+$  name-entry  [owner=@t tx-hash=@t claim-id=@ud]
++$  name-entry  [owner=@t tx-hash=@t claim-count=@ud]
 ::
 +$  versioned-state
   $:  %v2
@@ -128,7 +128,7 @@
       names=(map @t name-entry)
       tx-hashes=(set @t)
       primaries=(map @t @t)
-      claim-id=@ud
+      claim-count=@ud
       last-settled-claim-id=@ud
       root=@
       hull=@
@@ -318,11 +318,11 @@
   ?:  =(name i.keys)  `i
   $(keys t.keys, i +(i))
 ::
-::  +hull-for: hull-id for a given claim-id.
+::  +hull-for: hull-id for a given claim-count.
 ::
-::    hull(claim-id) = hash-pair(hash-leaf('nns'), hash-leaf(claim-id))
+::    hull(claim-count) = hash-pair(hash-leaf('nns'), hash-leaf(claim-count))
 ::
-::  Monotonic `claim-id` guarantees structural uniqueness: we can
+::  Monotonic `claim-count` guarantees structural uniqueness: we can
 ::  never re-register the same hull-id twice, so the graft's
 ::  `%vesl-error 'hull already registered'` branch is
 ::  unreachable on an honest kernel.
@@ -387,17 +387,17 @@
   ::
   ::  +peek: registry + graft state
   ::
-  ::    /owner/<name>      -> (unit name-entry)             {owner, tx-hash, claim-id}
+  ::    /owner/<name>      -> (unit name-entry)             {owner, tx-hash, claim-count}
   ::    /primary/<addr>    -> (unit @t)                     primary name
   ::    /entries           -> @ud                           total names
-  ::    /claim-id          -> @ud                           current claim-id
+  ::    /claim-count       -> @ud                           current claim-count
   ::    /last-settled      -> @ud                           last-settled-claim-id
   ::    /hull              -> @                             current hull-id
   ::    /root              -> @                             current Merkle root
-  ::    /snapshot          -> [claim-id=@ud hull=@ root=@]   all three at once
+  ::    /snapshot          -> [claim-count=@ud hull=@ root=@] all three at once
   ::    /proof/<name>      -> (unit (list [hash=@ side=?])) proof or ~
   ::    /pending-batch     -> (list @t)                     names with
-  ::                          entry.claim-id > last-settled-claim-id,
+  ::                          entry.claim-count > last-settled-claim-id,
   ::                          sorted canonically by `aor`
   ::    [anything else]    -> vesl-peek  (registered / settled / root by hull)
   ::
@@ -416,8 +416,8 @@
         [%entries ~]
       ``~(wyt by names.state)
         ::
-        [%claim-id ~]
-      ``claim-id.state
+        [%claim-count ~]
+      ``claim-count.state
         ::
         [%last-settled ~]
       ``last-settled-claim-id.state
@@ -429,7 +429,7 @@
       ``root.state
         ::
         [%snapshot ~]
-      ``[claim-id=claim-id.state hull=hull.state root=root.state]
+      ``[claim-count=claim-count.state hull=hull.state root=root.state]
         ::
         [%proof name=@t ~]
       =/  key  +<.path
@@ -447,7 +447,7 @@
       |-  ^-  (unit (unit *))
       ?~  keys  ``(flop out)
       =/  e  (~(got by names.state) i.keys)
-      ?:  (gth claim-id.e cutoff)
+      ?:  (gth claim-count.e cutoff)
         $(keys t.keys, out [i.keys out])
       $(keys t.keys)
     ==
@@ -462,7 +462,7 @@
     ?-  -.u.act
         ::
         ::  %claim: the hot path. Enforces C1..C4; writes
-        ::  `names` and `tx-hashes`; bumps `claim-id` and
+        ::  `names` and `tx-hashes`; bumps `claim-count` and
         ::  auto-registers a fresh hull in the graft.
         ::
         %claim
@@ -481,31 +481,31 @@
       ?:  (~(has in tx-hashes.state) tx-hash.c)
         :_  state
         ~[[%claim-error 'payment already used']]
-      ::  Commit the new row. Each entry records the claim-id at
+      ::  Commit the new row. Each entry records the claim-count at
       ::  which it was added so %settle-batch can select "everything
       ::  since the last successful settle" without an auxiliary
       ::  index.
-      =/  new-claim-id=@ud  +(claim-id.state)
-      =/  entry=name-entry  [owner.c tx-hash.c new-claim-id]
+      =/  new-claim-count=@ud  +(claim-count.state)
+      =/  entry=name-entry  [owner.c tx-hash.c new-claim-count]
       =.  names.state      (~(put by names.state) name.c entry)
       =.  tx-hashes.state  (~(put in tx-hashes.state) tx-hash.c)
       ::  Compute the fresh snapshot: Merkle root over the updated
-      ::  `names`, hull-id derived from the new claim-id.
+      ::  `names`, hull-id derived from the new claim-count.
       =/  leaves=(list @)  (sorted-leaves names.state)
       =/  new-root=@       (compute-root leaves)
-      =/  new-hull=@       (hull-for new-claim-id)
+      =/  new-hull=@       (hull-for new-claim-count)
       ::  Register the fresh hull in the graft. Because `new-hull`
-      ::  is a pure function of a strictly-monotonic `new-claim-id`,
+      ::  is a pure function of a strictly-monotonic `new-claim-count`,
       ::  it is structurally impossible for it to collide with a
       ::  previously-registered hull — if the graft ever returned
-      ::  a %vesl-error here our claim-id bookkeeping is broken and
+      ::  a %vesl-error here our claim-count bookkeeping is broken and
       ::  we crash rather than emit %claimed with an untracked
       ::  commitment.
       =^  reg-efx=(list vesl-effect)  vesl.state
         (vesl-poke vesl.state [%vesl-register new-hull new-root] nns-gate)
       ?>  ?=(^ reg-efx)
       ?>  ?=(%vesl-registered -.i.reg-efx)
-      =.  claim-id.state  new-claim-id
+      =.  claim-count.state  new-claim-count
       =.  root.state   new-root
       =.  hull.state   new-hull
       ::  Auto-assign primary on first claim for this owner.
@@ -520,13 +520,13 @@
       ;:  weld
         `(list effect)`~[[%claimed name.c owner.c tx-hash.c]]
         primary-efx
-        `(list effect)`~[[%claim-id-bumped new-claim-id new-hull new-root]]
+        `(list effect)`~[[%claim-count-bumped new-claim-count new-hull new-root]]
         `(list effect)`reg-efx
       ==
       ::
         ::  %set-primary: owner-gated reverse-lookup update.
         ::  Enforces P1/P2; writes `primaries`. Does NOT bump
-        ::  `claim-id` — `primaries` is not part of the committed
+        ::  `claim-count` — `primaries` is not part of the committed
         ::  Merkle tree.
         ::
         %set-primary
@@ -564,7 +564,7 @@
         |-  ^-  (list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
         ?~  ks  (flop acc)
         =/  e  (~(got by names.state) i.ks)
-        ?:  (gth claim-id.e cutoff)
+      ?:  (gth claim-count.e cutoff)
           =/  pf  (proof-for leaves i)
           $(ks t.ks, i +(i), acc [[i.ks owner.e tx-hash.e pf] acc])
         $(ks t.ks, i +(i))
@@ -585,11 +585,11 @@
         (vesl-poke vesl.state [%vesl-settle jammed] nns-gate)
       ?>  ?=(^ efx)
       ?:  ?=(%vesl-settled -.i.efx)
-        ::  Invariant: every %claim increments claim-id.state and
-        ::  writes entry.claim-id = new claim-id, `names` is
+        ::  Invariant: every %claim increments claim-count.state and
+        ::  writes entry.claim-count = new claim-count, `names` is
         ::  append-only, and the batch is non-empty here — so the
-        ::  highest entry.claim-id in the batch equals claim-id.state.
-        =/  settled-at=@ud  claim-id.state
+        ::  highest entry.claim-count in the batch equals claim-count.state.
+        =/  settled-at=@ud  claim-count.state
         =/  count=@ud  (lent batch)
         =.  last-settled-claim-id.state  settled-at
         :_  state

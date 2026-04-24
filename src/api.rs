@@ -203,7 +203,6 @@ async fn register_handler(
 
     let name = req.name.trim().to_string();
     let address = req.address.trim().to_string();
-
     let mut st = state.lock().await;
 
     // Pending name reservations live entirely in the hull mirror — the
@@ -254,6 +253,7 @@ async fn claim_handler(
 
     let name = req.name.trim().to_string();
     let address = req.address.trim().to_string();
+    let tx_hash = req.tx_hash.as_deref().map(str::trim);
 
     let mut st = state.lock().await;
 
@@ -271,7 +271,13 @@ async fn claim_handler(
     }
 
     let fee = payment::fee_for_name(&name);
-    let tx_hash = payment::verify(&st.settlement, &address, &name, fee, req.tx_hash.as_deref())
+    if !matches!(st.settlement.mode, vesl_core::SettlementMode::Local)
+        && tx_hash.map_or(true, str::is_empty)
+    {
+        return Err(bad_request("missing txHash"));
+    }
+
+    let tx_hash = payment::verify(&st.settlement, &address, &name, fee, tx_hash)
         .await
         .map_err(|e| bad_request(format!("no valid payment: {e}")))?;
     let note = ClaimNoteV1::new(name.clone(), address.clone(), tx_hash.clone());
@@ -502,9 +508,9 @@ async fn settle_handler(
     // Advance the mirror's last-settled cache. The kernel already
     // bumped its own counter — this is just a fast-read cache for
     // /status and /pending-batch.
-    st.mirror.set_last_settled_claim_id(batch.claim_id);
+    st.mirror.set_last_settled_claim_id(batch.claim_count);
     st.mirror
-        .set_snapshot(batch.claim_id, &settled.hull, &settled.root);
+        .set_snapshot(batch.claim_count, &settled.hull, &settled.root);
     let note_id_hex = hex_encode(&batch.note_id);
     let settlement_tx = match crate::chain::post_settlement_receipt(&st.settlement, &note_id_hex).await {
         Ok(tx) => tx,
@@ -516,7 +522,7 @@ async fn settle_handler(
     st.persist_all().await;
 
     Ok(Json(SettleResponse {
-        claim_id: batch.claim_id,
+        claim_id: batch.claim_count,
         count: batch.count,
         names,
         hull: hex_encode(&settled.hull),
@@ -720,7 +726,7 @@ async fn proof_handler(
         name,
         owner: entry.owner,
         tx_hash: entry.tx_hash,
-        claim_id: entry.claim_id,
+        claim_id: entry.claim_count,
         root: hex_encode(&snap.root),
         hull: hex_encode(&snap.hull),
         proof: proof

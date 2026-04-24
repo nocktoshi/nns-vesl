@@ -110,12 +110,12 @@ async fn register_then_claim_flow() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-1"}}"#)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "claim response: {body}");
     assert_eq!(body["registration"]["status"], "registered");
-    assert!(body["registration"]["txHash"].as_str().unwrap().starts_with("stub-"));
+    assert_eq!(body["registration"]["txHash"], "tx-alpha-1");
 
     let (status, body) = request_json(
         router.clone(),
@@ -156,7 +156,7 @@ async fn register_same_name_different_owner_rejected() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"bravo.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"bravo.nock","txHash":"tx-bravo-1"}}"#)),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -262,6 +262,63 @@ async fn invalid_name_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn claim_requires_tx_hash() {
+    let (_tmp, state) = setup().await;
+    {
+        let mut st = state.lock().await;
+        st.settlement.mode = SettlementMode::Fakenet;
+    }
+    let router = api::router(state.clone());
+
+    let (status, _) = request_json(
+        router.clone(),
+        "POST",
+        "/register",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"needtx.nock"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request_json(
+        router.clone(),
+        "POST",
+        "/claim",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"needtx.nock"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got: {body}");
+    assert_eq!(body["error"], "missing txHash");
+}
+
+#[tokio::test]
+async fn claim_without_tx_hash_is_allowed_in_local_mode() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, _) = request_json(
+        router.clone(),
+        "POST",
+        "/register",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"fakenet.nock"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = request_json(
+        router.clone(),
+        "POST",
+        "/claim",
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"fakenet.nock"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert!(
+        body["txHash"].as_str().unwrap_or_default().starts_with("stub-"),
+        "expected synthetic txHash in local mode: {body}"
+    );
+}
+
 /// The mirror's uniqueness check is a courtesy — the kernel is the
 /// actual gatekeeper. Clear the mirror mid-session, leave the kernel
 /// state intact, and retry the same name from a different owner: the
@@ -286,7 +343,7 @@ async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"delta.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"delta.nock","txHash":"tx-delta-2"}}"#)),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -310,7 +367,7 @@ async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR2}","name":"delta.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR2}","name":"delta.nock","txHash":"tx-delta-3"}}"#)),
     )
     .await;
     assert_eq!(
@@ -437,7 +494,7 @@ async fn follower_orders_same_height_claims_by_tx_index() {
         .mirror
         .claim_status("claim-b")
         .expect("claim-b status present");
-    assert_eq!(status_b.status, nns_vesl::types::ClaimLifecycleStatus::Applied);
+    assert_eq!(status_b.status, nns_vesl::types::ClaimLifecycleStatus::Finalized);
     assert_eq!(status_a.status, nns_vesl::types::ClaimLifecycleStatus::Rejected);
     assert!(
         status_a
@@ -596,7 +653,7 @@ async fn set_primary_requires_ownership() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-2"}}"#)),
     )
     .await;
 
@@ -754,7 +811,7 @@ async fn settle_twice_in_a_row_second_is_empty() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"india.nock"}}"#)),
+        Some(&format!(r#"{{"address":"{ADDR1}","name":"india.nock","txHash":"tx-india-1"}}"#)),
     )
     .await;
 
@@ -832,7 +889,7 @@ async fn claim_after_settle_gets_its_own_batch() {
             router.clone(),
             "POST",
             "/claim",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}"}}"#)),
+            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
         )
         .await;
     }
@@ -918,14 +975,14 @@ async fn pending_batch_endpoint_reflects_window() {
             router.clone(),
             "POST",
             "/register",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}"}}"#)),
+            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
         )
         .await;
         let _ = request_json(
             router.clone(),
             "POST",
             "/claim",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}"}}"#)),
+            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
         )
         .await;
     }
@@ -992,7 +1049,7 @@ async fn register_and_claim(router: axum::Router, addr: &str, name: &str) {
         router,
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{addr}","name":"{name}"}}"#)),
+        Some(&format!(r#"{{"address":"{addr}","name":"{name}","txHash":"tx-{name}"}}"#)),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1010,9 +1067,9 @@ async fn proof_returns_full_bundle_for_registered_name() {
 
     assert_eq!(body["name"], "proof1.nock");
     assert_eq!(body["owner"], ADDR1);
-    assert!(
-        body["txHash"].as_str().unwrap().starts_with("stub-"),
-        "txHash should be the stub payment id: {body}"
+    assert_eq!(
+        body["txHash"], "tx-proof1.nock",
+        "txHash should match submitted claim payment id: {body}"
     );
     assert!(
         body["claim_id"].as_u64().unwrap() >= 1,

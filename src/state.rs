@@ -52,7 +52,7 @@ pub struct Mirror {
     #[serde(alias = "addresses")]
     pub primaries: HashMap<String, String>,
     /// Latest commitment snapshot reported by the kernel (via
-    /// `%claim-id-bumped` effects on `%claim`). Cached so `/status`
+    /// `%claim-count-bumped` effects on `%claim`). Cached so `/status`
     /// and `/snapshot` can answer without a peek and so clients
     /// can correlate a claim response with the settlement hull.
     /// `None` until the first successful `%claim`.
@@ -131,7 +131,7 @@ impl Mirror {
     }
 
     /// Record a new commitment snapshot reported by the kernel via
-    /// `%claim-id-bumped`. Overwrites the previous snapshot — the
+    /// `%claim-count-bumped`. Overwrites the previous snapshot — the
     /// authoritative history lives in the graft state, not here.
     pub fn set_snapshot(&mut self, claim_id: u64, hull: &[u8], root: &[u8]) {
         self.snapshot = Some(SnapshotView {

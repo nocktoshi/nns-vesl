@@ -5,7 +5,7 @@ use nockapp::wire::Wire;
 use tokio::task::JoinHandle;
 
 use crate::chain::{confirmed_tx_position, ConfirmedTxPosition};
-use crate::kernel::{build_claim_poke, first_claim_id_bumped, first_error_message, first_primary_set, has_effect};
+use crate::kernel::{build_claim_poke, first_claim_count_bumped, first_error_message, first_primary_set, has_effect};
 use crate::state::SharedState;
 use crate::types::{ClaimLifecycleStatus, Registration, RegistrationStatus};
 
@@ -144,12 +144,12 @@ where
         if let Some((addr, primary_name)) = first_primary_set(&effects) {
             st.mirror.set_primary(addr, primary_name);
         }
-        if let Some(bumped) = first_claim_id_bumped(&effects) {
+        if let Some(bumped) = first_claim_count_bumped(&effects) {
             st.mirror
-                .set_snapshot(bumped.claim_id, &bumped.hull, &bumped.root);
+                .set_snapshot(bumped.claim_count, &bumped.hull, &bumped.root);
         }
         st.mirror
-            .update_claim_status(&claim.claim_id, ClaimLifecycleStatus::Applied, None);
+            .update_claim_status(&claim.claim_id, ClaimLifecycleStatus::Finalized, None);
         st.persist_all().await;
     }
     Ok(())

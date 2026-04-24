@@ -28,7 +28,9 @@ curl -X POST http://127.0.0.1:3000/register \
 
 curl -X POST http://127.0.0.1:3000/claim \
   -H 'content-type: application/json' \
-  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
+  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock","txHash":"<payment-tx-hash>"}'
+
+curl http://127.0.0.1:3000/claim-status?claim_id=<CLAIM_ID> 
 
 curl http://127.0.0.1:3000/resolve?name=nns.nock
 curl http://127.0.0.1:3000/resolve?address=8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5
@@ -71,22 +73,22 @@ settlement. Split of authority:
     - **P1 — name exists**: target name must be in `names`.
     - **P2 — ownership**: `names[name].owner == address`. Violations
       emit `[%primary-error <msg>]`; the hull turns them into `400`.
-- **Commitment path = claim-id-bumped auto-register.** Every
-  successful `%claim` bumps a `claim-id` counter, recomputes the
+- **Commitment path = claim-count-bumped auto-register.** Every
+  successful `%claim` bumps a kernel `claim-count` counter, recomputes the
   Merkle root over the full `names` map (canonical: keys sorted
   with `aor`, leaves = `jam([name owner tx-hash])`), derives a
-  fresh `hull-id = hash-pair(hash-leaf('nns'), hash-leaf(claim-id))`,
+  fresh `hull-id = hash-pair(hash-leaf('nns'), hash-leaf(claim-count))`,
   and internally pokes `%vesl-register hull root` against the
   graft. Hulls are **commitments, not mutable pointers**: each
-  claim-id gets its own permanent row in `registered`. The kernel
-  emits `[%claim-id-bumped claim-id hull root]` so the hull can
+  claim-count gets its own permanent row in `registered`. The kernel
+  emits `[%claim-count-bumped claim-count hull root]` so the hull can
   cache the current snapshot without peeking.
 - **Settlement path = `%settle-batch` poke.** Settlement is
   batched: a single `POST /settle` rolls up every name claimed
   since the last successful settle into one STARK-backed graft
   note. The kernel:
     1. Walks `names` in canonical (`aor`-sorted) order and picks
-       every entry whose `entry.claim-id > last-settled-claim-id`
+       every entry whose `entry.claim-count > last-settled-claim-id`
        — one contiguous window, no explicit list to maintain.
     2. Builds a Merkle inclusion proof for each selected name
        against the *current* `root` (which commits to the full
@@ -102,8 +104,8 @@ settlement. Split of authority:
            `verify-chunk(jam([name owner tx-hash]), proof, root)`
            succeeds.
     4. On `%vesl-settled`, advances `last-settled-claim-id` to
-       the current `claim-id.state` (invariant: it equals the
-       highest `entry.claim-id` in the batch), emits
+       the current `claim-count.state` (invariant: it equals the
+       highest `entry.claim-count` in the batch), emits
        `[%batch-settled claim-id count note-id]` alongside the
        graft's receipt, and drains the pending window.
   Replay protection is *per-batch*: the same leaf set produces
@@ -137,7 +139,7 @@ search-response shaping) lives in the Rust hull.
   part of the same jammed state a STARK attests to, so there is no
   hull-side cache to fall out of sync or get wiped across restarts.
 - The Vesl graft (`registered`, `settled`) is written to on every
-  `%claim` (fresh hull per claim-id) and on every `%vesl-settle`
+  `%claim` (fresh hull per claim-count) and on every `%vesl-settle`
   (replay-protected by batch `note-id`). `/settle` produces a
   single receipt covering every name claimed since the last
   settle, against the current commitment on demand; settlement chain
@@ -251,7 +253,7 @@ fragment, not a separate process.
 |       +---> Mirror cache  ----> .nns-data/.nns-mirror.json          |
 |               . pending reservations   (hull-only)                  |
 |               . primaries index        (driven by kernel effects)   |
-|               . snapshot cache         (claim-id, hull, root)       |
+|               . snapshot cache         (claim-count, hull, root)    |
 +---------------------------------+-----------------------------------+
                                   |  pokes:  %claim, %set-primary,
                                   |           %settle-batch
@@ -262,10 +264,10 @@ fragment, not a separate process.
 |  Hoon kernel (app.hoon)  authoritative, STARK-provable              |
 |                                                                     |
 |  versioned-state                                                    |
-|  +-- names          = (map @t [owner tx-hash claim-id])             |
+|  +-- names          = (map @t [owner tx-hash claim-count])          |
 |  +-- tx-hashes      = (set @t)          payment-replay guard        |
 |  +-- primaries      = (map @t @t)       owner -> primary name       |
-|  +-- claim-id       = @ud               monotonic counter           |
+|  +-- claim-count    = @ud               monotonic counter           |
 |  +-- last-settled   = @ud               settle cursor               |
 |  +-- root, hull     = @                 latest commitment cache     |
 |  +-- vesl-state  (vesl-graft, embedded)                             |
@@ -331,11 +333,11 @@ Rust hull (axum) ---- pending-only mirror + primaries mirror
     |      -> %vesl-error <msg>                        (hull: 400)
     v
 Hoon kernel = names=(map @t name-entry)          <- authoritative registry
-                         name-entry = [owner=@t tx-hash=@t claim-id=@ud]
+                         name-entry = [owner=@t tx-hash=@t claim-count=@ud]
             + tx-hashes=(set @t)                 <- payment replay guard
             + primaries=(map @t @t)              <- reverse-lookup target
-            + claim-id=@ud                       <- claim counter (monotonic)
-            + last-settled-claim-id=@ud          <- highest claim-id in
+            + claim-count=@ud                    <- claim counter (monotonic)
+            + last-settled-claim-id=@ud          <- highest claim-count in
                                                     most recently settled batch
             + root=@                             <- Merkle root over names
             + hull=@                             <- current hull-id
@@ -344,7 +346,7 @@ Hoon kernel = names=(map @t name-entry)          <- authoritative registry
 
 The Merkle tree deliberately covers *only* `names`. `primaries`
 is a nice-to-have reverse-lookup convenience, not a load-bearing
-domain invariant, so changing it does NOT bump the claim-id or the
+domain invariant, so changing it does NOT bump the claim-count or the
 root — `/settle` would otherwise churn a new hull on every primary
 flip for no settlement benefit.
 
@@ -369,11 +371,18 @@ departure from the legacy Cloudflare worker, which used
 `POST /verify`; migrate clients by renaming the path. CORS is
 open (`*`).
 
+Terminology note:
+
+- `claim_id` in HTTP (`/claim`, `/claim-status`) is the hull-level async
+  submission handle for follower tracking.
+- The kernel's monotonic state counter is `claim-count` (historically called
+  `claim-id` in older docs/effects).
+
 | Method | Path                     | Purpose                                               |
 | ------ | ------------------------ | ----------------------------------------------------- |
 | POST   | `/register`              | Create a pending reservation (`{address, name}`)      |
-| POST   | `/claim`                 | Submit claim-note + enqueue replay (`{address, name, txHash?}`), returns `{claim_id, status}`; follower applies in chain order when mined |
-| GET    | `/claim-status?claim_id=X` | Read async replay status (`submitted | confirmed | applied | rejected`) |
+| POST   | `/claim`                 | Submit claim-note + enqueue replay (`{address, name, txHash?}`); `txHash` is required in non-local modes. Returns `{claim_id, status}` and follower applies in chain order when mined |
+| GET    | `/claim-status?claim_id=X` | Query: `GET http://127.0.0.1:3000/claim-status?claim_id=<id>`. Returns `{claim_id, status, txHash?, registration?, reason?}` where lifecycle statuses are `submitted` (queued), `confirmed` (mined/applying), `finalized` (kernel accepted; includes `registration`), `rejected` (replay failed; includes `reason`). Unknown ids return `404 {"error":"unknown claim_id"}`. |
 | POST   | `/primary`               | Designate which of caller's names is primary (`{address, name}`), pokes kernel `%set-primary` |
 | POST   | `/settle`                | Produce one batch receipt for every name claimed since the last settle (empty body); pokes kernel `%settle-batch` |
 | GET    | `/snapshot`              | Current commitment `{claim_id, hull, root}` (hex-encoded) |
@@ -499,8 +508,8 @@ scripts/parity.py \
 
 Settlement is **batched** and **on** for commitments and
 receipts, **off** for on-chain posting. Every `%claim` bumps
-`claim-id` and writes `entry.claim-id = new claim-id`; `/settle`
-rolls up *every* name with `entry.claim-id >
+`claim-count` and writes `entry.claim-count = new claim-count`; `/settle`
+rolls up *every* name with `entry.claim-count >
 last-settled-claim-id` into a single `%vesl-settle` note against
 the current commitment. The kernel handles batch selection,
 Merkle proof generation (one traversal per name, against the
@@ -512,8 +521,8 @@ coordination needed.
 `{claim_id, count, names[], hull, root, note_id}` where `hull`,
 `root`, and `note_id` are hex-encoded raw atom bytes, `names` is
 the canonically-sorted list of names covered by this batch, and
-`claim_id` is the highest `claim-id` in the batch (which, by
-invariant, equals the current `claim-id.state`). No chain poke
+`claim_id` is the highest kernel claim-count in the batch (which, by
+invariant, equals the current `claim-count.state`). No chain poke
 is emitted yet; wiring that up is a drop-in at the end of
 `settle_handler`.
 
@@ -557,9 +566,9 @@ kernel code**, not verified by the proof:
   proof does not carry the `tx-hashes` set and so cannot
   attest to "this `tx-hash` is unique in the history."
 - **Claim-id monotonicity and honest hull/root derivation.**
-  The kernel computes `claim-id = claim-id + 1`,
+  The kernel computes `claim-count = claim-count + 1`,
   `root = compute-root(sorted-leaves(names))`, and
-  `hull = hull-for(claim-id)` deterministically on every
+  `hull = hull-for(claim-count)` deterministically on every
   `%claim`, but the proof does not retrace those transitions.
 - **`last-settled-claim-id` advancement.** The kernel bumps it
   on successful settlement; the proof says nothing about
@@ -594,15 +603,16 @@ To post settlements to Nockchain once that path is desired:
 
 ## Graduation path to real payment verification
 
-Current payment behavior in `src/payment.rs` is hybrid:
+Current payment behavior in `src/payment.rs`:
 
-1. If the caller supplies `txHash` and `chain_endpoint` is configured,
-   the hull checks chain acceptance for that tx id before allowing the
-   claim to progress.
-2. If no `txHash` is supplied (or in local mode), the hull falls back
-   to a stub tx id for local/dev flows.
+1. In local mode, missing `txHash` falls back to a synthetic tx id for
+   development flow compatibility.
+2. In submit modes, `POST /claim` requires `txHash`.
+3. In submit modes, the hull checks chain acceptance for that tx id
+   before allowing the claim to progress.
 
-This is chain-aware acceptance, not full payment attestation. To wire
+This is required and chain-aware acceptance, not full payment attestation.
+To wire
 real payment:
 
 1. Reimplement `verify(address, name, required_fee)` against a real
@@ -638,7 +648,7 @@ real payment:
        alongside `names` so uniqueness becomes a verifiable
        non-membership proof on the prior commitment. Constant
        per-claim overhead but more Hoon machinery.
-  The `claim-id` ladder (append-only, one hull per claim) is
+  The `claim-count` ladder (append-only, one hull per claim) is
   already the right shape for option 1 — each prior hull is a
   previous commitment the gate can reference when attesting a
   transition.

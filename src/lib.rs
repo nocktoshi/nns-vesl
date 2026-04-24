@@ -10,8 +10,10 @@
 //! Claim flow (`POST /claim`):
 //!   1. hull validates input (address shape, name shape, matching
 //!      pending reservation)
-//!   2. hull calls `payment::verify` (stubbed in v1) to get a tx hash
-//!   3. hull pokes the kernel with `%claim name owner fee tx-hash`
+//!   2. in non-local modes, hull requires `txHash`; then calls
+//!      `payment::verify`
+//!   3. hull enqueues claim-note replay; follower pokes the kernel
+//!      with `%claim name owner fee tx-hash`
 //!   4. on `%claimed` success, hull mirrors the new row; on an
 //!      accompanying `%primary-set` (first claim for this owner)
 //!      the hull also updates its reverse-lookup index

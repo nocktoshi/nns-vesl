@@ -33,7 +33,7 @@ pub enum RegistrationStatus {
 pub enum ClaimLifecycleStatus {
     Submitted,
     Confirmed,
-    Applied,
+    Finalized,
     Rejected,
 }
 
