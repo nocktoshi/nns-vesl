@@ -268,6 +268,52 @@ pub fn first_chain_link_result(effects: &[NounSlab]) -> Option<bool> {
     effects.iter().find_map(chain_link_result)
 }
 
+/// Build a `[%verify-tx-in-page digest=@ux tx-ids=(list @ux) claimed-tx-id=@ux]`
+/// poke slab. Read-only — the kernel builds the canonical
+/// `(z-set @ux)` via `z-silt` (so `gor-tip` ordering is correct),
+/// then runs `has-tx-in-page:nns-predicates` and emits
+/// `[%tx-in-page-result ok=?]` without mutating state.
+///
+/// `page_digest` is the 40-byte LE-packed Tip5 block digest.
+/// `tx_ids` is the flat list of 40-byte Tip5 tx-ids the block
+/// included; order doesn't matter (kernel canonicalises).
+/// `claimed_tx_id` is the tx-id we're checking membership for.
+pub fn build_verify_tx_in_page_poke(
+    page_digest: &[u8],
+    tx_ids: &[Vec<u8>],
+    claimed_tx_id: &[u8],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "verify-tx-in-page");
+
+    let mut list_noun = D(0);
+    for id in tx_ids.iter().rev() {
+        let key = make_atom_in(&mut slab, id);
+        list_noun = T(&mut slab, &[key, list_noun]);
+    }
+
+    let digest = make_atom_in(&mut slab, page_digest);
+    let claimed = make_atom_in(&mut slab, claimed_tx_id);
+    let poke = T(&mut slab, &[tag, digest, list_noun, claimed]);
+    slab.set_root(poke);
+    slab
+}
+
+/// `ok` from `[%tx-in-page-result ok=?]`.
+pub fn tx_in_page_result(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "tx-in-page-result" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let v = cell.tail().as_atom().ok()?.as_u64().ok()?;
+    Some(v == 0)
+}
+
+pub fn first_tx_in_page_result(effects: &[NounSlab]) -> Option<bool> {
+    effects.iter().find_map(tx_in_page_result)
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------

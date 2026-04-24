@@ -122,6 +122,7 @@
 /=  sp  /common/stark/prover
 /=  nv  /common/nock-verifier
 /=  four  /common/ztd/four
+/=  *  /common/zoon
 /=  *  /common/wrapper
 ::  nockup:imports
 ::  NOTE: this marker lets vesl-nockup's `graft-inject` tool locate
@@ -242,6 +243,18 @@
       ::  issuing an expensive %claim poke.
       ::
       [%verify-chain-link claim-digest=@ux headers=(list anchor-header) anchored-tip=@ux]
+      ::  Phase 3 Level B: drive `has-tx-in-page:nns-predicates`.
+      ::  Read-only; emits `[%tx-in-page-result ok=?]` iff
+      ::  `claimed-tx-id ∈ page.tx-ids`. Takes a flat list of tx-ids
+      ::  so the kernel can build the canonical `(z-set @ux)` via
+      ::  `z-silt` — z-in's `has` uses `gor-tip` (Tip5) ordering for
+      ::  BST descent, so the caller cannot hand us a tree directly.
+      ::  The page summary is hull-provided today (Phase 2c
+      ::  `fetch_page_for_tx`); Level C will recompute its
+      ::  block-commitment from the full page noun so the hull can't
+      ::  lie about `tx-ids`.
+      ::
+      [%verify-tx-in-page digest=@ux tx-ids=(list @ux) claimed-tx-id=@ux]
       ::  nockup:cause
       ::  graft-inject would add `vesl-cause` here on a fresh
       ::  kernel. Already present below; marker is idempotent.
@@ -815,6 +828,20 @@
       :_  state
       ^-  (list effect)
       ~[[%chain-link-result ok]]
+      ::
+        ::  %verify-tx-in-page: read-only Phase 3 Level B predicate
+        ::  smoke test. Builds a canonical `(z-set @ux)` from the
+        ::  provided tx-id list via `z-silt`, then runs
+        ::  `has-tx-in-page:np`. Returns `[%tx-in-page-result ok=?]`
+        ::  without mutating state.
+        ::
+        %verify-tx-in-page
+      =/  tx-set=(z-set @ux)  (z-silt tx-ids.u.act)
+      =/  pag=nns-page-summary:np  [digest.u.act tx-set]
+      =/  ok=?  (has-tx-in-page:np pag claimed-tx-id.u.act)
+      :_  state
+      ^-  (list effect)
+      ~[[%tx-in-page-result ok]]
       ::
         %set-primary
       =/  c  u.act

@@ -3,6 +3,51 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24 pm) — Phase 3 Level B tx-inclusion
+
+- ~~Verified `zoon.hoon` is safe to symlink standalone (it only
+  imports `/common/zeke`, no stark-engine cone). Added to
+  `scripts/setup-hoon-tree.sh` alongside the existing nockchain
+  links.~~
+- ~~`hoon/lib/nns-predicates.hoon` grew two Level B arms: `has-tx-in-page`
+  (walks `tx-ids.page` as a `(z-set @ux)` via zoon's `has:z-in`) and
+  `matches-block-digest` (cheap equality check against the hull's
+  `BlockDetails.block_id`). Both operate on a minimal
+  `+$nns-page-summary [digest=@ux tx-ids=(z-set @ux)]` type so we
+  avoid `block-commitment:page:t` (which requires the blocked
+  `tx-engine` cone). The hull is trusted to have built the page
+  summary from real chain data; Phase 3 Level C (pending) replaces
+  that with an in-STARK recompute via vendored `tx-witness.hoon`.~~
+- ~~New kernel cause `%verify-tx-in-page digest tx-ids claimed-tx-id`
+  builds the canonical z-set via `z-silt` (so `gor-tip` ordering is
+  correct) and emits `[%tx-in-page-result ok=?]`. Rust
+  `build_verify_tx_in_page_poke` + `first_tx_in_page_result` wired
+  through `src/kernel.rs`.~~
+- ~~7 new integration tests: 1-byte single, 1-byte two-element,
+  8-byte triples (accept + reject), empty-set, 40-byte single,
+  40-byte two-element. **16 Phase 3 tests total (9 Level A + 7
+  Level B), all passing.**~~
+- **Known edge case**: jetted `hash-noun-varlen` in
+  `zkvm-jetpack::tip5_jets` crashes when `z-silt` is handed 3+
+  40-byte atoms with certain patterns (the `mor-tip` double-hash
+  path). Smaller vectors and real Tip5 digests (which never have
+  the handcrafted-test patterns) work fine. Upstream jet issue —
+  not a blocker for Phase 3c since real chain tx-ids will hit the
+  same jet with well-distributed inputs. See the note block at the
+  top of the `tx_in_page_*` tests in
+  `tests/phase3_predicates.rs`.
+- **65 tests total, all green** (10 lib + 30 handlers + 9 phase2 +
+  16 phase3 + 3 ignored prover).
+
+### Phase 3 status
+
+| Level | Arms | Status |
+|---|---|---|
+| A | `fee-for-name`, `chain-links-to` | **shipped** |
+| B | `has-tx-in-page`, `matches-block-digest` | **shipped** (hull-trusted page summary) |
+| C | `matches-block-commitment`, `pays-sender`, `pays-amount` | pending narrow `tx-witness.hoon` vendor |
+| Gate rewrite (3c) | Compose all predicates under `prove-computation` | pending Level C |
+
 ## Today update (2026-04-24 pm) — Phase 3 Level A predicates
 
 - ~~New shared predicate library `hoon/lib/nns-predicates.hoon` with

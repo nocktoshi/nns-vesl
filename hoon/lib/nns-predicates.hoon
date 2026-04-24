@@ -5,35 +5,47 @@
 ::
 ::  The full Nockchain `tx-engine` family (`tx-engine.hoon`,
 ::  `tx-engine-0.hoon`, `tx-engine-1.hoon`, and their transitive
-::  `/common/{pow,nock-prover,schedule,zoon,zose}` cone) gives us
-::  `block-commitment:page:t`, `has:z-in`, `compute-id:raw-tx:t`, and
-::  the `spends:raw-tx:v1` / `outputs:tx:v1` shapes we eventually
-::  want. Unfortunately, pulling tx-engine into the same compilation
-::  unit as `lib/vesl-prover.hoon` + `lib/vesl-stark-verifier.hoon`
-::  wedges hoonc — both paths transitively import `/common/stark/prover`
+::  `/common/{pow,nock-prover,schedule,zose}` cone) gives us
+::  `block-commitment:page:t`, `compute-id:raw-tx:t`, and the
+::  `spends:raw-tx:v1` / `outputs:tx:v1` shapes we eventually want.
+::  Unfortunately, pulling tx-engine into the same compilation unit
+::  as `lib/vesl-prover.hoon` + `lib/vesl-stark-verifier.hoon` wedges
+::  hoonc — both paths transitively import `/common/stark/prover`
 ::  through a different `=> stark-engine` context, and the dep graph
 ::  loops on shared `/common/zeke` / `/common/ztd/*` resolution.
 ::
-::  Rather than fight the build-system, Phase 3 stages these
-::  predicates in two levels:
+::  `/common/zoon.hoon` (z-set + has:z-in) is an exception: its only
+::  import is `/common/zeke`, so it's safe to pull in. We use it for
+::  the Level B `has-tx-in-page` predicate.
 ::
-::    Level A (this file, landed 2026-04-24):
+::  Rather than fight the build-system, Phase 3 stages these
+::  predicates in three levels:
+::
+::    Level A (landed 2026-04-24):
 ::      - `fee-for-name`          (pure Hoon, no external deps)
 ::      - `chain-links-to`        (works on an `anchor-header` triple,
 ::                                 not on a full `page:t` noun)
 ::
-::    Level B (pending — requires a narrow vendored
+::    Level B (landed 2026-04-24, partial):
+::      - `has-tx-in-page`        (zoon's `has:z-in` over a claimed
+::                                 `(z-set @ux)` of tx-ids)
+::      - `matches-block-digest`  (equality check against a claimed
+::                                 block-id — the hull is trusted to
+::                                 have re-derived it from chain data)
+::
+::    Level C (pending — needs narrow vendored
 ::     `hoon/lib/tx-witness.hoon` that reproduces only the tx-engine
-::     arms we touch, without importing the full cone):
-::      - `matches-block-commitment`
-::      - `has-tx-in-page`
-::      - `pays-sender` / `pays-amount`
+::     arms we touch):
+::      - `matches-block-commitment`   (recompute commitment from full
+::                                      page noun, no hull trust)
+::      - `pays-sender` / `pays-amount` (over real `raw-tx:v1`)
 ::
-::  Level A is enough to land Phase 2d's claim-note chain-bundle
-::  checks against the kernel's anchor — we walk the declared
-::  header chain by parent pointer and confirm it chains to the
-::  follower-anchored tip. Payment attestation waits on Level B.
+::  Levels A+B let the Phase 3 gate enforce
+::  `tx-id ∈ page.tx-ids ∧ page-digest ∈ anchored-chain` without
+::  importing the full tx-engine cone; Level C closes the remaining
+::  "hull derived the page summary honestly" trust gap.
 ::
+/=  *  /common/zoon
 |%
 ::
 ::  +$anchor-header: same shape as the kernel's Phase 2a type in
@@ -44,6 +56,24 @@
   $:  digest=@ux
       height=@ud
       parent=@ux
+  ==
+::
+::  +$nns-page-summary: minimal handle on a Nockchain `page:t` that
+::  carries just what the gate needs — the block's own digest and a
+::  z-set of the tx-ids the block included. The hull (Phase 2c
+::  `fetch_page_for_tx`) builds this from `BlockDetails` proto data;
+::  we explicitly do NOT carry `parent`, `coinbase`, `accumulated-work`,
+::  or any other page field, because their only purpose in the real
+::  tx-engine is to feed `hashable-block-commitment` — and that check
+::  is Level C's job (see `matches-block-commitment`).
+::
+::  `tx-ids` is a `(z-set @ux)` = balanced BST keyed by Tip5 hash,
+::  ordering matching Nockchain's `tx-ids.page` bit-for-bit. `has:z-in`
+::  walks it in O(log n).
+::
++$  nns-page-summary
+  $:  digest=@ux               :: block-id
+      tx-ids=(z-set @ux)       :: ordered set of tx-ids in this block
   ==
 ::
 ::  +fee-for-name: NNS fee schedule, keyed on the stem length of a
@@ -115,4 +145,39 @@
   ?.  =(parent.i.rest digest.prev)  %.n
   ?.  =(height.i.rest +(height.prev))  %.n
   $(rest t.rest, prev i.rest)
+::
+::  +has-tx-in-page: is `claimed-tx-id` a member of `page.tx-ids`?
+::
+::  Uses zoon's `has:z-in` directly — O(log n) BST walk, same
+::  ordering the real `tx-ids.page` is built with on the Nockchain
+::  side. Level C's `matches-block-commitment` will eventually bind
+::  the page summary to the block-proof's committed commitment; for
+::  now the hull is trusted to have populated `tx-ids` from
+::  `BlockDetails.tx_ids` without tampering.
+::
+++  has-tx-in-page
+  |=  [pag=nns-page-summary claimed-tx-id=@ux]
+  ^-  ?
+  (~(has z-in tx-ids.pag) claimed-tx-id)
+::
+::  +matches-block-digest: does the claimed block's digest equal the
+::  on-chain page's digest? Trivial equality check on two @ux atoms.
+::
+::  This is the Level B stand-in for
+::  `matches-block-commitment:page:t` — the hull reads the block-id
+::  from Nockchain via `fetch_block_details_by_height` and passes it
+::  into the gate; the gate confirms the same block-id appears in the
+::  kernel's anchored-chain (Phase 2). Trust boundary: the kernel
+::  trusts the *chain* on digests (via anchor linkage) but not the
+::  hull, which is exactly the property Phase 3 wants.
+::
+::  Level C replaces this with the full `hash-hashable:tip5` over
+::  `hashable-block-commitment(page)`, at which point the hull can't
+::  lie about the digest even if it wanted to — the gate derives it
+::  itself.
+::
+++  matches-block-digest
+  |=  [pag=nns-page-summary claimed-digest=@ux]
+  ^-  ?
+  =(digest.pag claimed-digest)
 --

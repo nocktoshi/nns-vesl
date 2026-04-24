@@ -113,23 +113,26 @@ link "$NOCK_HOME/hoon/common/v2"                 "$HOON_DIR/common/v2"
 link "$NOCK_HOME/hoon/common/v0-v1"              "$HOON_DIR/common/v0-v1"
 link "$NOCK_HOME/hoon/common/stark"              "$HOON_DIR/common/stark"
 link "$NOCK_HOME/hoon/common/nock-verifier.hoon" "$HOON_DIR/common/nock-verifier.hoon"
+link "$NOCK_HOME/hoon/common/zoon.hoon"          "$HOON_DIR/common/zoon.hoon"
 link "$NOCK_HOME/hoon/dat"                       "$HOON_DIR/dat"
 link "$NOCK_HOME/hoon/jams"                      "$HOON_DIR/jams"
 # Phase 3 note: we deliberately do NOT symlink
-# `/common/{tx-engine,tx-engine-0,tx-engine-1,pow,nock-prover,schedule,zoon,zose}`.
-# Those files are fine individually, but when they're all in scope
-# alongside `/lib/vesl-prover.hoon` + `/lib/vesl-stark-verifier.hoon`
-# (which already pull `stark/prover` via a different `=> stark-engine`
-# path), hoonc ends up resolving the shared `/common/zeke` and
-# `/common/ztd/*` trees twice and looping indefinitely. The
-# symptom: `compiling /common/tx-engine-0.hoon` hangs for ~4 minutes
-# before OOM-ing.
+# `/common/{tx-engine,tx-engine-0,tx-engine-1,pow,nock-prover,schedule,zose}`.
+# When those are in scope alongside `/lib/vesl-prover.hoon` +
+# `/lib/vesl-stark-verifier.hoon` (which already pull `stark/prover`
+# via a different `=> stark-engine` path), hoonc ends up resolving
+# the shared `/common/zeke` and `/common/ztd/*` trees twice and
+# loops indefinitely. Symptom: `compiling /common/tx-engine-0.hoon`
+# hangs for ~4 minutes before OOM-ing.
 #
-# Until we have a clean fix, Phase 3 payment predicates over
-# `raw-tx:v1` / `page:t` are staged via a narrow local vendor in
-# `hoon/lib/tx-witness.hoon` (see plan), or via hull-side extraction
-# into minimal kernel types. Do NOT add tx-engine symlinks here
-# without first proving the compile stays bounded.
+# `zoon.hoon` is safe — its only import is `/common/zeke`, no
+# stark-engine cone. It's needed for `has:z-in` used by the Phase 3
+# Level B `has-tx-in-page` predicate in `hoon/lib/nns-predicates.hoon`.
+#
+# Full tx-engine (for `raw-tx:v1` payment predicates) is still
+# blocked; Phase 3 Level C will stage those via a narrow vendored
+# `hoon/lib/tx-witness.hoon`. Do NOT add more tx-engine-cone
+# symlinks here without first proving the compile stays bounded.
 
 echo "Linking vesl hoon libs from $VESL_HOME ..."
 link "$VESL_HOME/protocol/lib/vesl-graft.hoon"          "$HOON_DIR/lib/vesl-graft.hoon"
