@@ -25,8 +25,10 @@ const ANCHOR_POLL: Duration = Duration::from_secs(10);
 pub const DEFAULT_FINALITY_DEPTH: u64 = 10;
 
 /// Max headers the follower ingests into a single `%advance-tip` poke.
-/// Bounded well under the kernel's `max-anchor-headers = 1024` so the
-/// deque never drops an entry mid-advance.
+/// The kernel doesn't cache intermediate headers anymore (Phase 3
+/// slim-anchor refactor), so this is purely a per-poke bandwidth /
+/// compute budget — a poke with 64 headers walks 64 parent links to
+/// validate the chain before advancing the tip.
 pub const DEFAULT_MAX_ADVANCE_BATCH: u64 = 64;
 
 /// Spawn both follower loops: claim replay + anchor advance. Both run

@@ -3,6 +3,32 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24 pm) — slim-anchor refactor
+
+- ~~Collapsed kernel `+$anchored-chain` from `[tip-digest tip-height
+  recent-headers=(list anchor-header)]` to just `[tip-digest
+  tip-height]`. The 1 024-entry header deque was unused — no code
+  path read it, and per-claim chain linkage is supplied by the
+  claim-note `ClaimChainBundle.header_chain_jam` (Phase 2d) anyway.
+  Net storage savings: up to ~90 KB per kernel instance; typical
+  savings: ~88 bytes per header the follower had advanced through
+  (wasn't keeping them all, but was capping at 1 024).~~
+- ~~`%advance-tip` still validates the parent chain on every poke
+  but no longer caches intermediate headers after validation. Saved
+  ~45 lines of Hoon and removed the `max-anchor-headers` constant.~~
+- ~~Rust `AnchorView` dropped `recent_headers`; `decode_anchor`
+  simplified from a list-walking loop to a two-atom decode. Two
+  obsolete `recent_headers.len()` assertions in `tests/phase2_anchor.rs`
+  replaced with `tip_digest` equality checks.~~
+- **Design rationale** captured inline in `hoon/app/app.hoon`: NNS is
+  a zkRollup-on-Nockchain, and rollups don't re-encode their parent
+  chain — they commit to one state root. The kernel commits to one
+  Nockchain tip; the wallet trusts Nockchain independently (it has
+  to anyway, for UTXOs). Gate verifies the per-claim linkage into
+  our tip; we never duplicate Nockchain's chain cache.
+- **65 tests total, all green** — same count as before the refactor,
+  confirming no behavior drift.
+
 ## Today update (2026-04-24 pm) — Phase 3 Level B tx-inclusion
 
 - ~~Verified `zoon.hoon` is safe to symlink standalone (it only

@@ -432,15 +432,18 @@ and both are useful even if you never decentralize.
 Landed:
 
 - **Kernel anchored-chain cursor.** `hoon/app/app.hoon` grew an
-  `anchored-chain` field (`tip-digest`, `tip-height`, 1 024-entry
-  `recent-headers` deque) plus a new cause
-  `%advance-tip headers=(list anchor-header)`. Kernel enforces strict
-  parent-chain linkage: every new header's `parent` must equal the
-  previous header's `digest`, heights must increment by 1, and the
-  first header must chain to the current tip (or be `parent=0` when
-  bootstrapping). Violations emit `%anchor-error` and do not mutate
-  state; the follower treats those as "reorg I did not replay cleanly"
-  signals and fails fast.
+  `anchored-chain` field (`tip-digest`, `tip-height`) plus a new
+  cause `%advance-tip headers=(list anchor-header)`. Kernel
+  enforces strict parent-chain linkage: every new header's
+  `parent` must equal the previous header's `digest`, heights must
+  increment by 1, and the first header must chain to the current
+  tip (or be `parent=0` when bootstrapping). Violations emit
+  `%anchor-error` and do not mutate state; the follower treats
+  those as "reorg I did not replay cleanly" signals and fails fast.
+  Intermediate headers are discarded after validation — the kernel
+  stores only the current tip, matching the zkRollup-on-L1 analog
+  where the rollup commits to one state root on L1 rather than
+  re-encoding L1's header chain locally.
 - **Payment-address freeze.** A new `%set-payment-address address=@t`
   cause stores a `(unit @t)` that the Phase 3 C5 predicate will pin
   every claim payment against. The kernel refuses to change it after

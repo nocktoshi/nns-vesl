@@ -364,10 +364,10 @@ pub fn build_proof_peek(name: &str) -> NounSlab {
 
 /// Build a `/anchor ~` peek path slab.
 ///
-/// Kernel response: `[~ ~ anchored-chain]`:
-///   - `tip-digest=@ux` (`0` before the first `%advance-tip`)
-///   - `tip-height=@ud`
-///   - `recent-headers=(list anchor-header)` newest-first
+/// Kernel response: `[~ ~ tip-digest=@ux tip-height=@ud]`. Kernel
+/// intentionally does not cache historical headers — per-claim
+/// chain linkage is carried in the claim-note bundle and proved by
+/// the gate. See `+$anchored-chain` in `hoon/app/app.hoon`.
 pub fn build_anchor_peek() -> NounSlab {
     single_tag_peek("anchor")
 }
@@ -589,69 +589,37 @@ pub fn decode_proof(result: &NounSlab) -> Result<Vec<ProofNode>, String> {
     Ok(out)
 }
 
-/// Current anchored chain view from the kernel. `tip_digest` is the
-/// raw LE bytes of a 5-felt Tip5 hash (all-zero when uninitialised).
-/// `recent_headers` is newest-first — the head is the current tip.
+/// Current anchored chain view from the kernel.
+///
+/// `tip_digest` is the raw LE bytes of a 5-felt Tip5 hash (all-zero
+/// when uninitialised). The kernel intentionally does not cache
+/// historical headers — per-claim chain linkage is supplied by the
+/// claim-note's `ClaimChainBundle.header_chain_jam` and proved by
+/// the gate. See the `+$anchored-chain` comment in
+/// `hoon/app/app.hoon` for the design rationale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorView {
     pub tip_digest: Vec<u8>,
     pub tip_height: u64,
-    pub recent_headers: Vec<AnchorHeader>,
 }
 
-/// Decode the `/anchor` peek result.
+/// Decode the `/anchor` peek result. Kernel returns
+/// `[~ ~ tip-digest=@ux tip-height=@ud]`.
 pub fn decode_anchor(result: &NounSlab) -> Result<AnchorView, String> {
     let inner = peek_unwrap_some(result)?;
     let cell = inner
         .as_cell()
         .map_err(|_| "anchor: expected cell".to_string())?;
     let tip_digest = atom_to_le_bytes(cell.head())?;
-    let rest = cell
+    let tip_height = cell
         .tail()
-        .as_cell()
-        .map_err(|_| "anchor: tail not cell".to_string())?;
-    let tip_height = rest
-        .head()
         .as_atom()
         .map_err(|_| "anchor: tip_height not atom".to_string())?
         .as_u64()
         .map_err(|_| "anchor: tip_height overflows u64".to_string())?;
-    let mut cur = rest.tail();
-    let mut recent_headers = Vec::new();
-    loop {
-        if cur.as_atom().is_ok() {
-            break;
-        }
-        let c = cur
-            .as_cell()
-            .map_err(|_| "anchor: list cell malformed".to_string())?;
-        let node = c
-            .head()
-            .as_cell()
-            .map_err(|_| "anchor: header not a cell".to_string())?;
-        let digest = atom_to_le_bytes(node.head())?;
-        let node_tail = node
-            .tail()
-            .as_cell()
-            .map_err(|_| "anchor: header tail not cell".to_string())?;
-        let height = node_tail
-            .head()
-            .as_atom()
-            .map_err(|_| "anchor: header height not atom".to_string())?
-            .as_u64()
-            .map_err(|_| "anchor: header height overflows u64".to_string())?;
-        let parent = atom_to_le_bytes(node_tail.tail())?;
-        recent_headers.push(AnchorHeader {
-            digest,
-            height,
-            parent,
-        });
-        cur = c.tail();
-    }
     Ok(AnchorView {
         tip_digest,
         tip_height,
-        recent_headers,
     })
 }
 

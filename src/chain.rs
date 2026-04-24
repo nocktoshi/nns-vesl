@@ -378,7 +378,7 @@ pub async fn fetch_page_for_tx(
 /// `[from_height .. to_height]` from the node, producing one
 /// `AnchorHeader` per block. Intended to build `%advance-tip` payloads;
 /// callers should keep the range small (bounded by kernel
-/// `max-anchor-headers = 2^10 = 1024`). Errors fail fast on the first
+/// `DEFAULT_MAX_ADVANCE_BATCH = 64`). Errors fail fast on the first
 /// missing block so partial advances never reach the kernel.
 pub async fn fetch_header_chain(
     endpoint: &str,

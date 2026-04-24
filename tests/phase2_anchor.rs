@@ -98,10 +98,10 @@ async fn advance_tip_bootstrap_accepts_from_genesis() {
     };
     assert_eq!(view.tip_height, 3);
     assert_eq!(view.tip_digest, vec![3u8; 40]);
-    assert_eq!(view.recent_headers.len(), 3);
-    // Newest-first.
-    assert_eq!(view.recent_headers[0].height, 3);
-    assert_eq!(view.recent_headers[2].height, 1);
+    // Post-refactor: kernel no longer caches intermediate headers,
+    // so the only assertion we can make is on the current tip.
+    // Intermediate-chain provenance is carried in per-claim note
+    // bundles and verified by the gate, not by state inspection.
 }
 
 #[tokio::test]
@@ -138,7 +138,7 @@ async fn advance_tip_extends_after_bootstrap() {
         decode_anchor(&r).expect("decode anchor")
     };
     assert_eq!(view.tip_height, 4);
-    assert_eq!(view.recent_headers.len(), 4);
+    assert_eq!(view.tip_digest, vec![4u8; 40]);
 }
 
 #[tokio::test]

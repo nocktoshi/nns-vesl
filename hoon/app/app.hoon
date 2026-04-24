@@ -148,15 +148,23 @@
       parent=@ux    :: Tip5 hash of parent header (anchor-tip of genesis is 0)
   ==
 ::
-::  +$anchored-chain: kernel's view of the Nockchain header chain. The
-::  follower advances this via `%advance-tip`; the Phase 3 recursive
-::  `nns-gate` will bind each batched claim to a block-id that must
-::  appear in `recent-headers` (or chain-link to `tip-digest`).
+::  +$anchored-chain: kernel's view of the Nockchain header chain,
+::  trimmed to the minimum a zkRollup-style design needs.
+::
+::  We store ONLY the current follower-anchored tip. Per-claim chain
+::  linkage is proved by the gate against headers carried in the
+::  claim-note's `ClaimChainBundle.header_chain_jam` (Phase 2d) — the
+::  kernel is not a Nockchain-replica and does not cache the
+::  canonical chain.
+::
+::  Analog: Optimism stores a state root on L1, not L1's headers. The
+::  wallet independently trusts Nockchain (for UTXOs anyway); all we
+::  need to commit to is "this is the Nockchain tip NNS claims anchor
+::  to", and the STARK attests to parent-chain linkage up to it.
 ::
 +$  anchored-chain
-  $:  tip-digest=@ux                 :: follower-advanced canonical tip (0 = uninitialised)
-      tip-height=@ud                 :: page-number of tip
-      recent-headers=(list anchor-header)  :: bounded deque, newest first
+  $:  tip-digest=@ux    :: follower-advanced canonical tip (0 = uninitialised)
+      tip-height=@ud    :: page-number of tip
   ==
 ::
 +$  versioned-state
@@ -190,11 +198,6 @@
       ::
   ==
 ::
-::  Max number of headers kept in `recent-headers`. The kernel stores
-::  only a sliding window — older headers are implicit in the chain
-::  commitment and don't need to be rebound to new tips.
-::
-++  max-anchor-headers  ^~((bex 10))
 ::
 +$  effect  *
 ::
@@ -743,9 +746,12 @@
         ::        header's height on bootstrap).
         ::
         ::  Violations emit [%anchor-error <msg>] without mutating
-        ::  state. Empty `headers` is a no-op. The full list is
-        ::  prepended onto `recent-headers` (newest first), capped at
-        ::  max-anchor-headers — older entries drop off the back.
+        ::  state. Empty `headers` is a no-op.
+        ::
+        ::  We validate the chain but DO NOT cache intermediate
+        ::  headers. The kernel only remembers `(tip-digest, tip-height)`;
+        ::  per-claim chain linkage is supplied by the claim-note bundle
+        ::  and proved by the gate (see design note on `+$anchored-chain`).
         ::
         %advance-tip
       =/  hs=(list anchor-header)  headers.u.act
@@ -769,32 +775,23 @@
       ?.  =(height.i.hs expected-height)
         :_  state
         ~[[%anchor-error 'first header height off-by-one']]
-      ::  Walk the rest: each header's parent must be the prior
-      ::  header's digest; height must increment by 1.
+      ::  Walk the rest and find the last header in a single fold.
+      ::  Fails on any parent/height break.
       ::
-      =/  ok=?
-        =|  prev=anchor-header
-        =.  prev  i.hs
+      =/  walk=(unit anchor-header)
+        =/  prev=anchor-header  i.hs
         =/  rest=(list anchor-header)  t.hs
-        |-  ^-  ?
-        ?~  rest  %.y
-        ?.  =(parent.i.rest digest.prev)  %.n
-        ?.  =(height.i.rest +(height.prev))  %.n
+        |-  ^-  (unit anchor-header)
+        ?~  rest  `prev
+        ?.  =(parent.i.rest digest.prev)  ~
+        ?.  =(height.i.rest +(height.prev))  ~
         $(rest t.rest, prev i.rest)
-      ?.  ok
+      ?~  walk
         :_  state
         ~[[%anchor-error 'header chain mismatch']]
-      ::  Prepend headers newest-first onto recent-headers, capped.
-      ::
-      =/  newest-first=(list anchor-header)  (flop hs)
-      ?>  ?=(^ newest-first)
-      =/  tip=anchor-header  i.newest-first
-      =/  existing=(list anchor-header)  recent-headers.anchor.state
-      =/  merged=(list anchor-header)  (weld newest-first existing)
-      =/  capped=(list anchor-header)  (scag max-anchor-headers merged)
+      =/  tip=anchor-header  u.walk
       =.  tip-digest.anchor.state  digest.tip
       =.  tip-height.anchor.state  height.tip
-      =.  recent-headers.anchor.state  capped
       :_  state
       ^-  (list effect)
       ~[[%anchor-advanced digest.tip height.tip (lent hs)]]
