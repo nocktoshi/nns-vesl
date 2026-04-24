@@ -3,6 +3,14 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+> **Pre-production blocker**: Phase 7 (wallet freshness check on
+> `t_nns_height`) must ship before any wallet relies on NNS proofs
+> for value-bearing decisions. See
+> [PROOF_STORAGE.md](PROOF_STORAGE.md) §"Staleness and fork
+> resistance" for the attack and
+> [§Phase 7](#phase-7--staleness--fork-resistance-blocking-before-production)
+> below for the acceptance criteria.
+
 ## Today update (2026-04-24 pm) — slim-anchor refactor
 
 - ~~Collapsed kernel `+$anchored-chain` from `[tip-digest tip-height
@@ -278,6 +286,54 @@ settlement-batch schema).
 - [ ] Add wallet-ready verification guide + reference flow that verifies:
   inclusion proof + transition proof + chain anchor.
 
+## Phase 7 — Staleness / fork resistance (blocking before production)
+
+Background: [PROOF_STORAGE.md](PROOF_STORAGE.md) §"Staleness and fork
+resistance" identifies a vulnerability where a malicious NNS server
+can bypass its own follower, manually poke `%claim`, and emit a
+STARK proof anchored at a stale `T_nns`. The proof verifies
+cryptographically; without wallet-side freshness enforcement the
+wallet accepts a name that was really registered to someone else
+on-chain. Layers 1 and 2 of the architecture (chain-ordered replay,
+frozen-follower convergence) are in place. Layer 3 (wallet freshness
+check) is not. **No production wallet should rely on NNS proofs for
+value-bearing decisions until Phase 7 ships.**
+
+Acceptance criteria:
+
+- [ ] Proof bundle carries `t_nns_digest: [u8; 40]` and
+  `t_nns_height: u64` as explicit top-level fields (not buried in
+  the STARK's private inputs). Proof-bundle schema documented in
+  `docs/wallet-verification.md` (new file).
+- [ ] The recursive nns-gate circuit (Phase 3c) commits
+  `t_nns_height` into the STARK's public output so the wallet can
+  read the claimed anchor height without decoding the proof bundle
+  cryptographically independently.
+- [ ] `src/bin/light_verify.rs` (rewritten in Phase 5) exposes a
+  `MaxStaleness` parameter with default `20` blocks and rejects any
+  proof where
+  `proof.t_nns_height < wallet_chain_tip_height - max_staleness`.
+  Unit test the boundary cases (exactly at, one-above, one-below).
+- [ ] Light-client SDK docs prominently describe the freshness rule,
+  explain how to source `wallet_chain_tip_height` (gRPC call against
+  the wallet's configured Nockchain node), and give a code snippet
+  for end-to-end verification.
+- [ ] Integration test: spin up two NNS servers; freeze the follower
+  on one; have it issue a proof for a name; assert
+  `light_verify` rejects the stale proof once the chain advances
+  past the staleness window.
+
+Operator observability (ships alongside Phase 7 or before):
+
+- [ ] `/status` endpoint surfaces `anchor_lag = current_chain_tip -
+  anchor.tip_height`. Alert threshold suggested at > 50 blocks.
+- [ ] `/status` surfaces count of pending claims in `Submitted`
+  state older than 10 minutes.
+- [ ] Structured tracing emit on follower anchor advance failures
+  (parent-mismatch, height-gap) so operators can distinguish benign
+  slowness from chain-divergence bugs.
+- [ ] Optional Prometheus export for the three metrics above.
+
 ## Next todos (priority order)
 
 - ~~Phase 2: kernel anchored-chain cursor (`anchored-chain`,
@@ -305,6 +361,11 @@ settlement-batch schema).
 - [ ] Phase 5: rewrite `src/bin/light_verify.rs` to verify the single
   recursive settlement proof end-to-end; docs + wallet integration
   guide.
+- [ ] **Phase 7 (blocking before production)**: wallet freshness
+  check on `t_nns_height` to close the malicious-frozen-follower
+  attack in [PROOF_STORAGE.md](PROOF_STORAGE.md) §"Staleness and
+  fork resistance". Full acceptance criteria in the Phase 7
+  section above.
 - [ ] Wire follower `AnchorAdvance` path into `%claim` so each claim
   also attaches a `ClaimChainBundle` (blocks Phase 3 consumption).
 - [ ] Implement chain-native claim-note discovery path (replace reliance on
