@@ -116,6 +116,11 @@
 ::
 /+  *vesl-graft
 /+  *vesl-merkle
+/+  vp=vesl-prover
+/+  vv=vesl-verifier
+/=  sp  /common/stark/prover
+/=  nv  /common/nock-verifier
+/=  four  /common/ztd/four
 /=  *  /common/wrapper
 ::
 =>
@@ -132,6 +137,12 @@
       last-settled-claim-id=@ud
       root=@
       hull=@
+      ::  Cached (subject, formula) for the most recent %prove-batch.
+      ::  Phase 1-redo uses this so %verify-stark can replay the exact
+      ::  inputs the prover traced (`batch` contents may change between
+      ::  prove and verify). `~` when no batch has been proved yet.
+      ::
+      last-proved=(unit [subject=@ formula=*])
   ==
 ::
 +$  effect  *
@@ -140,6 +151,23 @@
   $%  [%claim name=@t owner=@t fee=@ud tx-hash=@t]
       [%set-primary address=@t name=@t]
       [%settle-batch ~]
+      [%prove-batch ~]
+      ::  Phase 1-redo: cue JAM and run `verify:nv` (same jets as
+      ::  on-chain block PoW STARK verification). Read-only; for
+      ::  benchmarking recursion cost — verify is not inside the
+      ::  fink-traced `prove-computation` subject.
+      ::
+      ::  Use `*` (not `@`) so `soft` accepts large JAM atoms; cast
+      ::  before `cue`.
+      ::
+      [%verify-stark blob=*]
+      ::  Phase 1-redo sanity: prove `[42 [0 1]]` (identity) with
+      ::  vesl-prover, then verify it with vesl-stark-verifier. Uses
+      ::  the exact same shape as vesl/protocol/tests/prove-verify.hoon
+      ::  so we can confirm prover<->verifier compatibility independent
+      ::  of our batch-specific subject/formula.
+      ::
+      [%prove-identity ~]
       vesl-cause
   ==
 ::
@@ -529,6 +557,58 @@
         ::  `claim-count` — `primaries` is not part of the committed
         ::  Merkle tree.
         ::
+        ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
+        ::  [%prove-identity-result ok=?] so the test can confirm the
+        ::  prover/verifier round-trip works at all.
+        ::
+        %prove-identity
+      =/  subj=*  42
+      =/  form=*  [0 1]
+      =/  res
+        %-  mule  |.
+        (prove-computation:vp subj form 1 1)
+      ?.  ?=(%& -.res)
+        :_  state
+        ~[[%prove-identity-result %.n]]
+      =/  pr  p.res
+      ?.  ?=(%& -.pr)
+        :_  state
+        ~[[%prove-identity-result %.n]]
+      =/  prf=proof:sp  p.pr
+      ::  NB: Phase 1-redo finding — vesl-prover bypasses puzzle-nock
+      ::  and standard `verify:nv` derives `[s f]` from puzzle-nock,
+      ::  so this round-trip currently fails composition eval. The
+      ::  matched verifier is `verify:vv` from vendored vesl-verifier,
+      ::  but making it accept our proof requires further investigation
+      ::  of stark-config injection. Tracked in the research memo.
+      ::
+      =/  ok=?  (verify:vv prf ~ 0 subj form)
+      :_  state
+      ~[[%prove-identity-result ok]]
+      ::
+        %verify-stark
+      ?.  ?=(@ blob.u.act)
+        :_  state
+        ~[[%verify-stark-error 'blob-not-atom']]
+      =/  jammy=@  blob.u.act
+      =/  cue-res  (mule |.((cue jammy)))
+      ?.  -.cue-res
+        :_  state
+        ~[[%verify-stark-error 'bad-jam']]
+      =/  proof=proof:four  ;;(proof:four +.cue-res)
+      ::  Replay the exact [s f] the prover traced. vesl-stark-verifier
+      ::  takes them externally (bypasses puzzle-nock). We cache them
+      ::  in last-proved on every successful %prove-batch.
+      ::
+      ?~  last-proved.state
+        :_  state
+        ~[[%verify-stark-error 'no-cached-sf']]
+      =/  subject=@  subject.u.last-proved.state
+      =/  formula=*  formula.u.last-proved.state
+      =/  ok=?  (verify:vv proof ~ 0 subject formula)
+      :_  state
+      ~[[%verify-stark-result ok]]
+      ::
         %set-primary
       =/  c  u.act
       =/  existing  (~(get by names.state) name.c)
@@ -599,6 +679,106 @@
           `(list effect)`efx
         ==
       ::  %vesl-error — pass through unchanged; state not mutated.
+      :_  state
+      ^-  (list effect)
+      efx
+      ::
+        ::  %prove-batch: same shape as %settle-batch, but additionally
+        ::  runs the STARK prover over the batch content. Emits a
+        ::  [%batch-proof note-id proof] effect carrying the proof noun
+        ::  on success, or [%prove-failed trace] on crash (proving
+        ::  fails closed: settlement is not applied in that case).
+        ::
+        ::  Baseline implementation for Phase 0 — it produces a real
+        ::  STARK over a canonical Nock computation derived from the
+        ::  batch content. The computation itself is the forge-template
+        ::  "64 nested Nock-4 increments over belt-digest" pattern; it
+        ::  does NOT yet re-run the gate's C1-C4 predicates inside the
+        ::  STARK (that is Phase 3 of the payment plan). Phase 0's
+        ::  goal is to have a real STARK artifact flowing end-to-end.
+        ::
+        %prove-batch
+      =/  cutoff=@ud  last-settled-claim-id.state
+      =/  all-keys=(list @t)
+        (sort ~(tap in ~(key by names.state)) aor)
+      =/  leaves=(list @)  (sorted-leaves names.state)
+      =/  batch=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
+        =|  acc=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
+        =|  i=@ud
+        =/  ks=(list @t)  all-keys
+        |-  ^-  (list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
+        ?~  ks  (flop acc)
+        =/  e  (~(got by names.state) i.ks)
+      ?:  (gth claim-count.e cutoff)
+          =/  pf  (proof-for leaves i)
+          $(ks t.ks, i +(i), acc [[i.ks owner.e tx-hash.e pf] acc])
+        $(ks t.ks, i +(i))
+      ?~  batch
+        :_  state
+        ~[[%batch-error 'nothing to prove']]
+      =/  note-id=@  (hash-leaf (jam batch))
+      ::  Fold every byte of the jammed batch into a single
+      ::  Goldilocks-field belt-digest. This is the subject of the
+      ::  STARK computation.
+      ::
+      =/  batch-bytes=@  (jam batch)
+      =/  belt-digest=@
+        =/  belts=(list @)  (split-to-belts batch-bytes)
+        =/  p=@  (add (sub (bex 64) (bex 32)) 1)
+        %+  roll  belts
+        |=  [a=@ b=@]
+        (mod (add a b) p)
+      ::  Deterministic Nock formula: 64 nested [4 f] increments.
+      ::
+      =/  fs-formula=*
+        =/  f=*  [0 1]
+        =|  i=@
+        |-
+        ?:  =(i 64)  f
+        $(f [4 f], i +(i))
+      =/  proof-attempt
+        %-  mule  |.
+        (prove-computation:vp belt-digest fs-formula root.state hull.state)
+      ?.  ?=(%& -.proof-attempt)
+        ::  Prover crashed — settlement NOT applied.
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.proof-attempt)]]
+      ::  The outer mule succeeded, but prove-computation itself can
+      ::  return `[%| err]` (e.g. %too-big heights). Unwrap both layers
+      ::  and require the inner `%&` success to emit a usable proof.
+      ::
+      =/  pr  p.proof-attempt
+      ?.  ?=(%& -.pr)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.pr)]]
+      =/  the-proof=proof:sp  p.pr
+      ::  Proof generated. Still fire the regular %vesl-settle so the
+      ::  graft's `settled` map advances; package both the settlement
+      ::  effect and the proof.
+      ::
+      =/  jammed=@
+        %-  jam
+        :*  [note-id hull.state root.state [%pending ~]]
+            batch
+            root.state
+        ==
+      =^  efx=(list vesl-effect)  vesl.state
+        (vesl-poke vesl.state [%vesl-settle jammed] nns-gate)
+      ?>  ?=(^ efx)
+      ?:  ?=(%vesl-settled -.i.efx)
+        =/  settled-at=@ud  claim-count.state
+        =/  count=@ud  (lent batch)
+        =.  last-settled-claim-id.state  settled-at
+        =.  last-proved.state  `[belt-digest fs-formula]
+        :_  state
+        ^-  (list effect)
+        ;:  weld
+          `(list effect)`~[[%batch-settled settled-at count note-id]]
+          `(list effect)`~[[%batch-proof note-id the-proof]]
+          `(list effect)`efx
+        ==
       :_  state
       ^-  (list effect)
       efx

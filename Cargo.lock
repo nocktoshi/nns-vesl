@@ -2758,6 +2758,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex-literal"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e712f64ec3850b98572bffac52e2c6f282b29fe6c5fa6d42334b30be438d95c1"
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3623,6 +3629,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vesl-core",
+ "zkvm-jetpack",
 ]
 
 [[package]]
@@ -4800,6 +4807,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
  "bitflags 2.11.1",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -7525,6 +7552,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zkvm-jetpack"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "bitvec",
+ "bs58",
+ "bytes",
+ "either",
+ "hex-literal",
+ "ibig",
+ "nockchain-math",
+ "nockchain-types",
+ "nockvm",
+ "nockvm_macros",
+ "noun-serde",
+ "num-traits",
+ "once_cell",
+ "quickcheck",
+ "rayon",
+ "strum",
+ "tracing",
 ]
 
 [[package]]

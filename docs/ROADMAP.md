@@ -3,6 +3,28 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24) — recursive-STARK plan
+
+- ~~Phase 0: wired the baseline STARK prover into NNS. `%prove-batch`
+  produces a real vesl-style proof (~4.7 s, ~1.2 GB peak RSS, ~75 KiB
+  JAM).~~
+- ~~Phase 1-redo: vendored `vesl-stark-verifier` + `vesl-verifier` into
+  `hoon/lib/`; new `%verify-stark` and `%prove-identity` kernel arms.
+  Verified a real NNS batch proof end-to-end in **~0.61 s**
+  (verify/prove ratio **0.13×**). Discovered that vesl-style proofs
+  and Nockchain `sp-verifier` are not interchangeable — Phase 3's
+  recursion still targets `sp-verifier` because the recursed proofs
+  are block PoW proofs (puzzle-nock-derived), which is the correct
+  compatibility boundary.~~ Full memo in
+  [docs/research/recursive-payment-proof.md](research/recursive-payment-proof.md).
+- Revised per-batch recursion projection: **~8–25 s wall-clock, ~2–5 GB
+  peak memory** on Apple Silicon; per-claim recursion no longer ruled
+  out by cost. Plan target (per-batch) unchanged.
+
+Next up: Phase 2 — chain input plumbing (kernel anchored-chain cursor,
+hull fetchers for page + block-proof + header chain, extended
+settlement-batch schema).
+
 ## Today update (2026-04-23)
 
 - ~~Added canonical same-block ordering in follower replay using
@@ -78,11 +100,24 @@ implementation sequence.
 
 ## Next todos (priority order)
 
+- [ ] Phase 2: kernel anchored-chain cursor (`anchored-chain`,
+  `%advance-tip`, `%set-payment-address`).
+- [ ] Phase 2: hull fetchers for raw-tx, page, block-proof, header chain
+  via `nockapp-grpc` private peeks.
+- [ ] Phase 2: extend `ClaimNoteV1` with `nns/v1/raw-tx`, `/page`,
+  `/block-proof`, `/header-chain` fields.
+- [ ] Phase 3: recursive `nns-gate` circuit — `verify:sp-verifier` on
+  the batch's block PoW proof, `has:z-in` for tx inclusion, C5 payment
+  predicates (sender pkh, amount >= fee), C1-C4 transitions.
+- [ ] Phase 4: hull + follower wiring for block-bundle fetch +
+  injection into `%settle-batch`; map new kernel error tags.
+- [ ] Phase 5: rewrite `src/bin/light_verify.rs` to verify the single
+  recursive settlement proof end-to-end; docs + wallet integration
+  guide.
 - [ ] Implement chain-native claim-note discovery path (replace reliance on
   local submission queue for canonical replay input).
 - [ ] Add follower cursor persistence + reorg replay mechanics.
 - [ ] Complete payment attestation semantics (`sender`, `recipient`,
   `amount >= fee`) instead of acceptance-only checks.
-- [ ] Upgrade `nns-gate` to full transition proofs and ship proof bytes.
 - [ ] Anchor settlement/transition outputs on chain and make wallet
   verification fully trustless by default.

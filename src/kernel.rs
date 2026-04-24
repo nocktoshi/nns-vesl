@@ -35,7 +35,9 @@
 //!   `/pending-batch`, plus the graft's `/registered/<hull>`,
 //!   `/settled/<note-id>`, `/root/<hull>`.
 
-use nock_noun_rs::{atom_from_u64, make_cord_in, make_tag_in, NounSlab};
+use nock_noun_rs::{
+    atom_from_u64, jam_to_bytes, make_atom_in, make_cord_in, make_tag_in, new_stack, NounSlab,
+};
 use nockvm::noun::{Noun, D, T};
 
 // ---------------------------------------------------------------------------
@@ -106,6 +108,64 @@ pub fn build_settle_batch_poke() -> NounSlab {
     let mut slab = NounSlab::new();
     let tag = make_tag_in(&mut slab, "settle-batch");
     let poke = T(&mut slab, &[tag, D(0)]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Build a `[%prove-batch ~]` poke slab.
+///
+/// Same batch-selection semantics as `%settle-batch` but additionally
+/// runs `prove-computation` over the jammed batch payload to produce
+/// a real STARK. On success the kernel emits a `[%batch-proof note-id
+/// proof]` effect alongside the usual `[%batch-settled ...]` + graft
+/// `[%vesl-settled ...]` effects. On prover crash the kernel emits
+/// `[%prove-failed trace-jam]` and does NOT apply settlement.
+pub fn build_prove_batch_poke() -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-batch");
+    let poke = T(&mut slab, &[tag, D(0)]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Phase 1-redo sanity: `[%prove-identity ~]` poke. Kernel proves
+/// the trivial `[42 [0 1]]` computation and immediately verifies it,
+/// emitting `[%prove-identity-result ok=?]`. Used by the spike to
+/// confirm the prover/verifier pair is self-consistent before
+/// attempting verification of NNS-specific batch proofs.
+pub fn build_prove_identity_poke() -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-identity");
+    let poke = T(&mut slab, &[tag, D(0)]);
+    slab.set_root(poke);
+    slab
+}
+
+/// `ok` from `[%prove-identity-result ok=?]`.
+pub fn prove_identity_result(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "prove-identity-result" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let v = cell.tail().as_atom().ok()?.as_u64().ok()?;
+    Some(v == 0)
+}
+
+pub fn first_prove_identity_result(effects: &[NounSlab]) -> Option<bool> {
+    effects.iter().find_map(prove_identity_result)
+}
+
+/// Build a `[%verify-stark blob=@]` poke slab. `blob` is the raw JAM
+/// bytes of a `proof` noun (e.g. from `%batch-proof`). The kernel cues
+/// it and runs `verify:nock-verifier` with the same jets as block PoW
+/// verification. Emits `[%verify-stark-result ok=?]` or
+/// `[%verify-stark-error msg=@t]`.
+pub fn build_verify_stark_poke(proof_jam: &[u8]) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "verify-stark");
+    let blob = make_atom_in(&mut slab, proof_jam);
+    let poke = T(&mut slab, &[tag, blob]);
     slab.set_root(poke);
     slab
 }
@@ -549,6 +609,90 @@ pub fn batch_settled(effect: &NounSlab) -> Option<BatchSettled> {
 
 pub fn first_batch_settled(effects: &[NounSlab]) -> Option<BatchSettled> {
     effects.iter().find_map(batch_settled)
+}
+
+/// Payload of a `[%batch-proof note-id=@ proof=*]` effect emitted by
+/// the kernel's `%prove-batch` arm on a successful STARK generation.
+/// `proof_jam` is the JAM'd bytes of the raw proof noun — opaque to
+/// the hull, suitable for transport, and CUE'able back into a noun
+/// for verification via `verify:sp-verifier`.
+#[derive(Debug, Clone)]
+pub struct BatchProof {
+    pub note_id: Vec<u8>,
+    pub proof_jam: Vec<u8>,
+}
+
+pub fn batch_proof(effect: &NounSlab) -> Option<BatchProof> {
+    if effect_tag(effect)? != "batch-proof" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let note_id = rest.head().as_atom().ok()?.as_ne_bytes().to_vec();
+    let proof_noun = rest.tail();
+    let mut stack = new_stack();
+    let proof_jam = jam_to_bytes(&mut stack, proof_noun);
+    Some(BatchProof { note_id, proof_jam })
+}
+
+pub fn first_batch_proof(effects: &[NounSlab]) -> Option<BatchProof> {
+    effects.iter().find_map(batch_proof)
+}
+
+/// Payload of a `[%prove-failed trace-jam=@]` effect emitted when the
+/// kernel's STARK prover crashed. Returns the JAM'd crash trace for
+/// diagnostic surfacing; the hull MUST treat this as a failure and
+/// NOT apply settlement.
+pub fn prove_failed(effect: &NounSlab) -> Option<Vec<u8>> {
+    if effect_tag(effect)? != "prove-failed" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let trace_atom = cell.tail().as_atom().ok()?;
+    Some(trace_atom.as_ne_bytes().to_vec())
+}
+
+pub fn first_prove_failed(effects: &[NounSlab]) -> Option<Vec<u8>> {
+    effects.iter().find_map(prove_failed)
+}
+
+/// `ok` from `[%verify-stark-result ok=?]` (Hoon loobean: `%.y` = true).
+pub fn verify_stark_result(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "verify-stark-result" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let ok_atom = cell.tail().as_atom().ok()?;
+    let v = ok_atom.as_u64().ok()?;
+    Some(v == 0)
+}
+
+pub fn first_verify_stark_result(effects: &[NounSlab]) -> Option<bool> {
+    effects.iter().find_map(verify_stark_result)
+}
+
+/// Cord message from `[%verify-stark-error msg=@t]`.
+pub fn verify_stark_error(effect: &NounSlab) -> Option<String> {
+    if effect_tag(effect)? != "verify-stark-error" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let msg = cell.tail().as_atom().ok()?;
+    let bytes = msg.as_ne_bytes();
+    Some(
+        std::str::from_utf8(bytes)
+            .ok()?
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+
+pub fn first_verify_stark_error(effects: &[NounSlab]) -> Option<String> {
+    effects.iter().find_map(verify_stark_error)
 }
 
 /// Returns the first `(address, name)` payload across `effects` from

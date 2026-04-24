@@ -53,10 +53,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = data_parent.join(".nns-data");
     fs::create_dir_all(&state_dir)?;
 
+    // Install the STARK prover hot state so the kernel's `%prove-batch`
+    // cause can produce real STARK artifacts. This is a no-op when the
+    // kernel never calls `prove-computation`, so it is safe to always
+    // install; pokes that only touch %claim / %set-primary pay nothing
+    // for the extra jets beyond module load time.
+    let prover_hot_state = zkvm_jetpack::hot::produce_prover_hot_state();
+
     let app: NockApp = boot::setup(
         &kernel,
         cli,
-        &[],
+        prover_hot_state.as_slice(),
         ".nns-data",
         Some(data_parent.clone()),
     )
