@@ -340,6 +340,8 @@
 ::  G1: every leaf's name has valid format.
 ::  G2: for every leaf, `jam [name owner tx-hash]` hashed as a leaf
 ::      and walked through `proof` equals `expected-root`.
+::  G3: no duplicate `name` within this transition batch.
+::  G4: no duplicate `tx-hash` within this transition batch.
 ::
 ::  The graft supplies `expected-root` from the registered hull
 ::  root, so a verified `nns-gate` invocation proves: "these
@@ -356,12 +358,20 @@
   ^-  ?
   =/  leaves
     ;;((list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])]) data)
+  =|  seen-names=(set @t)
+  =|  seen-tx-hashes=(set @t)
   |-  ^-  ?
   ?~  leaves  %.y
   =/  chunk=@  (jam [name.i.leaves owner.i.leaves tx-hash.i.leaves])
   ?&  (is-valid-name name.i.leaves)
+      !(~(has in seen-names) name.i.leaves)
+      !(~(has in seen-tx-hashes) tx-hash.i.leaves)
       (verify-chunk chunk proof.i.leaves expected-root)
-      $(leaves t.leaves)
+      %=  $
+        leaves  t.leaves
+        seen-names  (~(put in seen-names) name.i.leaves)
+        seen-tx-hashes  (~(put in seen-tx-hashes) tx-hash.i.leaves)
+      ==
   ==
 --
 |%

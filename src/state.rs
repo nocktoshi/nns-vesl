@@ -35,7 +35,7 @@ use nockapp::NockApp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::types::{Registration, RegistrationStatus};
+use crate::types::{ClaimLifecycleStatus, ClaimStatusResponse, Registration, RegistrationStatus};
 
 pub const MIRROR_FILE: &str = ".nns-mirror.json";
 
@@ -64,6 +64,26 @@ pub struct Mirror {
     /// default, so a fresh mirror is consistent with a fresh kernel.
     #[serde(default)]
     pub last_settled_claim_id: u64,
+    /// Queue of submitted claims awaiting follower replay.
+    #[serde(default)]
+    pub submitted_claims: HashMap<String, QueuedClaim>,
+    /// Monotonic local submission sequence used for deterministic replay
+    /// when multiple claims are pending.
+    #[serde(default)]
+    pub claim_submit_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedClaim {
+    pub claim_id: String,
+    pub submit_seq: u64,
+    pub address: String,
+    pub name: String,
+    pub fee: u64,
+    pub tx_hash: String,
+    pub status: ClaimLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// JSON-friendly view of the kernel's current commitment snapshot.
@@ -138,6 +158,63 @@ impl Mirror {
             .collect();
         v.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         v
+    }
+
+    pub fn enqueue_claim(
+        &mut self,
+        claim_id: String,
+        address: String,
+        name: String,
+        fee: u64,
+        tx_hash: String,
+    ) {
+        self.claim_submit_seq = self.claim_submit_seq.saturating_add(1);
+        let queued = QueuedClaim {
+            claim_id: claim_id.clone(),
+            submit_seq: self.claim_submit_seq,
+            address,
+            name,
+            fee,
+            tx_hash,
+            status: ClaimLifecycleStatus::Submitted,
+            reason: None,
+        };
+        self.submitted_claims.insert(claim_id, queued);
+    }
+
+    pub fn pending_claims_in_order(&self) -> Vec<QueuedClaim> {
+        let mut out: Vec<QueuedClaim> = self
+            .submitted_claims
+            .values()
+            .filter(|c| matches!(c.status, ClaimLifecycleStatus::Submitted | ClaimLifecycleStatus::Confirmed))
+            .cloned()
+            .collect();
+        out.sort_by_key(|c| c.submit_seq);
+        out
+    }
+
+    pub fn update_claim_status(
+        &mut self,
+        claim_id: &str,
+        status: ClaimLifecycleStatus,
+        reason: Option<String>,
+    ) {
+        if let Some(c) = self.submitted_claims.get_mut(claim_id) {
+            c.status = status;
+            c.reason = reason;
+        }
+    }
+
+    pub fn claim_status(&self, claim_id: &str) -> Option<ClaimStatusResponse> {
+        let claim = self.submitted_claims.get(claim_id)?;
+        let registration = self.names.get(&claim.name).cloned();
+        Some(ClaimStatusResponse {
+            claim_id: claim.claim_id.clone(),
+            status: claim.status,
+            reason: claim.reason.clone(),
+            registration,
+            tx_hash: Some(claim.tx_hash.clone()),
+        })
     }
 }
 

@@ -21,6 +21,8 @@ nockvm_macros = { path = "../nockchain/crates/nockvm/rust/nockvm_macros" }
 vesl-core = { path = "../vesl/crates/vesl-core" }
 nock-noun-rs = { path = "../vesl/crates/nock-noun-rs" }
 nockchain-tip5-rs = { path = "../vesl/crates/nockchain-tip5-rs" }
+nockchain-client-rs = { path = "../vesl/crates/nockchain-client-rs" }
+nockapp-grpc = { path = "../nockchain/crates/nockapp-grpc" }
 
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 anyhow = "1.0"

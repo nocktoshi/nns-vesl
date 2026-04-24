@@ -43,8 +43,9 @@ small kernel holding the authoritative registry
 `primaries=(map @t @t)`) with the Vesl graft wired in for on-demand
 settlement. Split of authority:
 
-- **Hot path = `%claim` poke.** The kernel enforces four domain
-  rules directly; no graft involvement, no STARK per registration:
+- **Hot path = `%claim` replay.** The kernel enforces four domain
+  rules directly on follower replay; no graft involvement, no STARK
+  per registration:
     - **C1 — format**: stem is non-empty, `[a-z0-9]+.nock`.
     - **C2 — fee adequacy**: declared fee ≥ the tier for the stem's
       length (`5000 / 500 / 100` $NOCK, matching the legacy worker).
@@ -120,7 +121,18 @@ search-response shaping) lives in the Rust hull.
 - The Rust hull serves the same HTTP API the old worker served —
   existing clients do not need changes.
 - Pending reservations live only in the hull mirror; a name hits the
-  kernel exactly once, via `%claim`, at `/claim` time.
+  kernel exactly once, via `%claim`, during follower replay.
+- `POST /claim` now queues a versioned claim-note payload and returns a
+  `claim_id` immediately. The follower confirms and applies queued
+  claims asynchronously.
+- When `chain_endpoint` is configured, follower apply order is
+  canonicalized by chain block inclusion height plus transaction index
+  inside that block (`GetTransactionBlock` + `GetBlockDetails`).
+- Claim-note payloads now have a canonical NoteData schema in
+  `src/claim_note.rs`:
+    - `nns/v1/claim-version` (jammed `@ud`)
+    - `nns/v1/claim-id` (opaque bytes)
+    - `nns/v1/claim` (jammed `[name owner tx-hash]`)
 - Payment-replay protection is *on-kernel*: the `tx-hashes` set is
   part of the same jammed state a STARK attests to, so there is no
   hull-side cache to fall out of sync or get wiped across restarts.
@@ -128,8 +140,92 @@ search-response shaping) lives in the Rust hull.
   `%claim` (fresh hull per claim-id) and on every `%vesl-settle`
   (replay-protected by batch `note-id`). `/settle` produces a
   single receipt covering every name claimed since the last
-  settle, against the current commitment on demand; no poke to
-  Nockchain yet — that's a follow-up.
+  settle, against the current commitment on demand; settlement chain
+  posting is still best-effort/placeholder.
+
+## Consensus architecture (why chain ordering helps)
+
+The consensus problem is not "can one kernel reject duplicates?" (it can),
+it's "do *all* nodes see `%claim`s in the same order?"
+
+Without a shared order source:
+
+- node A may apply `0.nock -> alice` first
+- node B may apply `0.nock -> bob` first
+- both are locally valid, globally inconsistent
+
+With Nockchain as sequencer:
+
+1. Claims are submitted as chain transactions (claim-note path).
+2. Followers wait until a claim tx is confirmed.
+3. Followers derive canonical position from chain data:
+   `(block_height, tx_index_in_block)`.
+4. Followers replay `%claim` into the kernel in exactly that order.
+5. Kernel C3/C4 rules decide validity:
+   - first `0.nock` claim in canonical order succeeds
+   - later `0.nock` claims deterministically fail (`name already registered`)
+
+That is why routing through Nockchain helps: the chain provides a single
+global order; the kernel provides deterministic validity rules.
+
+### Tx hash vs payment hash in kernel state
+
+Current kernel state stores `tx-hash` as the payment-replay key
+(`names[name].tx-hash` + `tx-hashes` set). This is enough for C4
+("one payment, one claim") and for proving ownership metadata.
+
+Do we also need to store the *sequencing* tx hash (claim-note tx id)?
+
+- **For consensus correctness:** no. Replay order comes from the chain
+  follower while processing incoming events, not from reading prior kernel
+  state.
+- **For audit/provenance/debuggability:** maybe useful, but optional.
+
+Practical rule:
+
+- If payment and claim-note are the same on-chain tx, one hash can serve
+  both roles.
+- If they are separate txs, keep payment hash in kernel (C4) and treat
+  claim tx hash as follower metadata unless product requirements demand
+  surfacing/proving it.
+
+## Security/Trust model
+
+### What a malicious app can do
+
+- Submit conflicting or spammy claim transactions (including duplicate
+  attempts for the same name).
+- Lie in its API responses (`/resolve`, `/proof`, `/claim-status`) to
+  clients that trust that app blindly.
+- Censor or delay forwarding user requests through its own frontend/API.
+- Run a modified follower locally and produce a non-canonical private view.
+
+### What a malicious app cannot do (assuming honest chain + honest followers)
+
+- Force canonical state to accept two owners for one name: kernel C3 rejects
+  later conflicting claims when replayed in canonical chain order.
+- Reuse one payment for multiple successful claims: kernel C4 rejects reused
+  `tx-hash` values.
+- Rewrite chain ordering for honest nodes: canonical `(block_height,
+  tx_index_in_block)` comes from Nockchain data.
+- Make honest nodes converge to different final states if they replay the same
+  chain data with the same kernel rules.
+
+### Remaining work for fully trustless verification
+
+- **Chain-native claim discovery:** follower currently uses submitted-claim
+  queue plus chain ordering for confirmation. Fully trustless operation wants
+  direct claim-note discovery from chain history (including reorg-safe replay)
+  without trusting local submission memory.
+- **Transition-proof completeness:** `nns-gate` currently proves inclusion
+  properties (G1/G2). Full trustless light-client security needs provable claim
+  transitions (C1-C4 over ordered events), not only inclusion in a committed
+  root.
+- **Payment attestation depth:** current payment path is chain-acceptance-aware
+  but not full semantic attestation (`sender`, `recipient`, `amount >= fee`)
+  in-proof.
+- **Client verification defaults:** wallets/UIs should verify proof bundles and
+  chain anchors by default instead of trusting any single app server response.
 
 ## Architecture
 
@@ -148,7 +244,7 @@ fragment, not a separate process.
 |  Rust hull (axum)       advisory, rebuildable                       |
 |                                                                     |
 |    handlers -------> payment::verify                                |
-|      (api.rs)          (stub today; chain client later)             |
+|      (api.rs)          (chain acceptance check + local fallback)    |
 |       |                                                             |
 |       +---> NockApp.poke / .peek  (holds kernel via tokio Mutex)    |
 |       |                                                             |
@@ -213,8 +309,8 @@ HTTP client
     v
 Rust hull (axum) ---- pending-only mirror + primaries mirror
     |
-    |  per /claim, one poke:
-    |    %claim name=@t owner=@t fee=@ud tx-hash=@t
+    |  per /claim, enqueue one replay item:
+    |    follower later pokes %claim name=@t owner=@t fee=@ud tx-hash=@t
     |      -> %claimed name owner tx-hash              on success
     |         (+ %primary-set owner name if first claim for this owner)
     |      -> %claim-error 'name already registered'   (hull: 400)
@@ -276,7 +372,8 @@ open (`*`).
 | Method | Path                     | Purpose                                               |
 | ------ | ------------------------ | ----------------------------------------------------- |
 | POST   | `/register`              | Create a pending reservation (`{address, name}`)      |
-| POST   | `/claim`                 | Promote pending → registered (`{address, name}`), pokes kernel `%claim` |
+| POST   | `/claim`                 | Submit claim-note + enqueue replay (`{address, name, txHash?}`), returns `{claim_id, status}`; follower applies in chain order when mined |
+| GET    | `/claim-status?claim_id=X` | Read async replay status (`submitted | confirmed | applied | rejected`) |
 | POST   | `/primary`               | Designate which of caller's names is primary (`{address, name}`), pokes kernel `%set-primary` |
 | POST   | `/settle`                | Produce one batch receipt for every name claimed since the last settle (empty body); pokes kernel `%settle-batch` |
 | GET    | `/snapshot`              | Current commitment `{claim_id, hull, root}` (hex-encoded) |
@@ -285,7 +382,7 @@ open (`*`).
 | GET    | `/verified`              | All registered entries, newest first                  |
 | GET    | `/resolve?name=X`        | `{address}` or 404                                    |
 | GET    | `/resolve?address=X`     | `{name}` — the address's **primary** — or 404         |
-| GET    | `/proof?name=X[&address=Y]` | Merkle inclusion bundle `{name, owner, txHash, claim_id, root, hull, proof[]}` proving `(name, owner, txHash)` is a row at `root`. Optional `address` filter returns 404 on owner mismatch. |
+| GET    | `/proof?name=X[&address=Y]` | Inclusion bundle + transition anchor `{name, owner, txHash, claim_id, root, hull, proof[], transition, transition_proof?}`. Optional `address` filter returns 404 on owner mismatch. |
 | GET    | `/search?name=X`         | `{name, price, status, owner?, registeredAt?}`        |
 | GET    | `/search?address=X`      | `{address, pending[], verified[], primary?}`          |
 | GET    | `/status`                | Diagnostic: counts, merkle root, settlement mode      |
@@ -388,6 +485,9 @@ hoonc --new --arbitrary hoon/tests/names.hoon hoon/
 
 # Rust unit + handler tests (boots the real kernel per test)
 cargo +nightly test
+
+# Light-client proof verification (reads ProofResponse JSON from stdin)
+curl "http://127.0.0.1:3000/proof?name=nns.nock" | cargo +nightly run --bin light_verify
 
 # API parity against the legacy worker
 scripts/parity.py \
@@ -494,9 +594,16 @@ To post settlements to Nockchain once that path is desired:
 
 ## Graduation path to real payment verification
 
-v1 intentionally stubs payment verification. Today
-`src/payment.rs::verify` returns `Ok(format!("stub-{uuid}"))`
-unconditionally. To wire real payment:
+Current payment behavior in `src/payment.rs` is hybrid:
+
+1. If the caller supplies `txHash` and `chain_endpoint` is configured,
+   the hull checks chain acceptance for that tx id before allowing the
+   claim to progress.
+2. If no `txHash` is supplied (or in local mode), the hull falls back
+   to a stub tx id for local/dev flows.
+
+This is chain-aware acceptance, not full payment attestation. To wire
+real payment:
 
 1. Reimplement `verify(address, name, required_fee)` against a real
    chain client (the legacy TypeScript lives at
@@ -610,8 +717,12 @@ src/
   api.rs                    axum router + handlers + poke/verify timeout guard
   kernel.rs                 NounSlab builders for each poke and peek
   state.rs                  AppState + mirror persistence
-  payment.rs                stubbed payment verify + fee tiers
+  payment.rs                chain-aware acceptance check + fee tiers
+  chain.rs                  chain RPC helpers (acceptance + tx block lookup)
+  chain_follower.rs         async replay worker (chain-ordered apply path)
+  claim_note.rs             canonical claim-note NoteData schema helpers
   types.rs                  wire-compat types for the legacy JSON shapes
+  bin/light_verify.rs       standalone proof verifier
 scripts/
   parity.py                 legacy vs new API diff tool
 tests/

@@ -28,6 +28,15 @@ pub enum RegistrationStatus {
     Registered,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimLifecycleStatus {
+    Submitted,
+    Confirmed,
+    Applied,
+    Rejected,
+}
+
 /// Request body for `POST /register`.
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -42,6 +51,8 @@ pub struct RegisterRequest {
 pub struct ClaimRequest {
     pub address: String,
     pub name: String,
+    #[serde(rename = "txHash", default)]
+    pub tx_hash: Option<String>,
 }
 
 /// Request body for `POST /primary`: designate `name` as the
@@ -55,9 +66,26 @@ pub struct SetPrimaryRequest {
 
 /// `POST /claim` success body.
 #[derive(Debug, Serialize)]
-pub struct ClaimResponse {
+pub struct ClaimSubmissionResponse {
     pub message: String,
-    pub registration: Registration,
+    pub claim_id: String,
+    pub status: ClaimLifecycleStatus,
+    #[serde(rename = "txHash", skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<Registration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimStatusResponse {
+    pub claim_id: String,
+    pub status: ClaimLifecycleStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration: Option<Registration>,
+    #[serde(rename = "txHash", skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
 }
 
 /// `POST /primary` success body.
@@ -127,6 +155,8 @@ pub struct SettleResponse {
     pub root: String,
     /// `hash-leaf(jam sorted-batch)` — batch-level replay key.
     pub note_id: String,
+    #[serde(rename = "settlementTx", skip_serializing_if = "Option::is_none")]
+    pub settlement_tx: Option<String>,
 }
 
 /// One sibling node in a Merkle inclusion proof.
@@ -138,14 +168,14 @@ pub struct SettleResponse {
 ///
 ///   - `"left"`  (Hoon `%.y`): compute `hash-pair(sibling, cur)`
 ///   - `"right"` (Hoon `%.n`): compute `hash-pair(cur, sibling)`
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofNodeView {
     /// Hex-encoded little-endian sibling hash bytes.
     pub hash: String,
     pub side: ProofSide,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProofSide {
     Left,
@@ -171,7 +201,7 @@ pub enum ProofSide {
 /// current `root` — not that `txHash` is unique in history (kernel
 /// `tx-hashes` set, trusted) nor that the root is a deterministic
 /// result of honest claims (see README "Proof scope").
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofResponse {
     pub name: String,
     pub owner: String,
@@ -184,6 +214,18 @@ pub struct ProofResponse {
     pub hull: String,
     /// Sibling chain from leaf to root, leaf-first.
     pub proof: Vec<ProofNodeView>,
+    /// Transition-proof anchor metadata for light clients. The
+    /// transition proof bytes are surfaced separately as an opaque
+    /// hex payload when available.
+    pub transition: TransitionProofMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_proof: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionProofMetadata {
+    pub mode: String,
+    pub settled_claim_id: u64,
 }
 
 /// `GET /pending-batch` success body.

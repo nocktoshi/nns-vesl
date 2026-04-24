@@ -3605,6 +3605,8 @@ dependencies = [
  "axum 0.7.9",
  "nock-noun-rs",
  "nockapp",
+ "nockapp-grpc",
+ "nockchain-client-rs",
  "nockchain-tip5-rs",
  "nockvm",
  "nockvm_macros",

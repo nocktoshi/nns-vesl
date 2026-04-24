@@ -8,6 +8,7 @@
 //!
 //!   POST /register        create pending reservation
 //!   POST /claim           promote pending -> registered (kernel %claim)
+//!   GET  /claim-status    check async claim replay status
 //!   POST /primary         designate which of caller's names is primary
 //!   POST /settle          batch-settle everything claimed since the
 //!                         previous successful settle (one note per call)
@@ -62,16 +63,16 @@ async fn poke_with_timeout(
 
 
 use crate::kernel::{
-    build_claim_poke, build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
+    build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
     build_proof_peek, build_set_primary_poke, build_settle_batch_poke, build_snapshot_peek,
     decode_last_settled, decode_owner, decode_pending_batch, decode_proof, decode_snapshot,
-    first_batch_settled, first_claim_id_bumped, first_error_message, first_primary_set,
-    first_vesl_settled, has_effect,
+    first_batch_settled, first_error_message, first_primary_set, first_vesl_settled,
 };
+use crate::claim_note::ClaimNoteV1;
 use crate::payment;
 use crate::state::{hex_encode, SharedState};
 use crate::types::{
-    ClaimRequest, ClaimResponse, PendingBatchResponse, ProofNodeView, ProofResponse, ProofSide,
+    ClaimRequest, ClaimStatusResponse, ClaimSubmissionResponse, ClaimLifecycleStatus, PendingBatchResponse, ProofNodeView, ProofResponse, ProofSide, TransitionProofMetadata,
     RegisterRequest, Registration, RegistrationStatus, SearchByAddressResponse,
     SearchByNameResponse, SearchStatus, SetPrimaryRequest, SetPrimaryResponse, SettleResponse,
 };
@@ -104,6 +105,10 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+pub(crate) fn now_millis_for_internal() -> u64 {
+    now_millis()
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +149,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/status", get(status))
         .route("/register", post(register_handler))
         .route("/claim", post(claim_handler))
+        .route("/claim-status", get(claim_status_handler))
         .route("/primary", post(set_primary_handler))
         .route("/settle", post(settle_handler))
         .route("/snapshot", get(snapshot_handler))
@@ -238,7 +244,7 @@ async fn register_handler(
 async fn claim_handler(
     State(state): State<SharedState>,
     Json(req): Json<ClaimRequest>,
-) -> Result<Json<ClaimResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
     if !is_valid_address(&req.address) {
         return Err(bad_request("invalid address"));
     }
@@ -265,76 +271,57 @@ async fn claim_handler(
     }
 
     let fee = payment::fee_for_name(&name);
-    let tx_hash = payment::verify(&address, &name, fee)
+    let tx_hash = payment::verify(&st.settlement, &address, &name, fee, req.tx_hash.as_deref())
+        .await
         .map_err(|e| bad_request(format!("no valid payment: {e}")))?;
+    let note = ClaimNoteV1::new(name.clone(), address.clone(), tx_hash.clone());
+    let _chain_submit = crate::chain::submit_claim_note(&st.settlement, &note)
+        .await
+        .map_err(|e| server_error(format!("claim note submit failed: {e}")))?;
+    st.mirror.enqueue_claim(
+        note.claim_id.clone(),
+        address,
+        name,
+        fee,
+        tx_hash.clone(),
+    );
+    st.persist();
 
-    // Hot path: a single %claim poke. The kernel is authoritative
-    // for both name uniqueness and payment uniqueness — if either
-    // the name or the tx_hash is already in kernel state, we get a
-    // %claim-error effect and surface it as a 400 without mutating
-    // hull state.
-    //
-    // Format/fee are validated hull-side too; a %claim that violates
-    // them crashes the kernel (unprovable) and surfaces as a 500.
-    // Settlement receipts (%vesl-register + %vesl-settle) are not on
-    // this path — they move the commitment on-chain when settlement
-    // mode is flipped on, without changing the hot path.
-    let effects = poke_with_timeout(
-        &mut st.app,
-        build_claim_poke(&name, &address, fee, &tx_hash),
-    )
-    .await
-    .map_err(|msg| server_error(format!("kernel claim poke failed: {msg}")))?;
+    if matches!(st.settlement.mode, vesl_core::SettlementMode::Local) {
+        drop(st);
+        crate::chain_follower::process_once(&state)
+            .await
+            .map_err(|e| server_error(format!("local replay failed: {e}")))?;
+        st = state.lock().await;
+    }
 
-    if let Some(err) = first_error_message(&effects) {
-        if err.contains("name already registered") {
+    let status = st
+        .mirror
+        .claim_status(&note.claim_id)
+        .map(|s| s.status)
+        .unwrap_or(ClaimLifecycleStatus::Submitted);
+    if matches!(status, ClaimLifecycleStatus::Rejected) {
+        let reason = st
+            .mirror
+            .claim_status(&note.claim_id)
+            .and_then(|s| s.reason)
+            .unwrap_or_else(|| "claim rejected".into());
+        if reason.contains("name already registered") {
             return Err(bad_request("Name already registered"));
         }
-        if err.contains("payment already used") {
+        if reason.contains("payment already used") {
             return Err(bad_request("Payment already consumed"));
         }
-        return Err(bad_request(err));
+        return Err(bad_request(reason));
     }
-    if !has_effect(&effects, "claimed") {
-        return Err(server_error(format!(
-            "claim returned no %claimed effect ({} effects)",
-            effects.len()
-        )));
-    }
+    let registration = st.mirror.names.get(&note.name).cloned();
 
-    let now = now_millis();
-    let reg = Registration {
-        address: address.clone(),
-        name: name.clone(),
-        status: RegistrationStatus::Registered,
-        timestamp: now,
-        date: Some(iso8601(now)),
+    Ok(Json(ClaimSubmissionResponse {
+        message: "Claim submitted; awaiting chain replay".into(),
+        claim_id: note.claim_id,
+        status,
         tx_hash: Some(tx_hash),
-    };
-    st.mirror.insert(reg.clone());
-    // On a first claim for this owner the kernel also emits
-    // [%primary-set owner name]. Mirror that here so
-    // /resolve?address= returns this name until the user
-    // explicitly calls POST /primary. If the owner already had a
-    // primary, no %primary-set effect is emitted and we leave the
-    // existing one alone.
-    if let Some((addr, primary_name)) = first_primary_set(&effects) {
-        st.mirror.set_primary(addr, primary_name);
-    }
-    // The kernel bumped `claim-id`, recomputed the Merkle root and
-    // registered a fresh hull in the graft. Cache the resulting
-    // commitment so the hull doesn't need to peek on every
-    // `/status` or `/settle` — authoritative history still lives
-    // in the graft's `registered` map.
-    if let Some(bumped) = first_claim_id_bumped(&effects) {
-        st.mirror
-            .set_snapshot(bumped.claim_id, &bumped.hull, &bumped.root);
-    }
-    st.persist_all().await;
-
-    Ok(Json(ClaimResponse {
-        message: "Name claimed".into(),
-        registration: reg,
+        registration,
     }))
 }
 
@@ -382,6 +369,31 @@ async fn set_primary_handler(
         address: ok_addr,
         name: ok_name,
     }))
+}
+
+async fn claim_status_handler(
+    State(state): State<SharedState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ClaimStatusResponse>, (StatusCode, Json<ErrorBody>)> {
+    let claim_id = params
+        .get("claim_id")
+        .or_else(|| params.get("claimId"))
+        .ok_or_else(|| bad_request("missing claim_id parameter"))?
+        .trim()
+        .to_string();
+    if claim_id.is_empty() {
+        return Err(bad_request("missing claim_id parameter"));
+    }
+    let st = state.lock().await;
+    let status = st.mirror.claim_status(&claim_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "unknown claim_id".into(),
+            }),
+        )
+    })?;
+    Ok(Json(status))
 }
 
 async fn snapshot_handler(
@@ -493,6 +505,14 @@ async fn settle_handler(
     st.mirror.set_last_settled_claim_id(batch.claim_id);
     st.mirror
         .set_snapshot(batch.claim_id, &settled.hull, &settled.root);
+    let note_id_hex = hex_encode(&batch.note_id);
+    let settlement_tx = match crate::chain::post_settlement_receipt(&st.settlement, &note_id_hex).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!("settlement chain post skipped: {e}");
+            None
+        }
+    };
     st.persist_all().await;
 
     Ok(Json(SettleResponse {
@@ -501,7 +521,8 @@ async fn settle_handler(
         names,
         hull: hex_encode(&settled.hull),
         root: hex_encode(&settled.root),
-        note_id: hex_encode(&batch.note_id),
+        note_id: note_id_hex,
+        settlement_tx,
     }))
 }
 
@@ -713,6 +734,11 @@ async fn proof_handler(
                 },
             })
             .collect(),
+        transition: TransitionProofMetadata {
+            mode: "claim-window-anchor".into(),
+            settled_claim_id: st.mirror.last_settled_claim_id,
+        },
+        transition_proof: None,
     }))
 }
 
@@ -795,6 +821,10 @@ fn iso8601(unix_millis: u64) -> String {
     )
 }
 
+pub(crate) fn iso8601_for_internal(unix_millis: u64) -> String {
+    iso8601(unix_millis)
+}
+
 fn unix_seconds_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400) as u32;
@@ -829,6 +859,7 @@ pub async fn serve(
     println!("Listening on http://{addr}");
     println!("  POST /register");
     println!("  POST /claim");
+    println!("  GET  /claim-status?claim_id=");
     println!("  POST /primary");
     println!("  POST /settle");
     println!("  GET  /snapshot");

@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  state dir: {}", state_dir.display());
 
     let state = Arc::new(Mutex::new(AppState::new(app, state_dir, settlement)));
+    let _follower = nns_vesl::chain_follower::spawn(state.clone());
 
     // --- Start HTTP server ---
     let port: u16 = std::env::var("API_PORT")

@@ -25,6 +25,9 @@
 //! graduation notes in `README.md`.
 
 pub mod api;
+pub mod chain;
+pub mod chain_follower;
+pub mod claim_note;
 pub mod kernel;
 pub mod payment;
 pub mod state;

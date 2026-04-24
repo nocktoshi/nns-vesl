@@ -11,11 +11,12 @@ use axum::http::{Request, StatusCode};
 use nockapp::kernel::boot;
 use nockapp::NockApp;
 use nockapp::wire::{SystemWire, Wire};
+use nns_vesl::chain::{ConfirmedTxPosition};
 use nns_vesl::kernel::{build_claim_poke, first_error_message, has_effect};
 use nns_vesl::{api, state::AppState};
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
-use vesl_core::SettlementConfig;
+use vesl_core::{SettlementConfig, SettlementMode};
 
 const ADDR1: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ";
 const ADDR2: &str = "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210abcdefghij";
@@ -368,6 +369,83 @@ async fn kernel_rejects_duplicate_tx_hash() {
     assert!(
         !has_effect(&effects2, "claimed"),
         "second claim must not emit %claimed"
+    );
+}
+
+/// Same-height race: two competing claims for one name are ordered by
+/// tx index inside the block (not local submission order). The lower
+/// tx index wins; the later tx is rejected by kernel C3.
+#[tokio::test]
+async fn follower_orders_same_height_claims_by_tx_index() {
+    let (_tmp, state) = setup().await;
+
+    // Force non-local follower path so ordering uses the mocked chain
+    // position provider.
+    {
+        let mut st = state.lock().await;
+        st.settlement.mode = SettlementMode::Fakenet;
+        st.settlement.chain_endpoint = Some("http://mock-chain".to_string());
+
+        // Enqueue in opposite order: tx-a first, tx-b second.
+        st.mirror.enqueue_claim(
+            "claim-a".to_string(),
+            ADDR1.to_string(),
+            "zero.nock".to_string(),
+            5000,
+            "tx-a".to_string(),
+        );
+        st.mirror.enqueue_claim(
+            "claim-b".to_string(),
+            ADDR2.to_string(),
+            "zero.nock".to_string(),
+            5000,
+            "tx-b".to_string(),
+        );
+    }
+
+    // Same block height, reversed tx index: tx-b should apply first.
+    nns_vesl::chain_follower::process_once_with_position_lookup(&state, |_endpoint, tx_hash| {
+        let pos = match tx_hash.as_str() {
+            "tx-a" => Some(ConfirmedTxPosition {
+                block_height: 42,
+                tx_index_in_block: 9,
+            }),
+            "tx-b" => Some(ConfirmedTxPosition {
+                block_height: 42,
+                tx_index_in_block: 3,
+            }),
+            _ => None,
+        };
+        async move { Ok(pos) }
+    })
+    .await
+    .expect("follower pass");
+
+    let st = state.lock().await;
+    let winner = st
+        .mirror
+        .names
+        .get("zero.nock")
+        .expect("name should be registered by winner");
+    assert_eq!(winner.address, ADDR2, "lower tx index should win");
+
+    let status_a = st
+        .mirror
+        .claim_status("claim-a")
+        .expect("claim-a status present");
+    let status_b = st
+        .mirror
+        .claim_status("claim-b")
+        .expect("claim-b status present");
+    assert_eq!(status_b.status, nns_vesl::types::ClaimLifecycleStatus::Applied);
+    assert_eq!(status_a.status, nns_vesl::types::ClaimLifecycleStatus::Rejected);
+    assert!(
+        status_a
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("name already registered"),
+        "loser should be rejected by kernel C3: {status_a:?}"
     );
 }
 
