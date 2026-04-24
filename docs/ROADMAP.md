@@ -3,6 +3,52 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24 pm) — Phase 3 Level A predicates
+
+- ~~New shared predicate library `hoon/lib/nns-predicates.hoon` with
+  two arms the Phase 3 recursive gate will consume:
+  `fee-for-name` (mirror of Rust `payment::fee_for_name`) and
+  `chain-links-to` (walks an oldest-first `(list anchor-header)` by
+  parent-pointer from a claim's block digest to the follower's
+  anchored tip).~~
+- ~~Kernel exposes them as `peek /fee-for-name/<name>` (read-only
+  @ud) and cause `%verify-chain-link claim-digest headers
+  anchored-tip` → `[%chain-link-result ok=?]`. Matching Rust poke
+  builders + decoders in `src/kernel.rs`.~~
+- ~~9 new integration tests in `tests/phase3_predicates.rs`:
+  2 fee-for-name cases (15-row parity table + long-name sanity)
+  and 7 chain-link cases (claim-is-tip, empty-chain-wrong-tip,
+  happy 3-header chain, first-parent-mismatch, internal-break,
+  height-gap, wrong-final-tip). All green.~~
+- ~~Grand total: **58 tests**, all passing (10 lib unit + 30 HTTP +
+  9 phase2 + 9 phase3 + 3 ignored prover).~~
+
+### Phase 3 Level B / Level C deferred
+
+The plan's original Phase 3 also called for `matches-block-commitment`,
+`has-tx-in-page`, and `pays-sender`/`pays-amount` predicates over
+full `page:t` / `raw-tx:v1` nouns. Landing those requires either:
+
+1. Symlinking `/common/tx-engine{,-0,-1}.hoon` +
+   `{pow,nock-prover,schedule,zoon,zose}.hoon` from `$NOCK_HOME` — we
+   tried this and hit a **hoonc dep-loop**: `tx-engine-0.hoon` hangs
+   for ~4 minutes during compile and eventually OOMs. Root cause is
+   the shared `/common/stark/prover` resolution through two different
+   `=> stark-engine` contexts (one from `vesl-prover`, one from
+   `nock-prover` pulled in transitively by `pow`).
+2. Vendoring a narrow subset of tx-engine arms into
+   `hoon/lib/tx-witness.hoon` with hand-picked re-exports. This is
+   the plan's "controlled upgrade" path; we ran out of session time
+   before getting to it.
+
+Either way, `nns-gate` v2 and the `%prove-claim` cause wait on the
+tx-witness module.
+
+**Status**: Phase 3 Level A shipped + tested; Phase 3 Level B tracked
+under follow-up todos. The compile-cycle finding is preserved inline
+in `scripts/setup-hoon-tree.sh` so nobody re-adds the tx-engine
+symlinks without first redesigning the shared stark-engine import.
+
 ## Today update (2026-04-24 pm) — un-vendor vesl hoon
 
 - ~~Moved the two downstream patches we carried on `vesl-stark-verifier.hoon`
@@ -169,9 +215,20 @@ settlement-batch schema).
   via `nockapp-grpc` public peeks.~~
 - ~~Phase 2: extend `ClaimNoteV1` with `nns/v1/raw-tx`, `/page`,
   `/block-proof`, `/header-chain` fields.~~
-- [ ] Phase 3: recursive `nns-gate` circuit — `verify:sp-verifier` on
-  the batch's block PoW proof, `has:z-in` for tx inclusion, C5 payment
-  predicates (sender pkh, amount >= fee), C1-C4 transitions.
+- [ ] Phase 3 Level B: vendor a narrow `hoon/lib/tx-witness.hoon`
+  that re-exports just the arms we need from tx-engine / tx-engine-1
+  (`block-commitment:page:t`, `has:z-in` on `tx-ids`,
+  `compute-id:raw-tx:t`, `spends:raw-tx:v1`, `outputs:tx:v1`) without
+  pulling in the full `pow → nock-prover → stark/prover` cone that
+  wedges hoonc.
+- [ ] Phase 3 Level B: `matches-block-commitment`, `has-tx-in-page`,
+  `pays-sender`, `pays-amount` predicates in `nns-predicates.hoon`
+  once `tx-witness.hoon` lands.
+- [ ] Phase 3c: recursive `nns-gate` circuit — `verify:sp-verifier`
+  on the batch's block PoW proof, `has:z-in` for tx inclusion, C5
+  payment predicates (sender pkh, amount >= fee), C1-C4 transitions.
+- [ ] Phase 3c: `%prove-claim` kernel cause + Rust poke builder +
+  recursive-proof integration test.
 - [ ] Phase 4: hull + follower wiring for block-bundle fetch +
   injection into `%settle-batch`; map new kernel error tags.
 - [ ] Phase 5: rewrite `src/bin/light_verify.rs` to verify the single

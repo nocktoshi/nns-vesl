@@ -118,10 +118,18 @@
 /+  *vesl-merkle
 /+  vp=vesl-prover
 /+  vv=vesl-verifier
+/+  np=nns-predicates
 /=  sp  /common/stark/prover
 /=  nv  /common/nock-verifier
 /=  four  /common/ztd/four
 /=  *  /common/wrapper
+::  nockup:imports
+::  NOTE: this marker lets vesl-nockup's `graft-inject` tool locate
+::  the vesl import block. We already wire vesl manually above
+::  (`*vesl-graft`, `*vesl-merkle`, `vp=vesl-prover`, `vv=vesl-verifier`),
+::  so `graft-inject` is idempotent here — it sees the vesl imports
+::  already in place and skips injection. See `docs/ROADMAP.md` for
+::  the nockup-adoption evaluation.
 ::
 =>
 |%
@@ -175,6 +183,10 @@
       ::  is frozen — further %set-payment-address pokes emit an error.
       ::
       payment-address=(unit @t)
+      ::  nockup:state
+      ::  graft-inject would add `vesl=vesl-state` here on a fresh
+      ::  kernel. Already present above; marker is idempotent.
+      ::
   ==
 ::
 ::  Max number of headers kept in `recent-headers`. The kernel stores
@@ -222,6 +234,18 @@
       ::  kernel operator from moving the payment target retroactively.
       ::
       [%set-payment-address address=@t]
+      ::  Phase 3 Level A: exercise `chain-links-to:nns-predicates`
+      ::  without going through %claim. Read-only — the cause does not
+      ::  mutate state, it just runs the predicate and emits the
+      ::  result. Used by tests + ops tooling to verify a claim's
+      ::  header chain resolves to the kernel's anchored tip before
+      ::  issuing an expensive %claim poke.
+      ::
+      [%verify-chain-link claim-digest=@ux headers=(list anchor-header) anchored-tip=@ux]
+      ::  nockup:cause
+      ::  graft-inject would add `vesl-cause` here on a fresh
+      ::  kernel. Already present below; marker is idempotent.
+      ::
       vesl-cause
   ==
 ::
@@ -542,6 +566,25 @@
         ::
         [%payment-address ~]
       ``payment-address.state
+        ::
+        ::  /fee-for-name/<name>  -> @ud
+        ::
+        ::  Phase 3 — shared fee-schedule peek. Identical table to the
+        ::  Rust-side `payment::fee_for_name`; a cross-repo parity
+        ::  test in `tests/phase3_predicates.rs` pins these in lockstep.
+        ::  Exposed as a peek (not just an internal arm) so the gate
+        ::  library and the hull both read from one source of truth.
+        ::
+        [%fee-for-name name=@t ~]
+      =/  key=@t  +<.path
+      ``(fee-for-name:np key)
+        ::
+        ::  nockup:peek
+        ::  graft-inject would wire `(vesl-peek vesl.state path)` as
+        ::  the `?+` default arm here on a fresh kernel. Already
+        ::  wired above (the `?+  path  (vesl-peek vesl.state path)`
+        ::  head); marker is idempotent.
+        ::
     ==
   ::
   ++  poke
@@ -758,6 +801,21 @@
       ^-  (list effect)
       ~[[%payment-address-set addr]]
       ::
+        ::  %verify-chain-link: read-only Phase 3 Level A predicate
+        ::  smoke test. Returns `[%chain-link-result ok=?]` without
+        ::  mutating state.
+        ::
+        %verify-chain-link
+      =/  ok=?
+        %-  chain-links-to:np
+        :*  claim-digest.u.act
+            headers.u.act
+            anchored-tip.u.act
+        ==
+      :_  state
+      ^-  (list effect)
+      ~[[%chain-link-result ok]]
+      ::
         %set-primary
       =/  c  u.act
       =/  existing  (~(get by names.state) name.c)
@@ -957,6 +1015,12 @@
       :_  state
       ^-  (list effect)
       efx
+      ::
+      ::  nockup:poke
+      ::  graft-inject would add the three `%vesl-register` /
+      ::  `%vesl-verify` / `%vesl-settle` arms here on a fresh
+      ::  kernel. Already present above; marker is idempotent.
+      ::
     ==
   --
 --

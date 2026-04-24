@@ -222,6 +222,52 @@ pub fn build_set_payment_address_poke(address: &str) -> NounSlab {
     slab
 }
 
+/// Build a `[%verify-chain-link claim-digest=@ux headers=(list anchor-header) anchored-tip=@ux]`
+/// poke slab. Read-only — runs
+/// `chain-links-to:nns-predicates` and emits
+/// `[%chain-link-result ok=?]` without mutating state.
+///
+/// Intended for tests + ops tooling; the live Phase 3 circuit will
+/// call `chain-links-to` in-gate, not via this poke.
+pub fn build_verify_chain_link_poke(
+    claim_digest: &[u8],
+    headers: &[AnchorHeader],
+    anchored_tip: &[u8],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "verify-chain-link");
+    let cd = make_atom_in(&mut slab, claim_digest);
+    let at = make_atom_in(&mut slab, anchored_tip);
+
+    let mut list_noun = D(0);
+    for h in headers.iter().rev() {
+        let digest = make_atom_in(&mut slab, &h.digest);
+        let parent = make_atom_in(&mut slab, &h.parent);
+        let height = atom_from_u64(&mut slab, h.height);
+        let cell = T(&mut slab, &[digest, height, parent]);
+        list_noun = T(&mut slab, &[cell, list_noun]);
+    }
+
+    let poke = T(&mut slab, &[tag, cd, list_noun, at]);
+    slab.set_root(poke);
+    slab
+}
+
+/// `ok` from `[%chain-link-result ok=?]`.
+pub fn chain_link_result(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "chain-link-result" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let v = cell.tail().as_atom().ok()?.as_u64().ok()?;
+    Some(v == 0)
+}
+
+pub fn first_chain_link_result(effects: &[NounSlab]) -> Option<bool> {
+    effects.iter().find_map(chain_link_result)
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------
@@ -286,6 +332,27 @@ pub fn build_anchor_peek() -> NounSlab {
 /// `%set-payment-address` poke, `[~ <cord>]` afterwards.
 pub fn build_payment_address_peek() -> NounSlab {
     single_tag_peek("payment-address")
+}
+
+/// Build a `/fee-for-name/<name>` peek path slab.
+///
+/// Kernel response: `[~ ~ @ud]` — the fee (in nicks) that the kernel
+/// would require for a `%claim` of `name`. Delegates to
+/// `fee-for-name:nns-predicates` (Phase 3 Level A); this is the
+/// single source of truth both Hoon and Rust consult so the fee
+/// schedule cannot drift between the two.
+pub fn build_fee_for_name_peek(name: &str) -> NounSlab {
+    name_peek("fee-for-name", name)
+}
+
+/// Decode the `[~ ~ @ud]` result of `/fee-for-name/<name>`.
+pub fn decode_fee_for_name(result: &NounSlab) -> Result<u64, String> {
+    let inner = peek_unwrap_some(result)?;
+    inner
+        .as_atom()
+        .map_err(|_| "fee-for-name: expected atom".to_string())?
+        .as_u64()
+        .map_err(|_| "fee-for-name: overflows u64".to_string())
 }
 
 fn single_tag_peek(tag_str: &str) -> NounSlab {
