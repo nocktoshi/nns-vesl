@@ -3,6 +3,27 @@
 This document turns the decision in `docs/CONSENSUS.md` into an
 implementation sequence.
 
+## Today update (2026-04-24 pm) — un-vendor vesl hoon
+
+- ~~Moved the two downstream patches we carried on `vesl-stark-verifier.hoon`
+  and `vesl-verifier.hoon` upstream on a local vesl feature branch
+  `phase1-verifier-debug-and-type-fix` (commit `dc9382c`):~~
+    - ~~type-narrow `verify-settlement`'s `mule` unwrap
+      (`?.  -.result` → `?.  ?=(%& -.result)`) so stricter hoonc compiles
+      it without a nest-fail;~~
+    - ~~add `++verify-raw` (top-level + wrapper) that calls `verify-inner`
+      directly so assert crashes bubble up as kernel traces — intended
+      for prover/verifier integration debugging, not production.~~
+- ~~Deleted the five vendored copies under `hoon/lib/vesl-*.hoon` (total
+  1 438 lines) and extended `scripts/setup-hoon-tree.sh` to symlink
+  from `$VESL_HOME/protocol/lib/` (with the same CLI-env-TOML
+  resolution story as `$NOCK_HOME`). NNS now tracks vesl master via
+  symlink — a `git pull` in the vesl clone propagates into the next
+  `make install`.~~
+- ~~Kernel recompiles unchanged (19 MB jam); all 49 active tests still
+  pass; the three ignored prover tests still record ~4.7 s prove,
+  ~0.61 s verify (ok=true).~~
+
 ## Today update (2026-04-24 pm) — Phase 2 chain-input plumbing
 
 - ~~Kernel state grew an `anchored-chain` field (tip digest/height + a

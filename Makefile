@@ -11,6 +11,7 @@ PATH_LINE := export PATH="$$HOME/.local/bin:$$PATH"
 .PHONY: install uninstall
 
 install:
+	bash scripts/setup-hoon-tree.sh
 	hoonc --new hoon/app/app.hoon hoon/
 	cargo +nightly build --release
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"

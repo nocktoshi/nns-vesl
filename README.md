@@ -15,12 +15,18 @@ rustup toolchain install nightly
 # hoonc
 cargo +nightly install --git https://github.com/nockchain/nockchain.git hoonc
 
-# nockchain sibling clone
+# nockchain sibling clone (sourced via $NOCK_HOME, default ../nockchain)
 git clone https://github.com/nockchain/nockchain ~/nockchain
 
-# vesl sibling clone
-git clone https://github.com/zkvesl/vesl-core.git ~/vesl
+# vesl sibling clone (sourced via $VESL_HOME, default ../vesl)
+git clone https://github.com/zkvesl/vesl.git ~/vesl
 ```
+
+`scripts/setup-hoon-tree.sh` (invoked by `make install`) symlinks the
+nockchain prover/verifier arms and the vesl graft/prover/verifier libs
+into `hoon/` so `hoonc` can resolve them. Override locations by setting
+`NOCK_HOME` / `VESL_HOME` in the environment or in `vesl.toml`
+(`nock_home = "..."`, `vesl_home = "..."`).
 
 ## Quick start
 
