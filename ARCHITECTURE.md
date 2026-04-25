@@ -1,3 +1,4 @@
+
 ---
 # NNS Architecture, Proof Model, Recursive-STARK Research, and Roadmap
 Status: consolidated architecture reference + roadmap.  
