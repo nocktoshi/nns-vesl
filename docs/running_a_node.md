@@ -5,7 +5,7 @@ monitor an NNS node. Everything below assumes a recent macOS or Linux
 host with `cargo +nightly` available.
 
 For the full architecture and design rationale, see
-[`../ARCHITECTURE.md`](../ARCHITECTURE.md).
+`[../ARCHITECTURE.md](../ARCHITECTURE.md)`.
 
 ---
 
@@ -26,13 +26,15 @@ curl -s http://127.0.0.1:3000/status | jq .
 
 ## 1. Prerequisites
 
-| Tool | Why |
-|---|---|
-| Rust nightly | kernel uses nightly features in upstream crates |
-| `jq` | you'll want to pipe JSON responses through it |
-| `curl` or HTTPie | query the local HTTP API |
-| 2 GB free RAM | kernel + mirror + axum |
-| 1 GB free disk | per-poke checkpoints in `.nns-data/` |
+
+| Tool             | Why                                             |
+| ---------------- | ----------------------------------------------- |
+| Rust nightly     | kernel uses nightly features in upstream crates |
+| `jq`             | you'll want to pipe JSON responses through it   |
+| `curl` or HTTPie | query the local HTTP API                        |
+| 2 GB free RAM    | kernel + mirror + axum                          |
+| 1 GB free disk   | per-poke checkpoints in `.nns-data/`            |
+
 
 Check Rust:
 
@@ -44,6 +46,9 @@ rustup toolchain list | grep nightly
 ## 2. Install
 
 ```bash
+git clone https://github.com/zkvesl/vesl-core.git
+cd vesl-core && git checkout dev
+cd ~
 git clone https://github.com/nocktoshi/nns-vesl.git
 cd nns-vesl
 make install
@@ -52,12 +57,12 @@ make install
 What `make install` does:
 
 - Runs `scripts/setup-hoon-tree.sh` — symlinks Nockchain + Vesl Hoon
-  libs into `hoon/common/` and `hoon/lib/`.
+libs into `hoon/common/` and `hoon/lib/`.
 - Compiles the kernel: `hoonc --new hoon/app/app.hoon hoon/` → produces
-  `out.jam` (~18 MB).
+`out.jam` (~18 MB).
 - Builds the Rust binary: `cargo +nightly build --release`.
 - Installs `nns` and `light_verify` to `$HOME/.local/bin` (updates
-  `$PATH` in `~/.zshrc` / `~/.bashrc` if needed).
+`$PATH` in `~/.zshrc` / `~/.bashrc` if needed).
 
 Verify:
 
@@ -121,15 +126,17 @@ Listening on http://127.0.0.1:3000
 
 Runtime env vars the binary respects:
 
-| Var | Default | What |
-|---|---|---|
-| `BIND_ADDR` | `127.0.0.1` | interface to bind |
-| `API_PORT` | `3000` | HTTP port |
-| `VESL_TOML` | `vesl.toml` | config file path |
-| `NNS_DATA_DIR` | `.` | where `.nns-data/` is created |
-| `NNS_KERNEL_JAM` | `out.jam` | kernel jam path |
-| `RUST_LOG` | `info` | log verbosity — see [§ Logs](#logs) |
-| `NNS_ENABLE_ADMIN` | unset | enable admin routes (debug only) |
+
+| Var                | Default     | What                                |
+| ------------------ | ----------- | ----------------------------------- |
+| `BIND_ADDR`        | `127.0.0.1` | interface to bind                   |
+| `API_PORT`         | `3000`      | HTTP port                           |
+| `VESL_TOML`        | `vesl.toml` | config file path                    |
+| `NNS_DATA_DIR`     | `.`         | where `.nns-data/` is created       |
+| `NNS_KERNEL_JAM`   | `out.jam`   | kernel jam path                     |
+| `RUST_LOG`         | `info`      | log verbosity — see [§ Logs](#logs) |
+| `NNS_ENABLE_ADMIN` | unset       | enable admin routes (debug only)    |
+
 
 Clean shutdown: `Ctrl-C` or `SIGTERM`. The binary flushes state
 (mirror + kernel checkpoint) before exiting.
@@ -173,14 +180,14 @@ curl -s http://127.0.0.1:3000/status | jq
 
 Interpret:
 
-- **`is_caught_up: true`** and **`last_error: null`** → follower healthy.
-- **`is_caught_up: false` and growing `anchor_lag_blocks`** → follower
-  falling behind. Check chain endpoint health, inspect `last_error`.
-- **`last_advance_age_seconds` > 60** → follower hasn't moved in a
-  minute even though the anchor tick runs every 10 s. Probably stuck
-  on a Nockchain RPC or the kernel is rejecting advances.
-- **`chain_tip_height: null`** → follower has never reached the chain.
-  Check `settlement_mode` and `chain_endpoint`.
+- `**is_caught_up: true**` and `**last_error: null**` → follower healthy.
+- `**is_caught_up: false` and growing `anchor_lag_blocks**` → follower
+falling behind. Check chain endpoint health, inspect `last_error`.
+- `**last_advance_age_seconds` > 60** → follower hasn't moved in a
+minute even though the anchor tick runs every 10 s. Probably stuck
+on a Nockchain RPC or the kernel is rejecting advances.
+- `**chain_tip_height: null`** → follower has never reached the chain.
+Check `settlement_mode` and `chain_endpoint`.
 
 ### `/anchor` — just the anchor surface
 
@@ -229,13 +236,15 @@ failures without matching claim-loop noise.
 
 ### Alerting (suggested)
 
-| Signal | Threshold | Action |
-|---|---|---|
-| `follower.is_caught_up == false` | sustained > 5 min | investigate chain endpoint |
-| `follower.anchor_lag_blocks` | > 50 | alert, check `last_error_phase` |
-| `follower.last_advance_age_seconds` | > 120 in chain mode | anchor stuck |
-| `follower.last_error_phase == "advance_poke"` | any | kernel rejected an advance — possible reorg |
-| Process missing | n/a | supervise with systemd/launchd |
+
+| Signal                                        | Threshold           | Action                                      |
+| --------------------------------------------- | ------------------- | ------------------------------------------- |
+| `follower.is_caught_up == false`              | sustained > 5 min   | investigate chain endpoint                  |
+| `follower.anchor_lag_blocks`                  | > 50                | alert, check `last_error_phase`             |
+| `follower.last_advance_age_seconds`           | > 120 in chain mode | anchor stuck                                |
+| `follower.last_error_phase == "advance_poke"` | any                 | kernel rejected an advance — possible reorg |
+| Process missing                               | n/a                 | supervise with systemd/launchd              |
+
 
 ## 6. Follower debugging
 
@@ -259,9 +268,9 @@ curl -X POST http://127.0.0.1:3000/admin/advance-tip-now
 
 Common causes of `advanced: false`:
 
-- **`local mode`** — `settlement_mode = "local"` in vesl.toml. Set to `"chain"`.
-- **`endpoint missing`** — `chain_endpoint` not set. Add it.
-- **`within finality depth`** — chain tip < NNS anchor + `finality_depth` (default 10). Wait for chain to advance.
+- `**local mode**` — `settlement_mode = "local"` in vesl.toml. Set to `"chain"`.
+- `**endpoint missing**` — `chain_endpoint` not set. Add it.
+- `**within finality depth**` — chain tip < NNS anchor + `finality_depth` (default 10). Wait for chain to advance.
 
 Never enable `NNS_ENABLE_ADMIN` on a public-facing node. The admin
 routes aren't authenticated. Scanners see 404 when it's disabled —
@@ -330,9 +339,9 @@ Everything NNS writes at runtime lives under `$NNS_DATA_DIR/.nns-data/`
 Backing up:
 
 - **State dir** — the whole `.nns-data/` atomically (the kernel fsyncs
-  internally on `persist_all`; copying mid-run risks a partial
-  checkpoint but not corruption of older ones).
-- **`vesl.toml`** — required to re-boot against the same treasury.
+internally on `persist_all`; copying mid-run risks a partial
+checkpoint but not corruption of older ones).
+- `**vesl.toml`** — required to re-boot against the same treasury.
 
 Restoring: drop the `.nns-data/` back in place and start `nns`. The
 kernel prints `Successfully imported kernel state from: ...` when it
@@ -377,3 +386,4 @@ and `names_count` stops changing.
 - **API reference** — `src/api.rs` (each handler's doc-comment)
 - **Config surface** — `src/config.rs`, `vesl.toml.example`
 - **Roadmap** — `ARCHITECTURE.md` §11
+

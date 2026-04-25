@@ -2,6 +2,7 @@
 # Environment variables override these; CLI flags override everything.
 
 nock_home = "../nockchain"
+vesl_home = "../vesl-core"
 
 # Hull HTTP API port (default: 3000)
 # api_port = 3000
