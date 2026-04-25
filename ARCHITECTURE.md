@@ -1070,25 +1070,25 @@ Known edge case:
 ### Level C-A — shipped 2026-04-24 pm
 Implemented in `hoon/lib/nns-predicates.hoon` as pure Hoon (no new deps):
 - `+$nns-raw-tx-witness`: 4-atom narrow view
-  `[tx-id spender-pkh treasury-amount treasury-address]`.
+  `[tx-id spender-pkh treasury-amount output-lock-root]`.   
 - `+matches-tx-id`: witness.tx-id == claim.tx-hash.
 - `+pays-sender`: witness.spender-pkh == claim.owner (atom equality).
 - `+pays-amount`: witness.treasury-amount >= fee-for-name(claim.name).
-- `+matches-treasury`: compared against kernel's `payment-address`
+- `+matches-treasury`: compared against treasury's public lock hash
   in the `%prove-claim` cause (state-relative, not in the arm).
 Kernel wiring:
 - `%validate-claim` / `%prove-claim` pokes take four extra witness
   atoms (`witness-tx-id`, `witness-spender-pkh`, `witness-treasury-amount`,
-  `witness-treasury-address`).
+  `witness-output-lock-hash`).
 - `validate-claim-bundle` adds three cross-predicate checks:
   `witness-tx-id-mismatch`, `witness-sender-mismatch`, `witness-underpaid`.
 - `%prove-claim` cause additionally refuses on `witness-wrong-treasury`
   (witness treasury ≠ kernel state, or kernel treasury unset).
 Trust model:
 - **Hull trusted** to correctly extract `(tx-id, spender-pkh,
-  treasury-amount, treasury-address)` from the on-chain raw-tx.
+  treasury-amount, output-lock-hash)` from the on-chain raw-tx.
 - **Kernel enforces** consistency between the witness, the claim
-  tuple, and kernel state (`payment-address`).
+  tuple, and kernel state (`output-lock-hash`).
 - **Wallet verifies** the STARK, then independently fetches the
   raw-tx from Nockchain and re-parses to confirm the witness
   fields match. This makes hull extraction *falsifiable* — a

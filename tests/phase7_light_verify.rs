@@ -72,10 +72,7 @@ fn rejects_stale_proof_with_exit_2() {
         tip_digest: "42".into(),
         tip_height: 100,
     }));
-    let (code, _out, err) = run(
-        &["--chain-tip", "130", "--max-staleness", "20"],
-        &body,
-    );
+    let (code, _out, err) = run(&["--chain-tip", "130", "--max-staleness", "20"], &body);
     assert_eq!(code, 2, "stale proof must exit 2 (stderr: {err})");
     assert!(
         err.contains("freshness check failed"),
@@ -92,10 +89,7 @@ fn accepts_at_exact_freshness_boundary() {
         tip_digest: "42".into(),
         tip_height: 100,
     }));
-    let (code, _out, err) = run(
-        &["--chain-tip", "120", "--max-staleness", "20"],
-        &body,
-    );
+    let (code, _out, err) = run(&["--chain-tip", "120", "--max-staleness", "20"], &body);
     assert_eq!(
         code, 1,
         "at-boundary should pass freshness, then fail on synthetic merkle \
@@ -143,15 +137,7 @@ fn rejects_mismatched_anchor_digest_with_exit_3() {
         tip_digest: "aa".into(),
         tip_height: 100,
     }));
-    let (code, _out, err) = run(
-        &[
-            "--chain-tip",
-            "100",
-            "--chain-tip-digest",
-            "bb",
-        ],
-        &body,
-    );
+    let (code, _out, err) = run(&["--chain-tip", "100", "--chain-tip-digest", "bb"], &body);
     assert_eq!(
         code, 3,
         "mismatched anchor digest must exit 3 (stderr: {err})"
@@ -170,15 +156,7 @@ fn accepts_matching_anchor_digest() {
         tip_digest: "aa".into(),
         tip_height: 100,
     }));
-    let (code, _out, err) = run(
-        &[
-            "--chain-tip",
-            "100",
-            "--chain-tip-digest",
-            "aa",
-        ],
-        &body,
-    );
+    let (code, _out, err) = run(&["--chain-tip", "100", "--chain-tip-digest", "aa"], &body);
     assert_eq!(
         code, 1,
         "matching anchor should pass freshness+binding, then fail merkle \
@@ -194,10 +172,7 @@ fn requires_chain_tip_without_no_freshness() {
         tip_height: 100,
     }));
     let (code, _out, err) = run(&[], &body);
-    assert_eq!(
-        code, 5,
-        "missing --chain-tip must exit 5 (stderr: {err})"
-    );
+    assert_eq!(code, 5, "missing --chain-tip must exit 5 (stderr: {err})");
 }
 
 #[test]
@@ -236,9 +211,6 @@ fn rejects_proof_one_block_past_boundary() {
         tip_digest: "42".into(),
         tip_height: 99,
     }));
-    let (code, _out, err) = run(
-        &["--chain-tip", "120", "--max-staleness", "20"],
-        &body,
-    );
+    let (code, _out, err) = run(&["--chain-tip", "120", "--max-staleness", "20"], &body);
     assert_eq!(code, 2, "one-past-boundary must reject (stderr: {err})");
 }

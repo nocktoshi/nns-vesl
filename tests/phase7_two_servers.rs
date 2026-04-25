@@ -37,16 +37,15 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use nns_vesl::kernel::{
+    build_advance_tip_poke, build_anchor_peek, decode_anchor, first_anchor_advanced, AnchorHeader,
+};
+use nns_vesl::state::{hex_encode, AppState, SharedState};
+use nns_vesl::types::{ProofAnchor, ProofResponse, TransitionProofMetadata};
 use nockapp::kernel::boot;
 use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use nns_vesl::kernel::{
-    build_advance_tip_poke, build_anchor_peek, decode_anchor, first_anchor_advanced,
-    AnchorHeader,
-};
-use nns_vesl::state::{hex_encode, AppState, SharedState};
-use nns_vesl::types::{ProofAnchor, ProofResponse, TransitionProofMetadata};
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -92,8 +91,7 @@ async fn advance_to(state: &SharedState, digest: Vec<u8>, height: u64) {
     let poke = build_advance_tip_poke(&[header]);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), poke)
+        k.poke(SystemWire.to_wire(), poke)
             .await
             .expect("advance-tip poke")
     };
@@ -179,7 +177,11 @@ async fn two_servers_freshness_gate() {
     while leading.last() == Some(&0) {
         leading.pop();
     }
-    assert_eq!(leading, vec![0x42], "server A anchor digest should start with 0x42");
+    assert_eq!(
+        leading,
+        vec![0x42],
+        "server A anchor digest should start with 0x42"
+    );
 
     // --- Wallet side: simulate canonical Nockchain tip at 130.
     const WALLET_CHAIN_TIP: u64 = 130;
@@ -235,7 +237,10 @@ async fn server_catches_up_proofs_become_fresh_again() {
 
     let stale_body = synthetic_proof_json(&digest, height);
     assert_eq!(
-        run_light_verify(&["--chain-tip", "130", "--max-staleness", "20"], &stale_body),
+        run_light_verify(
+            &["--chain-tip", "130", "--max-staleness", "20"],
+            &stale_body
+        ),
         2,
         "frozen server produces stale proof (reject)",
     );
@@ -248,7 +253,10 @@ async fn server_catches_up_proofs_become_fresh_again() {
 
     let fresh_body = synthetic_proof_json(&digest2, height2);
     assert_eq!(
-        run_light_verify(&["--chain-tip", "130", "--max-staleness", "20"], &fresh_body),
+        run_light_verify(
+            &["--chain-tip", "130", "--max-staleness", "20"],
+            &fresh_body
+        ),
         1,
         "caught-up server's proof passes freshness (Merkle fails on synthetic data)",
     );

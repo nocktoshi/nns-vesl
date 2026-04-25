@@ -39,11 +39,11 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nockapp::noun::slab::NounSlab;
-use nockapp::NockApp;
 use nockapp::wire::{SystemWire, Wire};
-use tokio::sync::Mutex as TokioMutex;
+use nockapp::NockApp;
 use serde::Serialize;
 use serde_json::json;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -64,25 +64,25 @@ async fn poke_with_timeout(
     }
 }
 
-
+use crate::claim_note::ClaimNoteV1;
 use crate::kernel::{
-    build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
-    build_anchor_peek, build_proof_peek, build_set_primary_poke, build_settle_batch_poke,
-    build_snapshot_peek, decode_anchor, decode_last_settled, decode_owner, decode_pending_batch,
-    decode_proof, decode_snapshot, first_batch_settled, first_error_message, first_primary_set,
+    build_anchor_peek, build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
+    build_proof_peek, build_set_primary_poke, build_settle_batch_poke, build_snapshot_peek,
+    decode_anchor, decode_last_settled, decode_owner, decode_pending_batch, decode_proof,
+    decode_snapshot, first_batch_settled, first_error_message, first_primary_set,
     first_vesl_settled,
 };
-use crate::claim_note::ClaimNoteV1;
 use crate::payment;
 use crate::state::{hex_encode, SharedState};
 use crate::types::{
-    ClaimRequest, ClaimStatusResponse, ClaimSubmissionResponse, ClaimLifecycleStatus, PendingBatchResponse, ProofAnchor, ProofNodeView, ProofResponse, ProofSide, TransitionProofMetadata,
-    RegisterRequest, Registration, RegistrationStatus, SearchByAddressResponse,
-    SearchByNameResponse, SearchStatus, SetPrimaryRequest, SetPrimaryResponse, SettleResponse,
+    ClaimLifecycleStatus, ClaimRequest, ClaimStatusResponse, ClaimSubmissionResponse,
+    PendingBatchResponse, ProofAnchor, ProofNodeView, ProofResponse, ProofSide, RegisterRequest,
+    Registration, RegistrationStatus, SearchByAddressResponse, SearchByNameResponse, SearchStatus,
+    SetPrimaryRequest, SetPrimaryResponse, SettleResponse, TransitionProofMetadata,
 };
 
 // ---------------------------------------------------------------------------
-// Validation 
+// Validation
 // ---------------------------------------------------------------------------
 
 pub fn is_valid_address(address: &str) -> bool {
@@ -101,7 +101,10 @@ pub fn is_valid_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".nock") else {
         return false;
     };
-    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 fn now_millis() -> u64 {
@@ -329,9 +332,8 @@ async fn anchor_handler(
         (Some(chain_tip), Some(anchor_tip)) => Some(chain_tip.saturating_sub(anchor_tip)),
         _ => None,
     };
-    let is_caught_up = anchor_lag_blocks.map(|lag| {
-        lag <= crate::chain_follower::DEFAULT_FINALITY_DEPTH + 1
-    });
+    let is_caught_up =
+        anchor_lag_blocks.map(|lag| lag <= crate::chain_follower::DEFAULT_FINALITY_DEPTH + 1);
 
     Ok(Json(json!({
         "anchor": anchor_kernel.as_ref().map(|a| json!({
@@ -531,13 +533,8 @@ async fn claim_handler(
     let is_local = matches!(settlement.mode, vesl_core::SettlementMode::Local);
     {
         let mut h = state.hull.lock().await;
-        h.mirror.enqueue_claim(
-            note.claim_id.clone(),
-            address,
-            name,
-            fee,
-            tx_hash.clone(),
-        );
+        h.mirror
+            .enqueue_claim(note.claim_id.clone(), address, name, fee, tx_hash.clone());
         h.persist_mirror();
     }
 
@@ -555,9 +552,7 @@ async fn claim_handler(
             .map(|s| s.status)
             .unwrap_or(ClaimLifecycleStatus::Submitted);
         let reason = if matches!(status, ClaimLifecycleStatus::Rejected) {
-            h.mirror
-                .claim_status(&note.claim_id)
-                .and_then(|s| s.reason)
+            h.mirror.claim_status(&note.claim_id).and_then(|s| s.reason)
         } else {
             None
         };
@@ -721,12 +716,17 @@ async fn settle_handler(
             .map_err(|e| server_error(format!("pending-batch peek failed: {e:?}")))?;
         let names = decode_pending_batch(&pending_slab)
             .map_err(|e| server_error(format!("pending-batch decode failed: {e}")))?;
-        let effects = match timeout(POKE_TIMEOUT, k.poke(SystemWire.to_wire(), build_settle_batch_poke()))
-            .await
+        let effects = match timeout(
+            POKE_TIMEOUT,
+            k.poke(SystemWire.to_wire(), build_settle_batch_poke()),
+        )
+        .await
         {
             Ok(Ok(effects)) => effects,
             Ok(Err(e)) => {
-                return Err(server_error(format!("kernel settle-batch poke failed: {e:?}")));
+                return Err(server_error(format!(
+                    "kernel settle-batch poke failed: {e:?}"
+                )));
             }
             Err(_) => {
                 return Err(server_error(format!(
@@ -748,17 +748,14 @@ async fn settle_handler(
     let batch = first_batch_settled(&effects).ok_or_else(|| {
         let tags: Vec<String> = effects
             .iter()
-            .map(|e| {
-                crate::kernel::effect_tag(e).unwrap_or_else(|| "<untagged>".to_string())
-            })
+            .map(|e| crate::kernel::effect_tag(e).unwrap_or_else(|| "<untagged>".to_string()))
             .collect();
         server_error(format!(
             "settle returned no %batch-settled effect (tags: {tags:?})"
         ))
     })?;
-    let settled = first_vesl_settled(&effects).ok_or_else(|| {
-        server_error("settle returned %batch-settled without %vesl-settled")
-    })?;
+    let settled = first_vesl_settled(&effects)
+        .ok_or_else(|| server_error("settle returned %batch-settled without %vesl-settled"))?;
 
     let note_id_hex = hex_encode(&batch.note_id);
     let settlement_for_post = {
@@ -894,7 +891,9 @@ async fn resolve_handler(
             Some(name) => Ok(Json(json!({ "name": name }))),
             None => Err((
                 StatusCode::NOT_FOUND,
-                Json(ErrorBody { error: "not found".into() }),
+                Json(ErrorBody {
+                    error: "not found".into(),
+                }),
             )),
         }
     } else {
@@ -1097,7 +1096,7 @@ async fn search_handler(
         if !is_valid_name(&name) {
             return Err(bad_request("invalid name"));
         }
-        let price = payment::fee_for_name(&name);
+        let price = payment::nock_for_name(&name);
         let existing = h.mirror.names.get(&name).cloned();
         let body = match existing {
             None => SearchByNameResponse {
@@ -1135,9 +1134,7 @@ fn iso8601(unix_millis: u64) -> String {
     let secs = unix_millis / 1000;
     let ms = unix_millis % 1000;
     let (year, month, day, hh, mm, ss) = unix_seconds_to_ymdhms(secs as i64);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z")
 }
 
 pub(crate) fn iso8601_for_internal(unix_millis: u64) -> String {

@@ -217,7 +217,10 @@ mod tests {
     fn exact_boundary_accepts() {
         // proof height exactly at chain_tip - max_staleness is OK.
         let fresh = Freshness::new(20);
-        assert!(fresh.check(100, 120).is_ok(), "lag==max_staleness must pass");
+        assert!(
+            fresh.check(100, 120).is_ok(),
+            "lag==max_staleness must pass"
+        );
     }
 
     #[test]
@@ -263,7 +266,10 @@ mod tests {
         // collapses — everything is "fresh enough".
         let fresh = Freshness::new(20);
         assert!(fresh.check(0, 5).is_ok());
-        assert!(fresh.check(0, 20).is_ok(), "chain_height == max_staleness boundary");
+        assert!(
+            fresh.check(0, 20).is_ok(),
+            "chain_height == max_staleness boundary"
+        );
     }
 
     #[test]
@@ -283,7 +289,10 @@ mod tests {
     fn very_tight_policy_requires_exact_tip() {
         let zero = Freshness::new(0);
         assert!(zero.check(100, 100).is_ok(), "equal is always ok");
-        assert!(zero.check(99, 100).is_err(), "any lag rejects with window=0");
+        assert!(
+            zero.check(99, 100).is_err(),
+            "any lag rejects with window=0"
+        );
     }
 
     #[test]

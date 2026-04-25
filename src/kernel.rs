@@ -66,7 +66,10 @@ pub fn build_claim_poke(name: &str, owner: &str, fee: u64, tx_hash: &str) -> Nou
     let owner_atom = make_cord_in(&mut slab, owner);
     let fee_atom = atom_from_u64(&mut slab, fee);
     let tx_hash_atom = make_cord_in(&mut slab, tx_hash);
-    let poke = T(&mut slab, &[tag, name_atom, owner_atom, fee_atom, tx_hash_atom]);
+    let poke = T(
+        &mut slab,
+        &[tag, name_atom, owner_atom, fee_atom, tx_hash_atom],
+    );
     slab.set_root(poke);
     slab
 }
@@ -210,20 +213,6 @@ pub fn build_advance_tip_poke(headers: &[AnchorHeader]) -> NounSlab {
     slab
 }
 
-/// Build a `[%set-payment-address address=@t]` poke slab.
-///
-/// Kernel accepts only while `claim-count == 0` and emits
-/// `[%payment-address-set address]` on success,
-/// `[%payment-address-error msg=@t]` once frozen.
-pub fn build_set_payment_address_poke(address: &str) -> NounSlab {
-    let mut slab = NounSlab::new();
-    let tag = make_tag_in(&mut slab, "set-payment-address");
-    let addr = make_cord_in(&mut slab, address);
-    let poke = T(&mut slab, &[tag, addr]);
-    slab.set_root(poke);
-    slab
-}
-
 /// Build a `[%verify-chain-link claim-digest=@ux headers=(list anchor-header) anchored-tip=@ux]`
 /// poke slab. Read-only — runs
 /// `chain-links-to:nns-predicates` and emits
@@ -350,10 +339,10 @@ pub struct ClaimBundle {
     /// **Level C-A** payment-semantic witness. Hull extracts these
     /// four fields from the on-chain raw-tx; kernel enforces
     /// `tx-id == claim.tx_hash`, `spender-pkh == claim.owner`,
-    /// `treasury-amount >= fee-for-name(name)`, and (kernel-state-
-    /// relative) `treasury-address == kernel.payment-address`.
+    /// `treasury-amount >= fee-for-name(name)`, and `%prove-claim`
+    /// checks the treasury note output's lock root (see
+    /// `output_lock_root` on `ClaimWitness`).
     ///
-    /// Mirrors `nns-raw-tx-witness` in `hoon/lib/nns-predicates.hoon`.
     /// All four fields are flattened onto the poke payload (rather
     /// than nested) to keep the poke-builder simple.
     pub witness: ClaimWitness,
@@ -380,9 +369,9 @@ pub struct ClaimWitness {
     /// Total nicks paid to the treasury address across all
     /// outputs. Must be `>= fee-for-name(claim.name)`.
     pub treasury_amount: u64,
-    /// Treasury address the hull extracted from the raw-tx. Must
-    /// equal the kernel's configured `payment-address`.
-    pub treasury_address: String,
+    /// v1: base58 lock root of the treasury payment note output
+    /// (`note_name_b58` / NockBlocks lockroot). Poke field remains
+    pub output_lock_root: String,
 }
 
 impl ClaimBundle {
@@ -460,7 +449,7 @@ pub fn build_validate_claim_poke(bundle: &ClaimBundle) -> NounSlab {
     let w_tx_id_atom = make_atom_in(&mut slab, &bundle.witness.tx_id);
     let w_spender_atom = make_atom_in(&mut slab, &bundle.witness.spender_pkh);
     let w_amount_atom = atom_from_u64(&mut slab, bundle.witness.treasury_amount);
-    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.treasury_address);
+    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.output_lock_root);
 
     let poke = T(
         &mut slab,
@@ -562,7 +551,7 @@ pub fn build_prove_claim_poke(bundle: &ClaimBundle) -> NounSlab {
     let w_tx_id_atom = make_atom_in(&mut slab, &bundle.witness.tx_id);
     let w_spender_atom = make_atom_in(&mut slab, &bundle.witness.spender_pkh);
     let w_amount_atom = atom_from_u64(&mut slab, bundle.witness.treasury_amount);
-    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.treasury_address);
+    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.output_lock_root);
 
     let poke = T(
         &mut slab,
@@ -804,9 +793,7 @@ pub fn claim_in_stark_proof(effect: &NounSlab) -> Option<ClaimInStarkProof> {
     // Decode `(each ~ validation-error)`:
     //   [%& 0]   -> Ok  (loobean 0 = %.y)
     //   [%| <tag-atom>] -> Rejected(tag)
-    let product_cell = product_noun
-        .as_cell()
-        .ok()?;
+    let product_cell = product_noun.as_cell().ok()?;
     let tag_atom = product_cell.head().as_atom().ok()?;
     let tag_val = tag_atom.as_u64().ok()?;
     let validation = match tag_val {
@@ -894,14 +881,6 @@ pub fn build_anchor_peek() -> NounSlab {
     single_tag_peek("anchor")
 }
 
-/// Build a `/payment-address ~` peek path slab.
-///
-/// Kernel response: `[~ ~ (unit @t)]` — `~` before the first
-/// `%set-payment-address` poke, `[~ <cord>]` afterwards.
-pub fn build_payment_address_peek() -> NounSlab {
-    single_tag_peek("payment-address")
-}
-
 /// Build a `/fee-for-name/<name>` peek path slab.
 ///
 /// Kernel response: `[~ ~ @ud]` — the fee (in nicks) that the kernel
@@ -976,7 +955,11 @@ pub fn decode_snapshot(result: &NounSlab) -> Result<Snapshot, String> {
         .map_err(|_| "snapshot: tail not a cell".to_string())?;
     let hull = atom_to_le_bytes(rest.head())?;
     let root = atom_to_le_bytes(rest.tail())?;
-    Ok(Snapshot { claim_id, hull, root })
+    Ok(Snapshot {
+        claim_id,
+        hull,
+        root,
+    })
 }
 
 /// Decode the `[~ ~ (list @t)]` peek result for `/pending-batch`.
@@ -1145,24 +1128,6 @@ pub fn decode_anchor(result: &NounSlab) -> Result<AnchorView, String> {
     })
 }
 
-/// Decode the `/payment-address` peek result into `Option<String>`.
-pub fn decode_payment_address(result: &NounSlab) -> Result<Option<String>, String> {
-    let inner = peek_unwrap_inner(result)?;
-    match inner {
-        None => Ok(None),
-        Some(noun) => {
-            // (unit @t) — `~` (atom 0) or `[~ cord]`.
-            if noun.as_atom().is_ok() {
-                return Ok(None);
-            }
-            let c = noun
-                .as_cell()
-                .map_err(|_| "payment-address: unit cell malformed".to_string())?;
-            Ok(Some(atom_to_cord(c.tail())?))
-        }
-    }
-}
-
 // Strip the outer `(unit (unit *))` wrapping the kernel peek
 // produces. Returns the innermost `*` or `None` if the inner unit
 // was null (recognized path, no value).
@@ -1191,14 +1156,11 @@ fn peek_unwrap_inner(result: &NounSlab) -> Result<Option<Noun>, String> {
 // Same as peek_unwrap_inner but errors on recognized-but-empty —
 // use for peeks whose result is always present.
 fn peek_unwrap_some(result: &NounSlab) -> Result<Noun, String> {
-    peek_unwrap_inner(result)?
-        .ok_or_else(|| "peek: expected a value, got empty unit".into())
+    peek_unwrap_inner(result)?.ok_or_else(|| "peek: expected a value, got empty unit".into())
 }
 
 fn atom_to_le_bytes(noun: Noun) -> Result<Vec<u8>, String> {
-    let atom = noun
-        .as_atom()
-        .map_err(|_| "expected atom".to_string())?;
+    let atom = noun.as_atom().map_err(|_| "expected atom".to_string())?;
     Ok(atom.as_ne_bytes().to_vec())
 }
 
@@ -1229,7 +1191,7 @@ pub fn effect_tag(effect: &NounSlab) -> Option<String> {
 
 /// Read the error message from a `[%claim-error msg=@t]`,
 /// `[%primary-error msg=@t]`, `[%batch-error msg=@t]`,
-/// `[%anchor-error msg=@t]`, `[%payment-address-error msg=@t]`, or
+/// `[%anchor-error msg=@t]`, or
 /// `[%vesl-error msg=@t]` effect.
 pub fn error_message(effect: &NounSlab) -> Option<String> {
     let tag = effect_tag(effect)?;
@@ -1237,7 +1199,6 @@ pub fn error_message(effect: &NounSlab) -> Option<String> {
         && tag != "primary-error"
         && tag != "batch-error"
         && tag != "anchor-error"
-        && tag != "payment-address-error"
         && tag != "vesl-error"
     {
         return None;
@@ -1282,26 +1243,6 @@ pub fn anchor_advanced(effect: &NounSlab) -> Option<AnchorAdvanced> {
 
 pub fn first_anchor_advanced(effects: &[NounSlab]) -> Option<AnchorAdvanced> {
     effects.iter().find_map(anchor_advanced)
-}
-
-/// `[%payment-address-set address=@t]` payload.
-pub fn payment_address_set(effect: &NounSlab) -> Option<String> {
-    if effect_tag(effect)? != "payment-address-set" {
-        return None;
-    }
-    let noun = unsafe { effect.root() };
-    let cell = noun.as_cell().ok()?;
-    let addr = cell.tail().as_atom().ok()?;
-    Some(
-        std::str::from_utf8(addr.as_ne_bytes())
-            .ok()?
-            .trim_end_matches('\0')
-            .to_string(),
-    )
-}
-
-pub fn first_payment_address_set(effects: &[NounSlab]) -> Option<String> {
-    effects.iter().find_map(payment_address_set)
 }
 
 /// Read `(address, name)` from a `[%primary-set address=@t name=@t]`
@@ -1381,7 +1322,11 @@ pub fn vesl_settled(effect: &NounSlab) -> Option<VeslSettled> {
     let hull = rest.head().as_atom().ok()?.as_ne_bytes().to_vec();
     let rest2 = rest.tail().as_cell().ok()?;
     let root = rest2.head().as_atom().ok()?.as_ne_bytes().to_vec();
-    Some(VeslSettled { note_id, hull, root })
+    Some(VeslSettled {
+        note_id,
+        hull,
+        root,
+    })
 }
 
 pub fn first_vesl_settled(effects: &[NounSlab]) -> Option<VeslSettled> {
@@ -1513,10 +1458,7 @@ pub fn first_primary_set(effects: &[NounSlab]) -> Option<(String, String)> {
 
 /// Returns `true` iff `effects` contains an effect tagged `tag`.
 pub fn has_effect(effects: &[NounSlab], tag: &str) -> bool {
-    effects
-        .iter()
-        .filter_map(effect_tag)
-        .any(|t| t == tag)
+    effects.iter().filter_map(effect_tag).any(|t| t == tag)
 }
 
 /// Returns the first error message across `effects` (from a

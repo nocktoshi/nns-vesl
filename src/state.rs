@@ -198,7 +198,12 @@ impl Mirror {
         let mut out: Vec<QueuedClaim> = self
             .submitted_claims
             .values()
-            .filter(|c| matches!(c.status, ClaimLifecycleStatus::Submitted | ClaimLifecycleStatus::Confirmed))
+            .filter(|c| {
+                matches!(
+                    c.status,
+                    ClaimLifecycleStatus::Submitted | ClaimLifecycleStatus::Confirmed
+                )
+            })
             .cloned()
             .collect();
         out.sort_by_key(|c| c.submit_seq);
@@ -308,11 +313,7 @@ impl HullState {
 }
 
 impl AppState {
-    pub fn new(
-        app: NockApp,
-        output_dir: PathBuf,
-        settlement: vesl_core::SettlementConfig,
-    ) -> Self {
+    pub fn new(app: NockApp, output_dir: PathBuf, settlement: vesl_core::SettlementConfig) -> Self {
         let mirror = Mirror::load(&output_dir);
         Self {
             kernel: Mutex::new(app),

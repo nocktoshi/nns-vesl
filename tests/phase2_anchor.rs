@@ -1,12 +1,10 @@
-//! Phase 2 integration tests — kernel anchor + payment-address behaviour.
+//! Phase 2 integration tests — kernel anchor behaviour.
 //!
 //! Exercises the new causes landed in Phase 2a against a real booted
 //! kernel, without the HTTP layer. Covers:
 //!
 //!   - `%advance-tip` bootstrap, extend, and reorg rejection paths
 //!   - `/anchor` peek roundtrip
-//!   - `%set-payment-address` single-shot + freeze-after-first-claim
-//!   - `/payment-address` peek roundtrip
 //!
 //! These are `#[tokio::test]`s (not `#[ignore]`) — the kernel boots in
 //! under a second with prover jets disabled, so they run on every
@@ -14,15 +12,14 @@
 
 use std::sync::Arc;
 
+use nns_vesl::kernel::{
+    build_advance_tip_poke, build_anchor_peek, decode_anchor, first_anchor_advanced,
+    first_error_message, AnchorHeader,
+};
+use nns_vesl::state::AppState;
 use nockapp::kernel::boot;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use nns_vesl::kernel::{
-    build_advance_tip_poke, build_anchor_peek, build_claim_poke, build_payment_address_peek,
-    build_set_payment_address_poke, decode_anchor, decode_payment_address, first_anchor_advanced,
-    first_error_message, first_payment_address_set, has_effect, AnchorHeader,
-};
-use nns_vesl::state::AppState;
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -70,16 +67,11 @@ fn header_at(height: u64, seed: u8, parent_seed: u8) -> AnchorHeader {
 async fn advance_tip_bootstrap_accepts_from_genesis() {
     let (_tmp, state) = boot_kernel().await;
 
-    let headers = vec![
-        header_at(1, 1, 0),
-        header_at(2, 2, 1),
-        header_at(3, 3, 2),
-    ];
+    let headers = vec![header_at(1, 1, 0), header_at(2, 2, 1), header_at(3, 3, 2)];
 
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
             .await
             .expect("advance-tip poke")
     };
@@ -123,8 +115,7 @@ async fn advance_tip_bootstrap_accepts_non_zero_parent() {
 
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
             .await
             .expect("advance-tip poke")
     };
@@ -147,8 +138,7 @@ async fn advance_tip_extends_after_bootstrap() {
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
     }
@@ -157,8 +147,7 @@ async fn advance_tip_extends_after_bootstrap() {
     let more = vec![header_at(3, 3, 2), header_at(4, 4, 3)];
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&more))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&more))
             .await
             .expect("extend")
     };
@@ -184,8 +173,7 @@ async fn advance_tip_rejects_parent_mismatch() {
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
     }
@@ -195,8 +183,7 @@ async fn advance_tip_rejects_parent_mismatch() {
     let bad = vec![header_at(3, 3, 99)];
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&bad))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&bad))
             .await
             .expect("bad advance")
     };
@@ -225,8 +212,7 @@ async fn advance_tip_rejects_height_gap() {
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
     }
@@ -236,8 +222,7 @@ async fn advance_tip_rejects_height_gap() {
     let gap = vec![header_at(5, 5, 2)];
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&gap))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&gap))
             .await
             .expect("gap advance")
     };
@@ -253,15 +238,10 @@ async fn advance_tip_rejects_internal_break() {
     let (_tmp, state) = boot_kernel().await;
 
     // Chain with a break in the middle: [1<-0, 2<-1, 3<-99 (bad)].
-    let broken = vec![
-        header_at(1, 1, 0),
-        header_at(2, 2, 1),
-        header_at(3, 3, 99),
-    ];
+    let broken = vec![header_at(1, 1, 0), header_at(2, 2, 1), header_at(3, 3, 99)];
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&broken))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&broken))
             .await
             .expect("broken advance")
     };
@@ -277,143 +257,13 @@ async fn advance_tip_empty_list_is_rejected() {
     let (_tmp, state) = boot_kernel().await;
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&[]))
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&[]))
             .await
             .expect("empty advance")
     };
     let err = first_error_message(&effects).expect("anchor-error");
-    assert!(err.contains("empty"), "expected empty-advance error, got: {err}");
-}
-
-// =========================================================================
-// %set-payment-address
-// =========================================================================
-
-#[tokio::test]
-async fn set_payment_address_binds_on_first_poke() {
-    let (_tmp, state) = boot_kernel().await;
-
-    // Peek before bootstrap: unit is `~`.
-    let before = {
-        let mut k = state.kernel.lock().await;
-        let r = k
-            .peek(build_payment_address_peek())
-            .await
-            .expect("pre peek");
-        decode_payment_address(&r).expect("decode")
-    };
-    assert_eq!(before, None);
-
-    let addr = "test-address-abc";
-    let effects = {
-        let mut k = state.kernel.lock().await;
-        k
-            .poke(
-                SystemWire.to_wire(),
-                build_set_payment_address_poke(addr),
-            )
-            .await
-            .expect("set address")
-    };
-    let bound =
-        first_payment_address_set(&effects).expect("payment-address-set effect");
-    assert_eq!(bound, addr);
-
-    let after = {
-        let mut k = state.kernel.lock().await;
-        let r = k
-            .peek(build_payment_address_peek())
-            .await
-            .expect("post peek");
-        decode_payment_address(&r).expect("decode")
-    };
-    assert_eq!(after.as_deref(), Some(addr));
-}
-
-#[tokio::test]
-async fn set_payment_address_can_change_before_first_claim() {
-    let (_tmp, state) = boot_kernel().await;
-
-    for addr in ["first-addr", "second-addr"] {
-        let effects = {
-            let mut k = state.kernel.lock().await;
-            k
-                .poke(
-                    SystemWire.to_wire(),
-                    build_set_payment_address_poke(addr),
-                )
-                .await
-                .expect("set address")
-        };
-        let bound =
-            first_payment_address_set(&effects).expect("payment-address-set");
-        assert_eq!(bound, addr);
-    }
-
-    let after = {
-        let mut k = state.kernel.lock().await;
-        let r = k
-            .peek(build_payment_address_peek())
-            .await
-            .expect("peek");
-        decode_payment_address(&r).expect("decode")
-    };
-    assert_eq!(after.as_deref(), Some("second-addr"));
-}
-
-#[tokio::test]
-async fn set_payment_address_is_frozen_after_first_claim() {
-    let (_tmp, state) = boot_kernel().await;
-
-    // Bind initially.
-    {
-        let mut k = state.kernel.lock().await;
-        let fx = k
-            .poke(
-                SystemWire.to_wire(),
-                build_set_payment_address_poke("frozen-addr"),
-            )
-            .await
-            .expect("set");
-        assert!(first_payment_address_set(&fx).is_some());
-    }
-
-    // Accept a first claim to bump claim-count.
-    {
-        let mut k = state.kernel.lock().await;
-        let fx = k
-            .poke(
-                SystemWire.to_wire(),
-                build_claim_poke("alpha.nock", "owner-zzz", 5000, "tx-freeze-1"),
-            )
-            .await
-            .expect("claim");
-        assert!(has_effect(&fx, "claimed"), "first claim should succeed");
-    }
-
-    // Further %set-payment-address pokes should error, not mutate.
-    let fx = {
-        let mut k = state.kernel.lock().await;
-        k
-            .poke(
-                SystemWire.to_wire(),
-                build_set_payment_address_poke("should-be-rejected"),
-            )
-            .await
-            .expect("second set")
-    };
-    assert!(first_payment_address_set(&fx).is_none());
-    let err = first_error_message(&fx).expect("payment-address-error");
-    assert!(err.contains("already bound"), "expected freeze error, got: {err}");
-
-    let view = {
-        let mut k = state.kernel.lock().await;
-        let r = k
-            .peek(build_payment_address_peek())
-            .await
-            .expect("peek");
-        decode_payment_address(&r).expect("decode")
-    };
-    assert_eq!(view.as_deref(), Some("frozen-addr"));
+    assert!(
+        err.contains("empty"),
+        "expected empty-advance error, got: {err}"
+    );
 }

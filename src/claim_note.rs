@@ -118,10 +118,7 @@ impl ClaimNoteV1 {
             entries.push(jam_opaque_bytes_entry(CLAIM_NOTE_BLOCK_PROOF_KEY, bytes));
         }
         if let Some(bytes) = self.chain_bundle.header_chain_jam.as_ref() {
-            entries.push(jam_opaque_bytes_entry(
-                CLAIM_NOTE_HEADER_CHAIN_KEY,
-                bytes,
-            ));
+            entries.push(jam_opaque_bytes_entry(CLAIM_NOTE_HEADER_CHAIN_KEY, bytes));
         }
         NoteData::new(entries)
     }
@@ -139,8 +136,8 @@ impl ClaimNoteV1 {
         }
         let claim_id_bytes = find_opaque_bytes_entry(note_data, CLAIM_NOTE_ID_KEY)
             .map_err(|e| format!("missing claim id: {e}"))?;
-        let claim_id = String::from_utf8(claim_id_bytes)
-            .map_err(|e| format!("claim id is not utf8: {e}"))?;
+        let claim_id =
+            String::from_utf8(claim_id_bytes).map_err(|e| format!("claim id is not utf8: {e}"))?;
         let tuple_jam = find_opaque_bytes_entry(note_data, CLAIM_NOTE_KEY)
             .map_err(|e| format!("missing claim tuple: {e}"))?;
         let mut stack = new_stack();
@@ -160,10 +157,8 @@ impl ClaimNoteV1 {
         let chain_bundle = ClaimChainBundle {
             raw_tx_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_RAW_TX_KEY).ok(),
             page_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_PAGE_KEY).ok(),
-            block_proof_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_BLOCK_PROOF_KEY)
-                .ok(),
-            header_chain_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_HEADER_CHAIN_KEY)
-                .ok(),
+            block_proof_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_BLOCK_PROOF_KEY).ok(),
+            header_chain_jam: find_opaque_bytes_entry(note_data, CLAIM_NOTE_HEADER_CHAIN_KEY).ok(),
         };
 
         Ok(Self {

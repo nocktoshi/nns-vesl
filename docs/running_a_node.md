@@ -318,7 +318,7 @@ curl -s -X POST "$HOST/register" \
 #    in chain mode, pass the real payment tx-id)
 curl -s -X POST "$HOST/claim" \
   -H 'content-type: application/json' \
-  -d "{\"address\":\"$ADDR\",\"name\":\"alice.nock\",\"fee\":5000,\"txHash\":\"stub-$(uuidgen)\"}"
+  -d "{\"address\":\"$ADDR\",\"name\":\"alice.nock\",\"txHash\":\"stub-$(uuidgen)\"}"
 
 # 3. fetch the Merkle + anchor proof
 curl -s "$HOST/proof?name=alice.nock" | jq

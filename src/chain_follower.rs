@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::future::Future;
+use std::time::Duration;
 
 use nockapp::wire::{SystemWire, Wire};
 use tokio::task::JoinHandle;
@@ -333,21 +333,20 @@ pub async fn advance_anchor_once(
         current_chain_tip: _,
     } = plan;
 
-    let headers: Vec<AnchorHeader> =
-        fetch_header_chain(&endpoint, from_height, to_height)
-            .await
-            .map_err(|e| {
-                let msg = format!("header chain fetch failed [{from_height}..{to_height}]: {e}");
-                let ts = crate::state::AppState::now_epoch_ms();
-                let s2 = state.clone();
-                // Fire-and-forget the record call — we're in an async
-                // sync closure, can't await here. Use blocking lock on
-                // the off-chance the mutex is held (fine for tests).
-                if let Ok(mut h) = s2.hull.try_lock() {
-                    h.follower.record_error("header_fetch", msg.clone(), ts);
-                }
-                msg
-            })?;
+    let headers: Vec<AnchorHeader> = fetch_header_chain(&endpoint, from_height, to_height)
+        .await
+        .map_err(|e| {
+            let msg = format!("header chain fetch failed [{from_height}..{to_height}]: {e}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            let s2 = state.clone();
+            // Fire-and-forget the record call — we're in an async
+            // sync closure, can't await here. Use blocking lock on
+            // the off-chance the mutex is held (fine for tests).
+            if let Ok(mut h) = s2.hull.try_lock() {
+                h.follower.record_error("header_fetch", msg.clone(), ts);
+            }
+            msg
+        })?;
     if headers.is_empty() {
         return Ok(None);
     }

@@ -4,15 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nns_vesl::{api, state::AppState};
 use nockapp::kernel::boot;
-use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use nns_vesl::{
-    api,
-    config::{NnsConfig, NnsToml},
-    kernel as nns_kernel,
-    state::AppState,
-};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,23 +17,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Load settlement + NNS config from vesl.toml ---
     let toml_path = std::env::var("VESL_TOML").unwrap_or_else(|_| "vesl.toml".into());
-    let (toml_cfg, nns_toml) = load_toml(&PathBuf::from(&toml_path));
+    let toml_cfg = load_toml(&PathBuf::from(&toml_path));
     let settlement = vesl_core::SettlementConfig::resolve(
-        None,       // cli_mode
-        None,       // cli_chain_endpoint
-        false,      // cli_submit
-        None,       // cli_tx_fee
-        None,       // cli_coinbase_timelock_min
-        None,       // cli_accept_timeout
-        None,       // cli_seed_phrase
-        &toml_cfg,
-        None,       // default_signing_key (unused for local)
+        None,  // cli_mode
+        None,  // cli_chain_endpoint
+        false, // cli_submit
+        None,  // cli_tx_fee
+        None,  // cli_coinbase_timelock_min
+        None,  // cli_accept_timeout
+        None,  // cli_seed_phrase
+        &toml_cfg, None, // default_signing_key (unused for local)
     );
-    let nns_cfg = NnsConfig::resolve(None, &nns_toml);
 
     println!("=== nns-vesl ===");
     println!("  settlement mode: {}", settlement.mode);
-    println!("  payment address: {}", nns_cfg.payment_address);
 
     // --- Boot the kernel ---
     let kernel_path = std::env::var("NNS_KERNEL_JAM").unwrap_or_else(|_| "out.jam".into());
@@ -55,9 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // alongside them in the same `.nns-data` dir so everything
     // the hull writes at runtime is contained in one folder,
     // separate from the source tree.
-    let data_parent = PathBuf::from(
-        std::env::var("NNS_DATA_DIR").unwrap_or_else(|_| ".".into()),
-    );
+    let data_parent = PathBuf::from(std::env::var("NNS_DATA_DIR").unwrap_or_else(|_| ".".into()));
     let state_dir = data_parent.join(".nns-data");
     fs::create_dir_all(&state_dir)?;
 
@@ -68,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for the extra jets beyond module load time.
     let prover_hot_state = zkvm_jetpack::hot::produce_prover_hot_state();
 
-    let mut app: NockApp = boot::setup(
+    let app: NockApp = boot::setup(
         &kernel,
         cli,
         prover_hot_state.as_slice(),
@@ -79,26 +68,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  kernel booted ({} bytes)", kernel.len());
     println!("  state dir: {}", state_dir.display());
-
-    // Phase 2: wire the NNS payment address into the kernel. This is a
-    // no-op after the first claim has been accepted (the kernel freezes
-    // the binding), so booting against an already-populated checkpoint
-    // with the same address is silent; a mismatched address surfaces as
-    // a `%payment-address-error` effect we log and ignore — the kernel
-    // stays authoritative.
-    let set_addr_poke = nns_kernel::build_set_payment_address_poke(&nns_cfg.payment_address);
-    match app.poke(SystemWire.to_wire(), set_addr_poke).await {
-        Ok(effects) => {
-            if let Some(bound) = nns_kernel::first_payment_address_set(&effects) {
-                println!("  payment address bound: {bound}");
-            } else if let Some(err) = nns_kernel::first_error_message(&effects) {
-                println!("  payment address already frozen in kernel: {err}");
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: %set-payment-address poke failed: {e:?}");
-        }
-    }
 
     let state = Arc::new(AppState::new(app, state_dir, settlement));
     let _follower = nns_vesl::chain_follower::spawn(state.clone());
@@ -182,7 +151,7 @@ struct Raw {
     payment_address: Option<String>,
 }
 
-fn load_toml(path: &std::path::Path) -> (vesl_core::SettlementToml, NnsToml) {
+fn load_toml(path: &std::path::Path) -> vesl_core::SettlementToml {
     let raw: Raw = match std::fs::read_to_string(path) {
         Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
             eprintln!("warning: failed to parse {}: {e}", path.display());
@@ -190,16 +159,11 @@ fn load_toml(path: &std::path::Path) -> (vesl_core::SettlementToml, NnsToml) {
         }),
         Err(_) => Raw::default(),
     };
-    (
-        vesl_core::SettlementToml {
-            settlement_mode: raw.settlement_mode,
-            chain_endpoint: raw.chain_endpoint,
-            tx_fee: raw.tx_fee,
-            coinbase_timelock_min: raw.coinbase_timelock_min,
-            accept_timeout_secs: raw.accept_timeout_secs,
-        },
-        NnsToml {
-            payment_address: raw.payment_address,
-        },
-    )
+    return vesl_core::SettlementToml {
+        settlement_mode: raw.settlement_mode,
+        chain_endpoint: raw.chain_endpoint,
+        tx_fee: raw.tx_fee,
+        coinbase_timelock_min: raw.coinbase_timelock_min,
+        accept_timeout_secs: raw.accept_timeout_secs,
+    };
 }

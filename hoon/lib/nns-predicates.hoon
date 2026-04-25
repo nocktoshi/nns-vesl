@@ -16,7 +16,10 @@
 ::
 ::  `/common/zoon.hoon` (z-set + has:z-in) is an exception: its only
 ::  import is `/common/zeke`, so it's safe to pull in. We use it for
-::  the Level B `has-tx-in-page` predicate.
+::  the Level B `has-tx-in-page` predicate. Level C `matches-treasury`
+::  compares the witness to the canonical NNS treasury lock root b58
+::  (same as on-chain `note_name_b58`; see nockblocks lockroot link in
+::  `src/config.rs::DEFAULT_TREASURY_LOCK_ROOT_B58`).
 ::
 ::  Rather than fight the build-system, Phase 3 stages these
 ::  predicates in three levels:
@@ -38,7 +41,7 @@
 ::     arms we touch):
 ::      - `matches-block-commitment`   (recompute commitment from full
 ::                                      page noun, no hull trust)
-::      - `pays-sender` / `pays-amount` (over real `raw-tx:v1`)
+::      - `sender-is-owner` / `pays-amount` (over real `raw-tx:v1`)
 ::
 ::  Levels A+B let the Phase 3 gate enforce
 ::  `tx-id ∈ page.tx-ids ∧ page-digest ∈ anchored-chain` without
@@ -86,7 +89,7 @@
 ::    - block PoW STARK proof (Level C+ — needs recursive-gate work)
 ::
 ::  Once Level C lands these get added as extra fields and the gate
-::  composes `pays-sender` / `pays-amount` / `verify:sp-verifier`
+::  composes `sender-is-owner` / `pays-amount` / `verify:sp-verifier`
 ::  alongside the Level A/B predicates.
 ::
 +$  claim-bundle
@@ -143,15 +146,16 @@
       %witness-tx-id-mismatch          :: Level C: witness.tx-id ≠ claim.tx-hash
       %witness-sender-mismatch         :: Level C: witness.spender-pkh ≠ claim.owner
       %witness-underpaid               :: Level C: witness.treasury-amount < fee
-      %witness-wrong-treasury          :: Level C: witness.treasury-address ≠ kernel state
+      %witness-wrong-treasury          :: Level C: witness output lock root ≠ canonical
   ==
 ::
 ::  +$nns-raw-tx-witness: **Level C-A** — narrow view of a
 ::  Nockchain v1 raw-tx's payment semantics. The hull extracts
 ::  these four atoms from the full `raw-tx:v1:t` noun fetched from
 ::  Nockchain and packs them into every `%prove-claim` poke; the
-::  kernel then enforces consistency between the witness, the
-::  claim tuple, and its own `payment-address` state.
+::  kernel then enforces consistency between the witness and the
+::  claim tuple (`%prove-claim` also checks output lock root vs
+::  canonical treasury lock root b58).
 ::
 ::  Why four atoms and not the full raw-tx:
 ::    - `tx-engine-1` pulls in `tx-engine-0` transitively, which
@@ -164,12 +168,14 @@
 ::
 ::  Trust model (Level C-A):
 ::    - Hull trusted to extract `spender-pkh` / `treasury-amount`
-::      / `treasury-address` from the raw-tx correctly. A hostile
+::      / `output-lock-root` from the raw-tx correctly. A hostile
 ::      hull can lie about these, so the wallet must re-verify by
 ::      fetching `tx-id` from Nockchain and re-parsing.
 ::    - Kernel cryptographically enforces: `tx-id` = claim's
 ::      `tx-hash`; `spender-pkh` = claim.owner; treasury amount >=
-::      fee schedule; treasury address = kernel `payment-address`.
+::      fee schedule; witness `output-lock-root` = canonical NNS
+::      treasury lock-root b58 (must match `DEFAULT_TREASURY_LOCK_ROOT_B58`
+::      in Rust / NockBlocks lockroot for this deployment).
 ::    - Wallet verifies STARK + re-parses raw-tx from chain to
 ::      confirm witness extraction was honest. One extra chain
 ::      query vs. today; zero extra trust.
@@ -183,7 +189,10 @@
   $:  tx-id=@ux              :: must equal claim.tx-hash
       spender-pkh=@          :: paying signer's pkh (atom form)
       treasury-amount=@ud    :: nicks paid to the NNS treasury
-      treasury-address=@t    :: must equal kernel's payment-address
+      output-lock-root=@t    :: v1: b58 lock root of treasury note output
+                             ::   (GRPC `note_name_b58`); must equal
+                             ::   canonical NNS lock (see `matches-treasury`
+                             ::   + Rust `DEFAULT_TREASURY_LOCK_ROOT_B58`)
   ==
 ::
 ::  +fee-for-name: NNS fee schedule, keyed on the stem length of a
@@ -207,10 +216,14 @@
   =/  stem-len=@ud
     ?:  has-suffix  (sub bytes suffix-len)
     bytes
+  ::  Atomic fee units: nicks (65.536 nicks = 1 NOCK)
+  ::    1..4 chars  -> 327.680.000
+  ::    5..9 chars  -> 32.768.000
+  ::    10+ chars   -> 6.553.600
   ?:  =(stem-len 0)            0
-  ?:  (gte stem-len 10)        100
-  ?:  (gte stem-len 5)         500
-  5.000
+  ?:  (gte stem-len 10)        6.553.600
+  ?:  (gte stem-len 5)         32.768.000
+  327.680.000
 ::
 ::  +chain-links-to: given a claim's block digest, a list of
 ::  `anchor-header` triples (oldest-first) extending toward the
@@ -307,14 +320,13 @@
   ^-  ?
   =(tx-id.witness claim-tx-hash)
 ::
-::  +pays-sender: the raw-tx was signed by the claim's owner. The
+::  +sender-is-owner: the raw-tx was signed by the claim's owner. The
 ::  hull extracts the spender's pkh; the kernel enforces that it
 ::  equals `claim.owner`. Atom-equality is used because both sides
 ::  are pre-canonicalised to the same representation at bundle
-::  construction — the hull either bundles a pkh-form owner string,
-::  or the kernel's `payment-address` setter normalises it.
+::  construction — the hull bundles a pkh-form owner string.
 ::
-++  pays-sender
+++  sender-is-owner
   |=  [witness=nns-raw-tx-witness claim-owner=@t]
   ^-  ?
   =(`@`claim-owner spender-pkh.witness)
@@ -330,15 +342,17 @@
   ^-  ?
   (gte treasury-amount.witness min-fee)
 ::
-::  +matches-treasury: the witness's declared treasury address is
-::  the same one the kernel was configured with. Closes the loop:
-::  no proof binds to a payment unless it flowed to THIS NNS
-::  instance's treasury, regardless of what the hull claims.
+::  +matches-treasury: treasury payment output's lock root (v1
+::  `note_name_b58` / NockBlocks lockroot) must be the canonical NNS
+::  treasury lock.
 ::
 ++  matches-treasury
-  |=  [witness=nns-raw-tx-witness kernel-treasury=@t]
+  |=  witness=nns-raw-tx-witness
   ^-  ?
-  =(treasury-address.witness kernel-treasury)
+  ::  lock hash for treasury - TREASURY_LOCK_ROOT_B58 from src/payment.rs
+  =/  expected=@t
+    'A3LoWjxurwiyzhkv8sgDv2MVu9PwgWHmqoncXw9GEQ5M3qx46svvadE'
+  =(output-lock-root.witness expected)
 ::
 ::  +matches-current-anchor: Phase 7 freshness binding.
 ::
@@ -438,13 +452,11 @@
 ::
 ::  Bundle-only checks (all cryptographically bound via the STARK's
 ::  bundle-digest commitment). The kernel `%prove-claim` cause adds
-::  two *state-relative* checks that aren't here:
+::  one *state-relative* check that isn't here:
 ::    - `matches-current-anchor` (Phase 7): bundle anchor == kernel
 ::      anchor state.
-::    - `matches-treasury` (Level C-A): witness treasury-address ==
-::      kernel payment-address.
-::  Both require peeking kernel state and so live in the cause, not
-::  this self-contained arm.
+::  `matches-treasury` (Level C-A) compares the witness to a fixed
+::  lock root and lives in `%prove-claim` beside the anchor check.
 ::
 ::  Predicates NOT yet enforced (Level C-B, future):
 ::    - `compute-id:raw-tx:t` inside the kernel (would eliminate the
@@ -474,7 +486,7 @@
   ?.  (matches-tx-id witness.bundle tx-hash.bundle)
     [%| %witness-tx-id-mismatch]
   ::  Level C-A — witness's sender pkh == claim.owner.
-  ?.  (pays-sender witness.bundle owner.bundle)
+  ?.  (sender-is-owner witness.bundle owner.bundle)
     [%| %witness-sender-mismatch]
   ::  Level C-A — actual treasury-flowed amount >= fee schedule.
   ::  Stricter than C2: hull can declare any `fee` it likes, but

@@ -17,10 +17,8 @@ install:
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"
 	install -m 755 "target/release/nns-vesl" "$(DESTDIR)$(BIN)"
 	install -m 644 "out.jam" "$(DESTDIR)$(KERNEL)"
-	printf '%s\n' '#!/usr/bin/env sh' \
-	  'export NNS_KERNEL_JAM="$(PREFIX)/lib/nns-vesl/out.jam"' \
-	  'exec "$(PREFIX)/lib/nns-vesl/nns-vesl" "$$@"' \
-	  > "$(DESTDIR)$(WRAPPER)"
+	printf '#!/usr/bin/env sh\nexport NNS_KERNEL_JAM=%s/out.jam\nexec %s/nns-vesl "$$@"\n' \
+	  "$(LIBDIR)" "$(LIBDIR)" > "$(DESTDIR)$(WRAPPER)"
 	chmod 755 "$(DESTDIR)$(WRAPPER)"
 	ln -sf "nns" "$(DESTDIR)$(ALT_WRAPPER)"
 	@touch "$(SHELL_RC)"

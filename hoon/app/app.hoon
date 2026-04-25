@@ -168,7 +168,7 @@
   ==
 ::
 +$  versioned-state
-  $:  %v2
+  $:  %v0
       vesl=vesl-state
       names=(map @t name-entry)
       tx-hashes=(set @t)
@@ -183,15 +183,9 @@
       ::  prove and verify). `~` when no batch has been proved yet.
       ::
       last-proved=(unit [subject=* formula=*])
-      ::  Phase 2: follower-advanced anchor + frozen payment address.
+      ::  Phase 2: follower-advanced anchor.
       ::
       anchor=anchored-chain
-      ::  Payment address (base58 Nockchain address the C5 predicate
-      ::  will require payments to land on). `~` before bootstrap. Once
-      ::  set and a claim has been accepted (`claim-count > 0`), this
-      ::  is frozen — further %set-payment-address pokes emit an error.
-      ::
-      payment-address=(unit @t)
       ::  nockup:state
       ::  graft-inject would add `vesl=vesl-state` here on a fresh
       ::  kernel. Already present above; marker is idempotent.
@@ -231,13 +225,6 @@
       ::  Phase 3's chain-linkage claim.
       ::
       [%advance-tip headers=(list anchor-header)]
-      ::  Phase 2: one-shot (until `claim-count > 0`) payment address
-      ::  setter. The C5 payment predicate in Phase 3 will require
-      ::  claim payments to land on an output locked to this address's
-      ::  pkh. Freezing after the first accepted claim prevents a
-      ::  kernel operator from moving the payment target retroactively.
-      ::
-      [%set-payment-address address=@t]
       ::  Phase 3 Level A: exercise `chain-links-to:nns-predicates`
       ::  without going through %claim. Read-only — the cause does not
       ::  mutate state, it just runs the predicate and emits the
@@ -284,7 +271,7 @@
           witness-tx-id=@ux
           witness-spender-pkh=@
           witness-treasury-amount=@ud
-          witness-treasury-address=@t
+          witness-output-lock-root=@t    :: v1 output lock root b58 (note_name)
       ==
       ::  Phase 3c step 2: validated proof of a single claim.
       ::
@@ -322,7 +309,7 @@
           witness-tx-id=@ux
           witness-spender-pkh=@
           witness-treasury-amount=@ud
-          witness-treasury-address=@t
+          witness-output-lock-root=@t    :: v1 output lock root b58 (note_name)
       ==
       ::  Phase 3c step 3: general-purpose prover primitive. Takes an
       ::  arbitrary `[subject formula]` pair and traces
@@ -445,10 +432,14 @@
   |=  name=@t
   ^-  @ud
   =/  slen  (stem-len name)
+  ::  Atomic fee units: nicks (65.536 nicks = 1 NOCK)
+  ::    1..4 chars  -> 327.680.000
+  ::    5..9 chars  -> 32.768.000
+  ::    10+ chars   -> 6.553.600
   ?:  =(slen 0)  0
-  ?:  (gte slen 10)  100
-  ?:  (gte slen 5)   500
-  5.000
+  ?:  (gte slen 10)  6.553.600
+  ?:  (gte slen 5)   32.768.000
+  327.680.000
 ::
 ::  --- Merkle tree primitives (duplicate-last convention, matches
 ::      Rust's nockchain-tip5-rs::MerkleTree) ---
@@ -642,8 +633,6 @@
   ::                          sorted canonically by `aor`
   ::    /anchor            -> anchored-chain               follower-advanced
   ::                          chain tip + recent headers
-  ::    /payment-address   -> (unit @t)                    configured payment
-  ::                          address (~ before bootstrap)
   ::    [anything else]    -> vesl-peek  (registered / settled / root by hull)
   ::
   ++  peek
@@ -698,9 +687,6 @@
         ::
         [%anchor ~]
       ``anchor.state
-        ::
-        [%payment-address ~]
-      ``payment-address.state
         ::
         ::  /fee-for-name/<name>  -> @ud
         ::
@@ -928,21 +914,6 @@
       ^-  (list effect)
       ~[[%anchor-advanced digest.tip height.tip (lent hs)]]
       ::
-        ::  %set-payment-address: one-shot (until first claim) address
-        ::  setter. Freezing after `claim-count > 0` prevents the
-        ::  operator from silently moving the payment target once
-        ::  users have started paying in.
-        ::
-        %set-payment-address
-      =/  addr=@t  address.u.act
-      ?:  (gth claim-count.state 0)
-        :_  state
-        ~[[%payment-address-error 'already bound; cannot change after first claim']]
-      =.  payment-address.state  `addr
-      :_  state
-      ^-  (list effect)
-      ~[[%payment-address-set addr]]
-      ::
         ::  %verify-chain-link: read-only Phase 3 Level A predicate
         ::  smoke test. Returns `[%chain-link-result ok=?]` without
         ::  mutating state.
@@ -985,7 +956,7 @@
         :*  witness-tx-id.u.act
             witness-spender-pkh.u.act
             witness-treasury-amount.u.act
-            witness-treasury-address.u.act
+            witness-output-lock-root.u.act
         ==
       =/  bundle=claim-bundle:np
         :*  name.u.act
@@ -1028,7 +999,7 @@
         :*  witness-tx-id.u.act
             witness-spender-pkh.u.act
             witness-treasury-amount.u.act
-            witness-treasury-address.u.act
+            witness-output-lock-root.u.act
         ==
       =/  bundle=claim-bundle:np
         :*  name.u.act
@@ -1057,18 +1028,10 @@
         :_  state
         ^-  (list effect)
         ~[[%validate-claim-error %anchor-mismatch]]
-      ::  Level C-A: bind the proof to the kernel's *configured*
-      ::  treasury. A claim whose witness claims payment to a
-      ::  different treasury can't prove against this kernel.
-      ::  Requires `payment-address` to be set; if not, refuse
-      ::  (the kernel operator hasn't finished bootstrap).
+      ::  Level C-A: witness must name the canonical NNS treasury lock
+      ::  root (v1 `note_name_b58`), not an arbitrary string.
       ::
-      ?~  payment-address.state
-        :_  state
-        ^-  (list effect)
-        ~[[%validate-claim-error %witness-wrong-treasury]]
-      ?.  %-  matches-treasury:np
-          [wit u.payment-address.state]
+      ?.  (matches-treasury:np wit)
         :_  state
         ^-  (list effect)
         ~[[%validate-claim-error %witness-wrong-treasury]]

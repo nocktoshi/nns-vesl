@@ -40,10 +40,10 @@
 
 use std::io::Read;
 
-use nock_noun_rs::{jam_to_bytes, make_cord, new_stack, T};
-use nockchain_tip5_rs::{verify_proof, ProofNode as Tip5ProofNode, Tip5Hash};
 use nns_vesl::freshness::{check_anchor_binding, Freshness, DEFAULT_MAX_STALENESS};
 use nns_vesl::types::{ProofResponse, ProofSide};
+use nock_noun_rs::{jam_to_bytes, make_cord, new_stack, T};
+use nockchain_tip5_rs::{verify_proof, ProofNode as Tip5ProofNode, Tip5Hash};
 
 const GOLDILOCKS_PRIME: u64 = 18_446_744_069_414_584_321;
 
@@ -293,7 +293,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- 3. Merkle inclusion ------------------------------------------
-    let root = le_bytes_to_tip5(&hex_decode(&proof.root).map_err(|e| format!("bad root hex: {e}"))?);
+    let root =
+        le_bytes_to_tip5(&hex_decode(&proof.root).map_err(|e| format!("bad root hex: {e}"))?);
     let proof_nodes: Vec<Tip5ProofNode> = proof
         .proof
         .iter()
@@ -365,9 +366,21 @@ fn print_verified(
     }
     println!();
     println!("checks:");
-    println!("  [{}] merkle inclusion    ({})", merkle.mark(), merkle.detail());
-    println!("  [{}] anchor freshness    ({})", freshness.mark(), freshness.detail());
-    println!("  [{}] anchor binding      ({})", binding.mark(), binding.detail());
+    println!(
+        "  [{}] merkle inclusion    ({})",
+        merkle.mark(),
+        merkle.detail()
+    );
+    println!(
+        "  [{}] anchor freshness    ({})",
+        freshness.mark(),
+        freshness.detail()
+    );
+    println!(
+        "  [{}] anchor binding      ({})",
+        binding.mark(),
+        binding.detail()
+    );
 }
 
 /// `"abcdef...9876"` style abbreviation for long hex strings so the

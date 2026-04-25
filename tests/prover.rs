@@ -16,19 +16,24 @@ use std::time::Instant;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use nns_vesl::kernel::{
+    build_advance_tip_poke, build_prove_arbitrary_poke, build_prove_batch_poke,
+    build_prove_claim_in_stark_poke, build_prove_claim_poke, build_prove_identity_poke,
+    build_verify_stark_poke, first_anchor_advanced, first_arbitrary_proof, first_batch_proof,
+    first_batch_settled, first_claim_in_stark_proof, first_claim_proof, first_prove_failed,
+    first_prove_identity_result, first_validate_claim_result, first_verify_stark_error,
+    first_verify_stark_result, AnchorHeader, ClaimBundle, ClaimWitness, InStarkValidation,
+    ValidateClaimResult,
+};
+use nns_vesl::{api, state::AppState};
 use nockapp::kernel::boot;
 use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use nns_vesl::kernel::{
-    build_prove_arbitrary_poke, build_prove_batch_poke, build_prove_claim_in_stark_poke,
-    build_prove_claim_poke, build_prove_identity_poke, build_verify_stark_poke,
-    first_arbitrary_proof, first_batch_proof, first_batch_settled, first_claim_in_stark_proof,
-    first_claim_proof, first_prove_failed, first_prove_identity_result,
-    first_validate_claim_result, first_verify_stark_error, first_verify_stark_result, AnchorHeader,
-    ClaimBundle, ClaimWitness, InStarkValidation, ValidateClaimResult,
-};
-use nns_vesl::{api, state::AppState};
+
+/// Same canonical lock root as `matches-treasury` in the kernel / `src/payment.rs`.
+const DEFAULT_TREASURY_LOCK_ROOT_B58: &str =
+    "A3LoWjxurwiyzhkv8sgDv2MVu9PwgWHmqoncXw9GEQ5M3qx46svvadE";
 use tower::util::ServiceExt;
 use vesl_core::SettlementConfig;
 
@@ -38,9 +43,8 @@ fn kernel_jam() -> Vec<u8> {
     let path = std::env::var("NNS_KERNEL_JAM").unwrap_or_else(|_| "out.jam".to_string());
     match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => std::fs::read("../out.jam").unwrap_or_else(|e| {
-            panic!("could not read kernel jam at {path} or ../out.jam: {e}")
-        }),
+        Err(_) => std::fs::read("../out.jam")
+            .unwrap_or_else(|e| panic!("could not read kernel jam at {path} or ../out.jam: {e}")),
     }
 }
 
@@ -99,11 +103,7 @@ async fn request_json(
     (status, body)
 }
 
-async fn register_and_claim(
-    router: axum::Router,
-    addr: &str,
-    name: &str,
-) {
+async fn register_and_claim(router: axum::Router, addr: &str, name: &str) {
     let (status, body) = request_json(
         router.clone(),
         "POST",
@@ -117,7 +117,9 @@ async fn register_and_claim(
         router,
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{addr}","name":"{name}","txHash":"tx-{name}"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{addr}","name":"{name}","txHash":"tx-{name}"}}"#
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "claim {name}: {body}");
@@ -144,8 +146,7 @@ async fn phase0_baseline_prove_and_verify() {
     let start = Instant::now();
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), prove_poke)
+        k.poke(SystemWire.to_wire(), prove_poke)
             .await
             .expect("%prove-batch poke must complete")
     };
@@ -172,13 +173,9 @@ async fn phase0_baseline_prove_and_verify() {
     let proof = first_batch_proof(&effects)
         .expect("prove-batch should produce a %batch-proof effect on success");
     println!("[phase0] proof jam bytes: {}", proof.proof_jam.len());
-    assert!(
-        !proof.proof_jam.is_empty(),
-        "proof bytes must be non-empty"
-    );
+    assert!(!proof.proof_jam.is_empty(), "proof bytes must be non-empty");
     assert_eq!(
-        proof.note_id,
-        settled.note_id,
+        proof.note_id, settled.note_id,
         "proof note-id must match settled note-id"
     );
 
@@ -214,8 +211,7 @@ async fn phase1_redo_prove_identity_sanity() {
     let t = Instant::now();
     let efx = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_prove_identity_poke())
+        k.poke(SystemWire.to_wire(), build_prove_identity_poke())
             .await
             .expect("%prove-identity poke must complete")
     };
@@ -252,23 +248,24 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
     let bad_poke = build_verify_stark_poke(&[0xab, 0xcd]);
     let bad_fx = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), bad_poke)
+        k.poke(SystemWire.to_wire(), bad_poke)
             .await
             .expect("bad jam verify poke")
     };
     println!(
         "[phase1-redo] bad-jam poke: {} effects {:?}",
         bad_fx.len(),
-        bad_fx.iter().filter_map(nns_vesl::kernel::effect_tag).collect::<Vec<_>>()
+        bad_fx
+            .iter()
+            .filter_map(nns_vesl::kernel::effect_tag)
+            .collect::<Vec<_>>()
     );
 
     let prove_poke = build_prove_batch_poke();
     let t_prove = Instant::now();
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), prove_poke)
+        k.poke(SystemWire.to_wire(), prove_poke)
             .await
             .expect("%prove-batch poke must complete")
     };
@@ -361,22 +358,42 @@ async fn phase3c_prove_claim_roundtrip() {
     let page_digest = vec![0x42];
     let tx_hash = vec![0x07];
     let other_tx = vec![0x08];
+
+    // `%prove-claim` runs `matches-current-anchor` against kernel state; a
+    // fresh kernel starts at tip `(0, 0)`, so seed the anchor to match the
+    // bundle's `anchored_tip` / `anchored_tip_height` (same pattern as
+    // `tests/phase3_predicates.rs::advance_anchor_to`).
+    {
+        let header = AnchorHeader {
+            digest: page_digest.clone(),
+            height: 1,
+            parent: vec![],
+        };
+        let mut k = state.kernel.lock().await;
+        let fx = k
+            .poke(SystemWire.to_wire(), build_advance_tip_poke(&[header]))
+            .await
+            .expect("advance-tip for prove-claim anchor binding");
+        let adv = first_anchor_advanced(&fx).expect("anchor-advanced");
+        assert_eq!(adv.tip_height, 1);
+    }
+
     let bundle = ClaimBundle {
         name: "ab.nock".to_string(),
         owner: "owner-addr".to_string(),
-        fee: 5_000,
+        fee: 327_680_000,
         tx_hash: tx_hash.clone(),
         claim_block_digest: page_digest.clone(),
         anchor_headers: Vec::<AnchorHeader>::new(),
         page_digest: page_digest.clone(),
         page_tx_ids: vec![tx_hash.clone(), other_tx],
         anchored_tip: page_digest,
-        anchored_tip_height: 0,
+        anchored_tip_height: 1,
         witness: ClaimWitness {
             tx_id: tx_hash,
             spender_pkh: b"owner-addr".to_vec(),
-            treasury_amount: 5_000,
-            treasury_address: "nns-treasury".to_string(),
+            treasury_amount: 327_680_000,
+            output_lock_root: DEFAULT_TREASURY_LOCK_ROOT_B58.to_string(),
         },
     };
 
@@ -403,8 +420,7 @@ async fn phase3c_prove_claim_roundtrip() {
     let t_prove = Instant::now();
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), build_prove_claim_poke(&bundle))
+        k.poke(SystemWire.to_wire(), build_prove_claim_poke(&bundle))
             .await
             .expect("%prove-claim poke")
     };
@@ -431,16 +447,12 @@ async fn phase3c_prove_claim_roundtrip() {
     let t_verify = Instant::now();
     let vfx = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), verify_poke)
+        k.poke(SystemWire.to_wire(), verify_poke)
             .await
             .expect("%verify-stark poke")
     };
     let verify_elapsed = t_verify.elapsed();
-    println!(
-        "[phase3c] %verify-stark wall-clock: {:.3?}",
-        verify_elapsed
-    );
+    println!("[phase3c] %verify-stark wall-clock: {:.3?}", verify_elapsed);
     if let Some(msg) = first_verify_stark_error(&vfx) {
         panic!("verify-stark rejected the claim proof: {msg}");
     }
@@ -487,22 +499,21 @@ async fn phase3c_step3_prove_arbitrary_roundtrip() {
     // formula avoids the degenerate-table-heights edge case that
     // Phase 1-redo exposed with `[0 1]`.
     let mut form_stack = new_stack();
-    let base = Cell::new(&mut form_stack, D(0), D(1)).as_noun();          // [0 1]
-    let inc1 = Cell::new(&mut form_stack, D(4), base).as_noun();          // [4 [0 1]]
-    let inc2 = Cell::new(&mut form_stack, D(4), inc1).as_noun();          // [4 [4 ...]]
-    let formula_noun = Cell::new(&mut form_stack, D(4), inc2).as_noun();  // [4 [4 [4 ...]]]
+    let base = Cell::new(&mut form_stack, D(0), D(1)).as_noun(); // [0 1]
+    let inc1 = Cell::new(&mut form_stack, D(4), base).as_noun(); // [4 [0 1]]
+    let inc2 = Cell::new(&mut form_stack, D(4), inc1).as_noun(); // [4 [4 ...]]
+    let formula_noun = Cell::new(&mut form_stack, D(4), inc2).as_noun(); // [4 [4 [4 ...]]]
     let formula_jam = jam_to_bytes(&mut form_stack, formula_noun);
 
     let t_prove = Instant::now();
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(
-                SystemWire.to_wire(),
-                build_prove_arbitrary_poke(&subject_jam, &formula_jam),
-            )
-            .await
-            .expect("%prove-arbitrary poke")
+        k.poke(
+            SystemWire.to_wire(),
+            build_prove_arbitrary_poke(&subject_jam, &formula_jam),
+        )
+        .await
+        .expect("%prove-arbitrary poke")
     };
     let prove_elapsed = t_prove.elapsed();
 
@@ -526,8 +537,7 @@ async fn phase3c_step3_prove_arbitrary_roundtrip() {
     let t_verify = Instant::now();
     let vfx = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), verify_poke)
+        k.poke(SystemWire.to_wire(), verify_poke)
             .await
             .expect("%verify-stark poke")
     };
@@ -594,7 +604,7 @@ async fn phase3c_step3_validator_in_stark_blocked_upstream() {
     let bundle = ClaimBundle {
         name: "ab.nock".to_string(),
         owner: "owner-addr".to_string(),
-        fee: 5_000,
+        fee: 327_680_000,
         tx_hash: tx_hash.clone(),
         claim_block_digest: page_digest.clone(),
         anchor_headers: Vec::<AnchorHeader>::new(),
@@ -605,20 +615,19 @@ async fn phase3c_step3_validator_in_stark_blocked_upstream() {
         witness: ClaimWitness {
             tx_id: tx_hash,
             spender_pkh: b"owner-addr".to_vec(),
-            treasury_amount: 5_000,
-            treasury_address: "nns-treasury".to_string(),
+            treasury_amount: 327_680_000,
+            output_lock_root: DEFAULT_TREASURY_LOCK_ROOT_B58.to_string(),
         },
     };
 
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(
-                SystemWire.to_wire(),
-                build_prove_claim_in_stark_poke(&bundle),
-            )
-            .await
-            .expect("%prove-claim-in-stark poke")
+        k.poke(
+            SystemWire.to_wire(),
+            build_prove_claim_in_stark_poke(&bundle),
+        )
+        .await
+        .expect("%prove-claim-in-stark poke")
     };
 
     // Confirm the encoding is semantically correct: if the dry-run

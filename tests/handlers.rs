@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use nockapp::kernel::boot;
-use nockapp::NockApp;
-use nockapp::wire::{SystemWire, Wire};
-use nns_vesl::chain::{ConfirmedTxPosition};
+use nns_vesl::chain::ConfirmedTxPosition;
 use nns_vesl::kernel::{build_claim_poke, first_error_message, has_effect};
 use nns_vesl::{api, state::AppState};
+use nockapp::kernel::boot;
+use nockapp::wire::{SystemWire, Wire};
+use nockapp::NockApp;
 use tower::util::ServiceExt;
 use vesl_core::{SettlementConfig, SettlementMode};
 
@@ -21,13 +21,11 @@ const ADDR1: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ";
 const ADDR2: &str = "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210abcdefghij";
 
 fn kernel_jam() -> Vec<u8> {
-    let path = std::env::var("NNS_KERNEL_JAM")
-        .unwrap_or_else(|_| "out.jam".to_string());
+    let path = std::env::var("NNS_KERNEL_JAM").unwrap_or_else(|_| "out.jam".to_string());
     match std::fs::read(&path) {
         Ok(b) => b,
-        Err(_) => std::fs::read("../out.jam").unwrap_or_else(|e| {
-            panic!("could not read kernel jam at {path} or ../out.jam: {e}")
-        }),
+        Err(_) => std::fs::read("../out.jam")
+            .unwrap_or_else(|e| panic!("could not read kernel jam at {path} or ../out.jam: {e}")),
     }
 }
 
@@ -93,13 +91,7 @@ async fn register_then_claim_flow() {
     assert_eq!(body["status"], "pending");
     assert_eq!(body["name"], "alpha.nock");
 
-    let (status, body) = request_json(
-        router.clone(),
-        "GET",
-        "/pending",
-        None,
-    )
-    .await;
+    let (status, body) = request_json(router.clone(), "GET", "/pending", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().map(|a| a.len()), Some(1));
     assert_eq!(body[0]["name"], "alpha.nock");
@@ -109,7 +101,9 @@ async fn register_then_claim_flow() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-1"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-1"}}"#
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "claim response: {body}");
@@ -155,7 +149,9 @@ async fn register_same_name_different_owner_rejected() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"bravo.nock","txHash":"tx-bravo-1"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"bravo.nock","txHash":"tx-bravo-1"}}"#
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -195,17 +191,17 @@ async fn search_available_pending_registered() {
     let (_tmp, state) = setup().await;
     let router = api::router(state.clone());
 
-    // 4-char stem exercises the premium tier (5000).
+    // 4-char stem: premium tier (5000 NOCK in API; kernel uses nicks).
     let (_, body) = request_json(router.clone(), "GET", "/search?name=echo", None).await;
     assert_eq!(body["status"], "available");
     assert_eq!(body["price"], 5000);
 
-    // 5-char stem sits in the mid tier (500).
+    // 5-char stem: mid tier (500 NOCK).
     let (_, body) = request_json(router.clone(), "GET", "/search?name=delta", None).await;
     assert_eq!(body["status"], "available");
     assert_eq!(body["price"], 500);
 
-    // 10+-char stem sits in the cheap tier (100).
+    // 10+-char stem: cheap tier (100 NOCK).
     let (_, body) = request_json(router.clone(), "GET", "/search?name=hugecoolname", None).await;
     assert_eq!(body["price"], 100);
 
@@ -313,7 +309,10 @@ async fn claim_without_tx_hash_is_allowed_in_local_mode() {
     .await;
     assert_eq!(status, StatusCode::OK, "got: {body}");
     assert!(
-        body["txHash"].as_str().unwrap_or_default().starts_with("stub-"),
+        body["txHash"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("stub-"),
         "expected synthetic txHash in local mode: {body}"
     );
 }
@@ -340,7 +339,9 @@ async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"delta.nock","txHash":"tx-delta-2"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"delta.nock","txHash":"tx-delta-2"}}"#
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -382,7 +383,9 @@ async fn resolve_by_name_falls_back_to_kernel_when_mirror_is_stale() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"echo.nock","txHash":"tx-echo-1"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"echo.nock","txHash":"tx-echo-1"}}"#
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -411,7 +414,7 @@ async fn kernel_rejects_duplicate_tx_hash() {
         let mut k = state.kernel.lock().await;
         k.poke(
             SystemWire.to_wire(),
-            build_claim_poke("foxtrot.nock", ADDR1, 5000, tx_hash),
+            build_claim_poke("foxtrot.nock", ADDR1, 327_680_000, tx_hash),
         )
         .await
         .expect("first claim poke")
@@ -429,7 +432,7 @@ async fn kernel_rejects_duplicate_tx_hash() {
         let mut k = state.kernel.lock().await;
         k.poke(
             SystemWire.to_wire(),
-            build_claim_poke("golf.nock", ADDR2, 5000, tx_hash),
+            build_claim_poke("golf.nock", ADDR2, 327_680_000, tx_hash),
         )
         .await
         .expect("second claim poke")
@@ -465,14 +468,14 @@ async fn follower_orders_same_height_claims_by_tx_index() {
             "claim-a".to_string(),
             ADDR1.to_string(),
             "zero.nock".to_string(),
-            5000,
+            327_680_000,
             "tx-a".to_string(),
         );
         h.mirror.enqueue_claim(
             "claim-b".to_string(),
             ADDR2.to_string(),
             "zero.nock".to_string(),
-            5000,
+            327_680_000,
             "tx-b".to_string(),
         );
     }
@@ -511,8 +514,14 @@ async fn follower_orders_same_height_claims_by_tx_index() {
         .mirror
         .claim_status("claim-b")
         .expect("claim-b status present");
-    assert_eq!(status_b.status, nns_vesl::types::ClaimLifecycleStatus::Finalized);
-    assert_eq!(status_a.status, nns_vesl::types::ClaimLifecycleStatus::Rejected);
+    assert_eq!(
+        status_b.status,
+        nns_vesl::types::ClaimLifecycleStatus::Finalized
+    );
+    assert_eq!(
+        status_a.status,
+        nns_vesl::types::ClaimLifecycleStatus::Rejected
+    );
     assert!(
         status_a
             .reason
@@ -670,7 +679,9 @@ async fn set_primary_requires_ownership() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-2"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"alpha.nock","txHash":"tx-alpha-2"}}"#
+        )),
     )
     .await;
 
@@ -717,7 +728,10 @@ async fn snapshot_advances_with_each_claim() {
     let mut last_root: Option<String> = None;
     let mut last_claim_id: u64 = 0;
 
-    for (i, name) in ["alpha.nock", "beta.nock", "charlie.nock"].iter().enumerate() {
+    for (i, name) in ["alpha.nock", "beta.nock", "charlie.nock"]
+        .iter()
+        .enumerate()
+    {
         let _ = request_json(
             router.clone(),
             "POST",
@@ -828,7 +842,9 @@ async fn settle_twice_in_a_row_second_is_empty() {
         router.clone(),
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{ADDR1}","name":"india.nock","txHash":"tx-india-1"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{ADDR1}","name":"india.nock","txHash":"tx-india-1"}}"#
+        )),
     )
     .await;
 
@@ -906,7 +922,9 @@ async fn claim_after_settle_gets_its_own_batch() {
             router.clone(),
             "POST",
             "/claim",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
+            Some(&format!(
+                r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#
+            )),
         )
         .await;
     }
@@ -949,7 +967,7 @@ async fn batch_note_id_is_deterministic() {
             let effects = k
                 .poke(
                     SystemWire.to_wire(),
-                    build_claim_poke(name, addr, 5000, tx),
+                    build_claim_poke(name, addr, 327_680_000, tx),
                 )
                 .await
                 .expect("claim poke");
@@ -991,14 +1009,18 @@ async fn pending_batch_endpoint_reflects_window() {
             router.clone(),
             "POST",
             "/register",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
+            Some(&format!(
+                r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#
+            )),
         )
         .await;
         let _ = request_json(
             router.clone(),
             "POST",
             "/claim",
-            Some(&format!(r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#)),
+            Some(&format!(
+                r#"{{"address":"{ADDR1}","name":"{name}","txHash":"tx-{name}"}}"#
+            )),
         )
         .await;
     }
@@ -1065,7 +1087,9 @@ async fn register_and_claim(router: axum::Router, addr: &str, name: &str) {
         router,
         "POST",
         "/claim",
-        Some(&format!(r#"{{"address":"{addr}","name":"{name}","txHash":"tx-{name}"}}"#)),
+        Some(&format!(
+            r#"{{"address":"{addr}","name":"{name}","txHash":"tx-{name}"}}"#
+        )),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1146,10 +1170,7 @@ async fn proof_404s_for_unregistered_name() {
 
     let (status, body) = request_json(router.clone(), "GET", "/proof?name=nope.nock", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "got: {body}");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("not registered"));
+    assert!(body["error"].as_str().unwrap().contains("not registered"));
 }
 
 #[tokio::test]
@@ -1169,10 +1190,7 @@ async fn proof_404s_when_address_does_not_match_owner() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "got: {body}");
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("does not own"));
+    assert!(body["error"].as_str().unwrap().contains("does not own"));
 
     // Matching address -> 200.
     let (status, body) = request_json(
@@ -1224,9 +1242,7 @@ async fn proof_rejects_invalid_inputs() {
 // ---------------------------------------------------------------------------
 
 use nock_noun_rs::{jam_to_bytes, make_cord, new_stack, T as TupleIn};
-use nockchain_tip5_rs::{
-    verify_proof, ProofNode as Tip5ProofNode, Tip5Hash,
-};
+use nockchain_tip5_rs::{verify_proof, ProofNode as Tip5ProofNode, Tip5Hash};
 
 /// Goldilocks prime. Same constant `nockchain_math::belt::PRIME` uses;
 /// hard-coded here to keep the test free of an extra path dep.
@@ -1296,7 +1312,12 @@ async fn le_bytes_to_tip5_is_inverse_of_tip5_to_atom_le_bytes() {
     // the original back. This keeps the inverse honest independent of
     // the kernel so failures in the big end-to-end test localize.
     use nockchain_tip5_rs::{hash_leaf, tip5_to_atom_le_bytes};
-    for data in [&b"alpha"[..], b"bravo.nock", b"", b"\x00\x01\x02\x03\x04\x05\x06\x07"] {
+    for data in [
+        &b"alpha"[..],
+        b"bravo.nock",
+        b"",
+        b"\x00\x01\x02\x03\x04\x05\x06\x07",
+    ] {
         let h = hash_leaf(data);
         let bytes = tip5_to_atom_le_bytes(&h);
         let roundtrip = le_bytes_to_tip5(&bytes);
@@ -1484,8 +1505,7 @@ async fn admin_advance_tip_returns_404_when_admin_disabled() {
     let (_tmp, state) = setup().await;
     let router = api::router(state.clone());
 
-    let (status, _body) =
-        request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
+    let (status, _body) = request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1497,8 +1517,7 @@ async fn admin_advance_tip_is_noop_in_local_mode_when_enabled() {
     let (_tmp, state) = setup().await;
     let router = api::router(state.clone());
 
-    let (status, body) =
-        request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
+    let (status, body) = request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
     assert_eq!(status, StatusCode::OK);
     // Local mode always returns advanced=false with a reason.
     assert_eq!(body["advanced"], false);

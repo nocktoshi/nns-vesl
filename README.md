@@ -92,7 +92,7 @@ submission handle for follower tracking.
 | GET    | `/resolve?name=X`           | `{address}` or 404                                                                                                                                                                                                                                                                                                                                                          |
 | GET    | `/resolve?address=X`        | `{name}` — the address's **primary** — or 404                                                                                                                                                                                                                                                                                                                               |
 | GET    | `/proof?name=X[&address=Y]` | Inclusion bundle + transition anchor `{name, owner, txHash, claim_id, root, hull, proof[], transition, transition_proof?}`. Optional `address` filter returns 404 on owner mismatch.                                                                                                                                                                                        |
-| GET    | `/search?name=X`            | `{name, price, status, owner?, registeredAt?}`                                                                                                                                                                                                                                                                                                                              |
+| GET    | `/search?name=X`            | `{name, price, status, owner?, registeredAt?}` — `price` in whole NOCK                                                                                                                                                                                                                                                                                                     |
 | GET    | `/search?address=X`         | `{address, pending[], verified[], primary?}`                                                                                                                                                                                                                                                                                                                                |
 | GET    | `/status`                   | Diagnostic: counts, merkle root, settlement mode                                                                                                                                                                                                                                                                                                                            |
 | GET    | `/health`                   | `{status: "ok"}`                                                                                                                                                                                                                                                                                                                                                            |
@@ -119,7 +119,7 @@ rules directly on follower replay; no graft involvement, no STARK
 per registration:
   - **C1 — format**: stem is non-empty, `[a-z0-9]+.nock`.
   - **C2 — fee adequacy**: declared fee ≥ the tier for the stem's
-  length (`5000 / 500 / 100` $NOCK, matching the legacy worker).
+  length (`327680000 / 32768000 / 6553600` nicks, where `65536 nicks = 1 NOCK`).
   - **C3 — name uniqueness**: `name` must not already be in
   `names`. On duplicate the kernel emits `[%claim-error 'name already registered']` without mutating state; the hull turns
   that into a `400`.
@@ -419,11 +419,11 @@ flip for no settlement benefit.
 Fee tiers (ported from `nock-names-worker/src/utils/constants.ts`):
 
 
-| Stem length | Fee (nocks) |
-| ----------- | ----------- |
-| 1-4 chars   | 5000        |
-| 5-9 chars   | 500         |
-| 10+ chars   | 100         |
+| Stem length | API `price` (NOCK) | On-chain / kernel (nicks) |
+| ----------- | ------------------ | --------------------------- |
+| 1-4 chars   | 5000               | 327680000                   |
+| 5-9 chars   | 500                | 32768000                    |
+| 10+ chars   | 100                | 6553600                     |
 
 
 ## Configuration

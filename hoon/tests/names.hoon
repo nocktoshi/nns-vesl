@@ -59,9 +59,9 @@
   |=  name=@t  ^-  @ud
   =/  slen  (stem-len name)
   ?:  =(slen 0)  0
-  ?:  (gte slen 10)  100
-  ?:  (gte slen 5)   500
-  5.000
+  ?:  (gte slen 10)  6.553.600
+  ?:  (gte slen 5)   32.768.000
+  327.680.000
 ::
 ::  Merkle primitives — parallel copies.
 ::
@@ -158,11 +158,11 @@
 ::  Fee tiers match legacy worker (nicks)
 ::  ============================================
 ::
-?>  (assert-eq (fee-for 'a.nock') 5.000)
-?>  (assert-eq (fee-for 'abcd.nock') 5.000)
-?>  (assert-eq (fee-for 'abcde.nock') 500)
-?>  (assert-eq (fee-for 'abcdefghi.nock') 500)
-?>  (assert-eq (fee-for 'abcdefghij.nock') 100)
+?>  (assert-eq (fee-for 'a.nock') 327.680.000)
+?>  (assert-eq (fee-for 'abcd.nock') 327.680.000)
+?>  (assert-eq (fee-for 'abcde.nock') 32.768.000)
+?>  (assert-eq (fee-for 'abcdefghi.nock') 32.768.000)
+?>  (assert-eq (fee-for 'abcdefghij.nock') 6.553.600)
 ::
 ::  ============================================
 ::  Batch G2: 1-leaf batch (smallest real case)

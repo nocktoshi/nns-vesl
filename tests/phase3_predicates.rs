@@ -20,19 +20,19 @@
 
 use std::sync::Arc;
 
+use nns_vesl::kernel::{
+    build_advance_tip_poke, build_fee_for_name_peek, build_prove_claim_poke,
+    build_validate_claim_poke, build_verify_chain_link_poke, build_verify_tx_in_page_poke,
+    decode_fee_for_name, first_anchor_advanced, first_chain_link_result, first_claim_proof,
+    first_tx_in_page_result, first_validate_claim_result, AnchorHeader, ClaimBundle,
+    ValidateClaimResult,
+};
+use nns_vesl::payment::fee_for_name;
+use nns_vesl::state::AppState;
 use nockapp::kernel::boot;
 use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use nns_vesl::kernel::{
-    build_advance_tip_poke, build_fee_for_name_peek, build_prove_claim_poke,
-    build_set_payment_address_poke, build_validate_claim_poke, build_verify_chain_link_poke,
-    build_verify_tx_in_page_poke, decode_fee_for_name, first_anchor_advanced,
-    first_chain_link_result, first_claim_proof, first_tx_in_page_result,
-    first_validate_claim_result, AnchorHeader, ClaimBundle, ValidateClaimResult,
-};
-use nns_vesl::payment::fee_for_name;
-use nns_vesl::state::AppState;
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -75,10 +75,7 @@ async fn boot_kernel() -> (tempfile::TempDir, nns_vesl::state::SharedState) {
     (tmp, state)
 }
 
-async fn fee_via_kernel(
-    state: &nns_vesl::state::SharedState,
-    name: &str,
-) -> u64 {
+async fn fee_via_kernel(state: &nns_vesl::state::SharedState, name: &str) -> u64 {
     let mut k = state.kernel.lock().await;
     let res = k
         .peek(build_fee_for_name_peek(name))
@@ -97,27 +94,27 @@ async fn fee_for_name_parity_hoon_rust() {
     let (_tmp, state) = boot_kernel().await;
 
     let cases = [
-        // tier: 1..=4 chars -> 5000
-        ("a.nock", 5_000),
-        ("ab.nock", 5_000),
-        ("abc.nock", 5_000),
-        ("abcd.nock", 5_000),
-        // tier: 5..=9 chars -> 500
-        ("abcde.nock", 500),
-        ("abcdef.nock", 500),
-        ("abcdefgh.nock", 500),
-        ("abcdefghi.nock", 500),
-        // tier: 10+ chars -> 100
-        ("abcdefghij.nock", 100),
-        ("zzzzzzzzzzzzzzzzzzzz.nock", 100),
+        // tier: 1..=4 chars -> 327_680_000 nicks (5000 NOCK)
+        ("a.nock", 327_680_000),
+        ("ab.nock", 327_680_000),
+        ("abc.nock", 327_680_000),
+        ("abcd.nock", 327_680_000),
+        // tier: 5..=9 chars -> 32_768_000 nicks (500 NOCK)
+        ("abcde.nock", 32_768_000),
+        ("abcdef.nock", 32_768_000),
+        ("abcdefgh.nock", 32_768_000),
+        ("abcdefghi.nock", 32_768_000),
+        // tier: 10+ chars -> 6_553_600 nicks (100 NOCK)
+        ("abcdefghij.nock", 6_553_600),
+        ("zzzzzzzzzzzzzzzzzzzz.nock", 6_553_600),
         // empty stem (G1 would reject before fee; exercises the zero path)
         (".nock", 0),
         ("", 0),
         // lookups without the .nock suffix still derive a sensible fee,
         // matching Rust's `strip_suffix(".nock").unwrap_or(name)` fallback.
-        ("abcd", 5_000),
-        ("abcde", 500),
-        ("abcdefghij", 100),
+        ("abcd", 327_680_000),
+        ("abcde", 32_768_000),
+        ("abcdefghij", 6_553_600),
     ];
 
     for (name, expected) in cases {
@@ -145,8 +142,8 @@ async fn fee_for_name_accepts_long_names() {
     let long_name = format!("{}.nock", "z".repeat(200));
     let rust = fee_for_name(&long_name);
     let hoon = fee_via_kernel(&state, &long_name).await;
-    assert_eq!(rust, 100);
-    assert_eq!(hoon, 100);
+    assert_eq!(rust, 6_553_600);
+    assert_eq!(hoon, 6_553_600);
 }
 
 // =========================================================================
@@ -176,8 +173,7 @@ async fn run_chain_link(
     let poke = build_verify_chain_link_poke(claim_digest, headers, anchored_tip);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(SystemWire.to_wire(), poke)
+        k.poke(SystemWire.to_wire(), poke)
             .await
             .expect("chain-link poke")
     };
@@ -189,7 +185,10 @@ async fn run_chain_link(
 async fn chain_link_accepts_claim_is_tip() {
     let (_tmp, state) = boot_kernel().await;
     let ok = run_chain_link(&state, &digest(7), &[], &digest(7)).await;
-    assert!(ok, "claim-digest == anchored-tip with empty headers should pass");
+    assert!(
+        ok,
+        "claim-digest == anchored-tip with empty headers should pass"
+    );
 }
 
 /// Empty headers + different tip must fail.
@@ -259,8 +258,7 @@ async fn run_tx_in_page(
     let poke = build_verify_tx_in_page_poke(page_digest, tx_ids, claimed);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("tx-in-page poke")
     };
@@ -290,9 +288,7 @@ async fn tx_in_page_accepts_small_atom_id() {
     let (_tmp, state) = boot_kernel().await;
     let small: Vec<u8> = vec![0x2a];
     assert!(run_tx_in_page(&state, &digest(1), &[small.clone()], &small).await);
-    assert!(
-        !run_tx_in_page(&state, &digest(1), &[small.clone()], &vec![0x2b]).await
-    );
+    assert!(!run_tx_in_page(&state, &digest(1), &[small.clone()], &vec![0x2b]).await);
 }
 
 /// Two small atoms — verifies `z-silt` can build a 2-element tree
@@ -362,15 +358,9 @@ async fn tx_in_page_forty_byte_two() {
         v[0] = seed;
         v
     };
-    assert!(
-        run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(1)).await
-    );
-    assert!(
-        run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(2)).await
-    );
-    assert!(
-        !run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(3)).await
-    );
+    assert!(run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(1)).await);
+    assert!(run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(2)).await);
+    assert!(!run_tx_in_page(&state, &digest(1), &[mk(1), mk(2)], &mk(3)).await);
 }
 
 // =========================================================================
@@ -381,7 +371,7 @@ async fn tx_in_page_forty_byte_two() {
 /// input). Individual tests mutate one field at a time to trigger
 /// the specific rejection they're exercising.
 fn good_bundle() -> ClaimBundle {
-    // 2-digit stem @ 5000 nicks fee. Shortest stable-atom inputs for
+    // 2-digit stem @ 327_680_000 nicks fee. Shortest stable-atom inputs for
     // the z-silt code path (see the tx_in_page_* note at the top of
     // the file about jet edge cases with 3+ 40-byte atoms).
     let page_digest = vec![0x42];
@@ -391,7 +381,7 @@ fn good_bundle() -> ClaimBundle {
     ClaimBundle {
         name: "ab.nock".to_string(),
         owner: "owner-address".to_string(),
-        fee: 5_000,
+        fee: 327_680_000,
         tx_hash: tx_hash.clone(),
         claim_block_digest: page_digest.clone(),
         // Claim block IS the anchored tip — no intermediate headers.
@@ -405,14 +395,14 @@ fn good_bundle() -> ClaimBundle {
         // claim (owner/fee/tx_hash) so the good-bundle stays happy
         // path. Individual tests mutate one to exercise a rejection.
         //
-        // treasury_address kept as a placeholder string because
-        // %validate-claim doesn't check it (only %prove-claim does,
-        // against kernel state — tested separately).
+        // output_lock_root: %validate-claim ignores it; %prove-claim checks it
+        // against the hardcoded canonical lock root (see `matches-treasury` +
+        // `DEFAULT_TREASURY_LOCK_ROOT_B58`).
         witness: nns_vesl::kernel::ClaimWitness {
             tx_id: vec![0x07],
             spender_pkh: b"owner-address".to_vec(),
-            treasury_amount: 5_000,
-            treasury_address: "nns-treasury".to_string(),
+            treasury_amount: 327_680_000,
+            output_lock_root: "A3LoWjxurwiyzhkv8sgDv2MVu9PwgWHmqoncXw9GEQ5M3qx46svvadE".to_string(),
         },
     }
 }
@@ -424,8 +414,7 @@ async fn run_validate(
     let poke = build_validate_claim_poke(bundle);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("validate-claim poke")
     };
@@ -472,8 +461,8 @@ async fn validate_claim_rejects_invalid_name() {
 async fn validate_claim_rejects_fee_below_schedule() {
     let (_tmp, state) = boot_kernel().await;
     let mut b = good_bundle();
-    // 2-char stem requires 5000; send 4999.
-    b.fee = 4_999;
+    // 2-char stem requires 327_680_000; send 327_679_999.
+    b.fee = 327_679_999;
     assert_eq!(
         run_validate(&state, &b).await,
         ValidateClaimResult::Error("fee-below-schedule".into())
@@ -484,8 +473,10 @@ async fn validate_claim_rejects_fee_below_schedule() {
 async fn validate_claim_accepts_fee_above_schedule() {
     let (_tmp, state) = boot_kernel().await;
     let mut b = good_bundle();
-    // Overpaying is fine (the gate only checks fee >= fee-for-name).
-    b.fee = 1_000_000;
+    // Overpaying is fine (the gate only checks fee >= fee-for-name for ab.nock:
+    // 327_680_000 nicks). Witness amount must follow (Level C underpaid check).
+    b.fee = 400_000_000;
+    b.witness.treasury_amount = 400_000_000;
     assert_eq!(run_validate(&state, &b).await, ValidateClaimResult::Ok);
 }
 
@@ -611,11 +602,7 @@ async fn validate_claim_short_circuits_on_first_error() {
 
 /// Advance the kernel anchor to a specific (tip-digest, tip-height).
 /// Returns once the `%anchor-advanced` effect confirms the move.
-async fn advance_anchor_to(
-    state: &nns_vesl::state::SharedState,
-    digest: Vec<u8>,
-    height: u64,
-) {
+async fn advance_anchor_to(state: &nns_vesl::state::SharedState, digest: Vec<u8>, height: u64) {
     // Bootstrapping from genesis: a single header whose parent=0 and
     // height starts at tip-height+1 (or, in the bootstrap case, equals
     // the supplied height because the kernel's current tip starts at
@@ -628,8 +615,7 @@ async fn advance_anchor_to(
     let poke = build_advance_tip_poke(&[header]);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("advance-tip poke")
     };
@@ -651,8 +637,7 @@ async fn prove_claim_rejects_stale_tip_height() {
     let poke = build_prove_claim_poke(&bundle);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
     };
@@ -686,8 +671,7 @@ async fn prove_claim_rejects_mismatched_tip_digest_with_matching_height() {
     let poke = build_prove_claim_poke(&b);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
     };
@@ -712,9 +696,9 @@ async fn prove_claim_rejects_mismatched_tip_digest_with_matching_height() {
 //   - matches-tx-id        → witness.tx-id == claim.tx-hash
 //   - pays-sender          → witness.spender-pkh == claim.owner
 //   - pays-amount          → witness.treasury-amount >= fee-for-name
-// The fourth (matches-treasury) compares witness.treasury-address against
-// the kernel's payment-address state — tested under %prove-claim (which
-// does the state-relative check) rather than %validate-claim.
+// The fourth (matches-treasury) compares witness.output_lock_root to the
+// v1 lock-root b58 derived from the kernel p2pkh (not the p2pkh string
+// itself) — tested under %prove-claim.
 
 #[tokio::test]
 async fn validate_claim_rejects_witness_tx_id_mismatch() {
@@ -747,7 +731,7 @@ async fn validate_claim_rejects_witness_sender_mismatch() {
 async fn validate_claim_rejects_witness_underpaid() {
     let (_tmp, state) = boot_kernel().await;
     let mut b = good_bundle();
-    // Hull declared fee=5000 (passes C2) but the actual on-chain
+    // Hull declared fee=327_680_000 (passes C2) but the actual on-chain
     // treasury-amount was only 4999. The witness-underpaid check is
     // stricter than C2: C2 trusts the hull's claim.fee, this trusts
     // what actually moved on chain (as reported by the hull, then
@@ -763,10 +747,10 @@ async fn validate_claim_rejects_witness_underpaid() {
 async fn validate_claim_rejects_witness_underpaid_even_when_claim_fee_matches() {
     let (_tmp, state) = boot_kernel().await;
     let mut b = good_bundle();
-    // Hull lies: claim.fee=5000 passes C2, but actual treasury received 0.
+    // Hull lies: claim.fee=327_680_000 passes C2, but actual treasury received 0.
     // Witness-underpaid is the belt-and-suspenders check that closes
     // the "hostile hull lies about fee" gap.
-    b.fee = 5_000;
+    b.fee = 327_680_000;
     b.witness.treasury_amount = 0;
     assert_eq!(
         run_validate(&state, &b).await,
@@ -774,25 +758,7 @@ async fn validate_claim_rejects_witness_underpaid_even_when_claim_fee_matches() 
     );
 }
 
-// --- Kernel-state-relative: %prove-claim matches-treasury --------------
-
-async fn set_treasury(state: &nns_vesl::state::SharedState, addr: &str) {
-    let poke = build_set_payment_address_poke(addr);
-    let effects = {
-        let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
-            .await
-            .expect("set-payment-address poke")
-    };
-    // Success effect is %payment-address-set; just confirm no error.
-    assert!(
-        !effects
-            .iter()
-            .any(|e| nns_vesl::kernel::effect_tag(e).as_deref() == Some("payment-address-error")),
-        "set-payment-address rejected"
-    );
-}
+// --- %prove-claim matches-treasury (canonical lock root) -------------
 
 /// Advance the kernel's anchor to `(0x42, 1)` and produce a bundle
 /// whose `anchored_tip` / `anchored_tip_height` match — so the Phase 7
@@ -809,19 +775,14 @@ async fn bundle_matching_advanced_anchor(state: &nns_vesl::state::SharedState) -
 async fn prove_claim_rejects_wrong_treasury() {
     let (_tmp, state) = boot_kernel().await;
     let mut b = bundle_matching_advanced_anchor(&state).await;
-    // Configure the kernel's treasury.
-    set_treasury(&state, "nns-treasury").await;
-
-    // Bundle claims payment was sent to a *different* treasury. Proof
-    // must refuse before the prover runs — this is the Level C-A
-    // state-relative check in %prove-claim.
-    b.witness.treasury_address = "attacker-treasury".to_string();
+    // Bundle claims payment was sent to a *different* lock root than the
+    // canonical NNS treasury.
+    b.witness.output_lock_root = "4uhcJHPZN6759D8ukUopNpVNPG3ho18pYjksyS81NLXo".to_string();
 
     let poke = build_prove_claim_poke(&b);
     let effects = {
         let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+        k.poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
     };
@@ -830,30 +791,6 @@ async fn prove_claim_rejects_wrong_treasury() {
         first_claim_proof(&effects).is_none(),
         "prover must not run when witness treasury != kernel treasury"
     );
-    assert_eq!(
-        first_validate_claim_result(&effects),
-        Some(ValidateClaimResult::Error("witness-wrong-treasury".into())),
-    );
-}
-
-#[tokio::test]
-async fn prove_claim_rejects_when_treasury_unset() {
-    // Fresh kernel with no payment-address configured yet. %prove-claim
-    // refuses rather than accepting an arbitrary witness treasury —
-    // operator hasn't finished bootstrap.
-    let (_tmp, state) = boot_kernel().await;
-    let b = bundle_matching_advanced_anchor(&state).await;
-
-    let poke = build_prove_claim_poke(&b);
-    let effects = {
-        let mut k = state.kernel.lock().await;
-        k
-            .poke(nockapp::wire::SystemWire.to_wire(), poke)
-            .await
-            .expect("prove-claim poke")
-    };
-
-    assert!(first_claim_proof(&effects).is_none());
     assert_eq!(
         first_validate_claim_result(&effects),
         Some(ValidateClaimResult::Error("witness-wrong-treasury".into())),

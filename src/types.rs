@@ -110,6 +110,7 @@ pub struct SearchByAddressResponse {
 /// `GET /search?name=...` result. The legacy worker returns
 /// `{name, price, status, owner?, registeredAt?}` and status is
 /// one of `registered | pending | available`.
+/// `price` is denominated in whole NOCK (`65536` nicks = `1` NOCK on chain).
 #[derive(Debug, Serialize)]
 pub struct SearchByNameResponse {
     pub name: String,
