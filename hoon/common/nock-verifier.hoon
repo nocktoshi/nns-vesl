@@ -1,1 +1,1 @@
-REDACTED/nockchain/hoon/common/nock-verifier.hoon
+../../../nockchain/hoon/common/nock-verifier.hoon

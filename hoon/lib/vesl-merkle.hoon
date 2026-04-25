@@ -1,1 +1,1 @@
-REDACTED/vesl/protocol/lib/vesl-merkle.hoon
+../../../vesl-core/protocol/lib/vesl-merkle.hoon

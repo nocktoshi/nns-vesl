@@ -1,1 +1,1 @@
-REDACTED/nockchain/hoon/common/zoon.hoon
+../../../nockchain/hoon/common/zoon.hoon

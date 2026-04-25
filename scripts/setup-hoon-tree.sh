@@ -20,7 +20,9 @@
 # We used to vendor the vesl files as verbatim copies under
 # `hoon/lib/vesl-*.hoon`. That drifted whenever vesl master moved and
 # forced us to patch upstream fixes locally. Phase 2 promoted those
-# files to symlinks so we track vesl master exactly.
+# files to symlinks so we track vesl master exactly. Phase 7.1
+# re-vendored `vesl-stark-verifier.hoon` because it needs a local
+# strict-hoonc patch — see the header on that file.
 #
 # Locally owned (untouched by this script):
 #   - /common/wrapper.hoon
@@ -30,40 +32,27 @@
 #   - /app/
 #   - /tests/
 #
-# Env vars (first non-empty wins; if both missing, falls back to the
-# sibling-clone defaults `../nockchain` and `../vesl`):
-#   - NOCK_HOME / vesl.toml's `nock_home`
-#   - VESL_HOME / vesl.toml's `vesl_home`
+# Sibling checkouts are CANONICALLY named `../nockchain` and
+# `../vesl-core` relative to this repo's root. The script hard-codes
+# these paths so the committed symlinks resolve identically on every
+# host — no machine-specific TOML reads, no env-var overrides.
+#
+# If you keep your checkouts elsewhere, symlink them at the expected
+# location instead of configuring this script:
+#
+#   ln -s /path/to/nockchain  ../nockchain
+#   ln -s /path/to/vesl-core  ../vesl-core
+#
+# Rust-side path deps in `Cargo.toml` assume the same canonical
+# names, so pinning the script avoids surprise config drift.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOON_DIR="$REPO_ROOT/hoon"
 
-read_toml_key() {
-    local key="$1"
-    if [[ -f "$REPO_ROOT/vesl.toml" ]]; then
-        # `grep -s` with no match exits nonzero under `set -e`; swallow.
-        grep -s "^${key}" "$REPO_ROOT/vesl.toml" 2>/dev/null \
-            | head -1 \
-            | sed 's/.*= *"\(.*\)"/\1/' \
-            || true
-    fi
-}
-
-if [[ -z "${NOCK_HOME:-}" ]]; then
-    NOCK_HOME="$(read_toml_key nock_home)"
-fi
-if [[ -z "${NOCK_HOME:-}" ]]; then
-    NOCK_HOME="../nockchain"
-fi
-
-if [[ -z "${VESL_HOME:-}" ]]; then
-    VESL_HOME="$(read_toml_key vesl_home)"
-fi
-if [[ -z "${VESL_HOME:-}" ]]; then
-    VESL_HOME="../vesl"
-fi
+NOCK_HOME="../nockchain"
+VESL_HOME="../vesl-core"
 
 # Resolve relative paths against repo root so symlinks are correct.
 resolve_home() {
@@ -87,13 +76,43 @@ resolve_home() {
 NOCK_HOME="$(resolve_home NOCK_HOME "$NOCK_HOME" hoon/common/v2)"
 VESL_HOME="$(resolve_home VESL_HOME "$VESL_HOME" protocol/lib/vesl-graft.hoon)"
 
+# Compute a relative path from `$2` (the symlink's parent directory) to
+# `$1` (an absolute target path). Portable-ish: prefers GNU `realpath
+# --relative-to` when available (Linux + Homebrew coreutils), falls
+# back to Python 3 otherwise (macOS default). Both produce the same
+# canonical relative path, which is what we commit to git so the repo
+# is host-independent.
+relpath() {
+    local target="$1"
+    local from_dir="$2"
+    if command -v realpath >/dev/null 2>&1 && \
+       realpath --help 2>&1 | grep -q relative-to; then
+        realpath --relative-to="$from_dir" "$target"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import os.path,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" \
+            "$target" "$from_dir"
+    else
+        echo "Error: neither GNU realpath nor python3 available; can't compute relative path." >&2
+        echo "       Install coreutils (brew install coreutils) or python3." >&2
+        exit 1
+    fi
+}
+
 link() {
     local target="$1"
     local dest="$2"
+    local dest_dir
+    dest_dir="$(dirname "$dest")"
+    # Convert the absolute target to a repo-relative path so the
+    # symlink is host-independent — can be committed and resolves on
+    # any machine where the sibling checkout exists at the expected
+    # location relative to the repo root.
+    local rel_target
+    rel_target="$(relpath "$target" "$dest_dir")"
     if [[ -L "$dest" ]]; then
         local current
         current="$(readlink "$dest")"
-        if [[ "$current" == "$target" ]]; then
+        if [[ "$current" == "$rel_target" ]]; then
             echo "  $(basename "$dest"): already linked"
             return
         fi
@@ -102,8 +121,8 @@ link() {
         echo "Error: $dest exists and is not a symlink. Refusing to clobber." >&2
         exit 1
     fi
-    ln -s "$target" "$dest"
-    echo "  $(basename "$dest") -> $target"
+    ln -s "$rel_target" "$dest"
+    echo "  $(basename "$dest") -> $rel_target"
 }
 
 mkdir -p "$HOON_DIR/lib"
@@ -138,7 +157,27 @@ echo "Linking vesl hoon libs from $VESL_HOME ..."
 link "$VESL_HOME/protocol/lib/vesl-graft.hoon"          "$HOON_DIR/lib/vesl-graft.hoon"
 link "$VESL_HOME/protocol/lib/vesl-merkle.hoon"         "$HOON_DIR/lib/vesl-merkle.hoon"
 link "$VESL_HOME/protocol/lib/vesl-prover.hoon"         "$HOON_DIR/lib/vesl-prover.hoon"
-link "$VESL_HOME/protocol/lib/vesl-stark-verifier.hoon" "$HOON_DIR/lib/vesl-stark-verifier.hoon"
 link "$VESL_HOME/protocol/lib/vesl-verifier.hoon"       "$HOON_DIR/lib/vesl-verifier.hoon"
+
+# vesl-stark-verifier.hoon is INTENTIONALLY vendored (not symlinked).
+# It carries a local hoonc-strict-compile patch (the `?=(%& -.result)`
+# narrowing at +verify) that was never merged into upstream Vesl. Any
+# VESL_HOME checkout without the patch produces a nest-fail ~90
+# seconds into the compile — see the header comment in the vendored
+# file for the exact diff against upstream. When upstream merges the
+# fix, delete the vendored copy and add the symlink back here.
+if [[ -L "$HOON_DIR/lib/vesl-stark-verifier.hoon" ]]; then
+    echo "  vesl-stark-verifier.hoon: replacing stale symlink with vendored copy"
+    rm "$HOON_DIR/lib/vesl-stark-verifier.hoon"
+    cp "$VESL_HOME/protocol/lib/vesl-stark-verifier.hoon" \
+       "$HOON_DIR/lib/vesl-stark-verifier.hoon"
+    echo "  vesl-stark-verifier.hoon: vendored from $VESL_HOME (was symlink)"
+elif [[ ! -e "$HOON_DIR/lib/vesl-stark-verifier.hoon" ]]; then
+    echo "Error: $HOON_DIR/lib/vesl-stark-verifier.hoon missing." >&2
+    echo "       Vendored copy should be checked in. Restore from git." >&2
+    exit 1
+else
+    echo "  vesl-stark-verifier.hoon: vendored (local patch; upstream PR pending)"
+fi
 
 echo "Done."

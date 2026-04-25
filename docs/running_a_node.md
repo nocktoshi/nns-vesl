@@ -94,14 +94,33 @@ follower's anchor loop is a no-op in this mode (see
 
 ### Chain mode
 
+Three flavours of chain mode, chosen by `settlement_mode`:
+
+| Mode | What it means | Typical use |
+|---|---|---|
+| `fakenet` | Real Nockchain protocol, single-node test fabric, deterministic | dev / CI |
+| `dumbnet` | Public dev network with real-ish chain but throwaway value | integration, staging |
+| `chain`   | Alias accepted by the config parser, treated as `dumbnet` | scripts that hard-code `"chain"` |
+| `mainnet` | Production | real deploys |
+
+Minimum chain-mode config:
+
 ```toml
-settlement_mode = "chain"
-chain_endpoint  = "http://localhost:50051"  # your Nockchain gRPC
-tx_fee          = 100                        # optional, nicks per settle tx
+settlement_mode = "dumbnet"                  # or "fakenet", "mainnet"
+chain_endpoint  = "https://localhost:5556"   # your Nockchain gRPC (TLS)
+tx_fee          = 256                         # optional, nicks per settle tx
 ```
 
-With these three lines the follower's two loops start actually doing
-work — anchor advance every 10 s, claim replay every 2 s.
+**`chain_endpoint` can be HTTP or HTTPS.** If HTTPS, the hull's gRPC
+client uses rustls with webpki roots; the `aws-lc-rs` provider is
+installed at process start (see `src/main.rs`), which avoids the
+"Could not automatically determine the process-level CryptoProvider"
+panic that rustls 0.23 throws when multiple backends are visible.
+
+With these lines the follower's two loops start doing work —
+anchor advance every 10 s, claim replay every 2 s. Check
+`curl -s localhost:3000/status | jq .follower` after ~30 s to
+confirm `chain_tip_height` is populated.
 
 ## 4. Run
 
@@ -256,7 +275,8 @@ If `/status.follower.chain_tip_height == null` in chain mode:
 
 ```bash
 # 1. confirm chain endpoint reachable
-grpcurl -plaintext localhost:50051 list | head -5
+#    (-plaintext for http://, omit for https://)
+grpcurl -plaintext localhost:5556 list | head -5
 
 # 2. crank tracing to see what the follower attempts
 RUST_LOG=info,nns_vesl::chain_follower=trace,nns_vesl::chain=debug nns
@@ -361,6 +381,30 @@ That's usually fine (new kernel can read older state as long as the
 `+$state` shape is backwards-compatible), but some peek paths may hit
 deterministic exits on exotic edge cases. The `/proof` handler has a
 mirror-cache fallback for this specifically.
+
+### Troubleshooting: `nest-fail` during `make install`
+
+If `hoonc` aborts a fresh build with a trace like:
+
+```
+nest-fail
+-have.[i=@tD t=""]
+-need.@
+/lib/vesl-stark-verifier.hoon::[541 27].[541 35]
+```
+
+that used to mean `$VESL_HOME` was checked out to a commit whose
+`vesl-stark-verifier.hoon` had drifted from what NNS expected. It is
+now auto-resolved: `vesl-stark-verifier.hoon` is **vendored** (checked
+into this repo at `hoon/lib/vesl-stark-verifier.hoon` rather than
+symlinked). `scripts/setup-hoon-tree.sh` leaves the vendored file in
+place even when you re-run it. The header banner at the top of the
+file documents the upstream divergence and the refresh procedure for
+the day the patch lands in vesl main.
+
+If you still see the nest-fail after pulling NNS, your checkout is
+missing the vendored copy — `git status hoon/lib/vesl-stark-verifier.hoon`
+and `git checkout` it.
 
 ## 9. Chain-replay bootstrap (chain mode)
 

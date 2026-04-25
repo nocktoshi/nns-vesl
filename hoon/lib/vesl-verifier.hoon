@@ -1,1 +1,1 @@
-REDACTED/vesl/protocol/lib/vesl-verifier.hoon
+../../../vesl-core/protocol/lib/vesl-verifier.hoon

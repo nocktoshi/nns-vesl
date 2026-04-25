@@ -1,1 +1,1 @@
-REDACTED/vesl/protocol/lib/vesl-graft.hoon
+../../../vesl-core/protocol/lib/vesl-graft.hoon

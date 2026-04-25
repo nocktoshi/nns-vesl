@@ -1,9 +1,12 @@
 # nns-vesl configuration.
 # Environment variables override these; CLI flags override everything.
-
-nock_home = "../nockchain"
-vesl_home = "../vesl-core"
-
+#
+# Sibling-repo paths (`nockchain`, `vesl-core`) are NOT configured
+# here — they are hard-coded to `../nockchain` and `../vesl-core`
+# relative to this repo in both `scripts/setup-hoon-tree.sh` and
+# `Cargo.toml`. If your checkouts live elsewhere, symlink them at
+# the expected paths instead of adding config.
+#
 # Hull HTTP API port (default: 3000)
 # api_port = 3000
 
