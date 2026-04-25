@@ -37,6 +37,19 @@ use tokio::sync::Mutex;
 
 use crate::types::{ClaimLifecycleStatus, ClaimStatusResponse, Registration, RegistrationStatus};
 
+/// Hull-side state: mirror JSON, paths, settlement config, follower
+/// telemetry. **Lock ordering:** never acquire [`AppState::hull`] while
+/// holding [`AppState::kernel`]. Kernel work (`peek`/`poke`) may run
+/// concurrently with short hull reads (`GET /status`) as long as callers
+/// `drop(kernel)` before locking hull.
+#[derive(Debug)]
+pub struct HullState {
+    pub mirror: Mirror,
+    pub output_dir: PathBuf,
+    pub settlement: vesl_core::SettlementConfig,
+    pub follower: FollowerObservability,
+}
+
 pub const MIRROR_FILE: &str = ".nns-mirror.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -277,17 +290,23 @@ impl FollowerObservability {
     }
 }
 
-/// Shared hull state passed into every handler.
+/// Shared hull + kernel state. The kernel mutex serializes all Nock I/O;
+/// the hull mutex covers the mirror, settlement snapshot, and follower
+/// telemetry so `GET /status` never waits on a long `%advance-tip` poke.
 pub struct AppState {
-    pub app: NockApp,
-    pub mirror: Mirror,
-    pub output_dir: PathBuf,
-    pub settlement: vesl_core::SettlementConfig,
-    /// Phase 7.1 runtime telemetry. See [`FollowerObservability`].
-    pub follower: FollowerObservability,
+    pub kernel: Mutex<NockApp>,
+    pub hull: Mutex<HullState>,
 }
 
-pub type SharedState = Arc<Mutex<AppState>>;
+pub type SharedState = Arc<AppState>;
+
+impl HullState {
+    pub fn persist_mirror(&self) {
+        if let Err(e) = self.mirror.save(&self.output_dir) {
+            tracing::error!("failed to persist mirror: {e}");
+        }
+    }
+}
 
 impl AppState {
     pub fn new(
@@ -297,11 +316,13 @@ impl AppState {
     ) -> Self {
         let mirror = Mirror::load(&output_dir);
         Self {
-            app,
-            mirror,
-            output_dir,
-            settlement,
-            follower: FollowerObservability::default(),
+            kernel: Mutex::new(app),
+            hull: Mutex::new(HullState {
+                mirror,
+                output_dir,
+                settlement,
+                follower: FollowerObservability::default(),
+            }),
         }
     }
 
@@ -317,36 +338,15 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// Mirror-only flush. Cheap (~JSON write) and safe to call on
-    /// every mutation. Use for register-handler pending inserts where
-    /// the kernel is untouched, so we don't pay a checkpoint cost per
-    /// pending reservation.
-    pub fn persist(&self) {
-        if let Err(e) = self.mirror.save(&self.output_dir) {
-            tracing::error!("failed to persist mirror: {e}");
-        }
-    }
-
-    /// Full flush: force a kernel checkpoint then save the mirror.
-    /// Use after every successful kernel poke so the on-disk state
-    /// matches the in-memory state even if the process dies before
-    /// the next periodic save would have fired. Errors are logged
-    /// but do not fail the caller — we prefer returning the HTTP
-    /// response to losing the mutation because of a transient disk
-    /// issue. The mirror write still happens even if the kernel save
-    /// fails, so `/status` and `/resolve` stay consistent with what
-    /// the handler already told the client.
-    ///
-    /// Note: `NockApp::save_blocking` expects the nockapp's internal
-    /// task machinery to be alive, which it is as long as we hold
-    /// the mutex guard on `self`. This is the *only* place we write
-    /// kernel checkpoints — the nockapp's periodic save tick never
-    /// runs because we don't drive `app.run()`.
-    pub async fn persist_all(&mut self) {
-        if let Err(e) = self.app.save_blocking().await {
+    /// Full flush: kernel checkpoint then mirror JSON. **Lock order:**
+    /// kernel is acquired and released before touching `hull`, so no
+    /// code waits on `hull` while holding `kernel`.
+    pub async fn persist_all(&self) {
+        if let Err(e) = self.kernel.lock().await.save_blocking().await {
             tracing::error!("failed to save kernel checkpoint: {e:?}");
         }
-        if let Err(e) = self.mirror.save(&self.output_dir) {
+        let h = self.hull.lock().await;
+        if let Err(e) = h.mirror.save(&h.output_dir) {
             tracing::error!("failed to persist mirror: {e}");
         }
     }

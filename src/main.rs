@@ -7,8 +7,6 @@ use std::sync::Arc;
 use nockapp::kernel::boot;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
-use tokio::sync::Mutex;
-
 use nns_vesl::{
     api,
     config::{NnsConfig, NnsToml},
@@ -102,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let state = Arc::new(Mutex::new(AppState::new(app, state_dir, settlement)));
+    let state = Arc::new(AppState::new(app, state_dir, settlement));
     let _follower = nns_vesl::chain_follower::spawn(state.clone());
 
     // --- Start HTTP server ---
@@ -137,8 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     {
-        let mut st = state.lock().await;
-        st.persist_all().await;
+        state.persist_all().await;
     }
 
     serve_result

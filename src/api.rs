@@ -39,7 +39,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nockapp::noun::slab::NounSlab;
+use nockapp::NockApp;
 use nockapp::wire::{SystemWire, Wire};
+use tokio::sync::Mutex as TokioMutex;
 use serde::Serialize;
 use serde_json::json;
 use tokio::time::timeout;
@@ -48,9 +50,10 @@ use tower_http::cors::{Any, CorsLayer};
 const POKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn poke_with_timeout(
-    app: &mut nockapp::NockApp,
+    kernel: &TokioMutex<NockApp>,
     slab: NounSlab,
 ) -> Result<Vec<NounSlab>, String> {
+    let mut app = kernel.lock().await;
     match timeout(POKE_TIMEOUT, app.poke(SystemWire.to_wire(), slab)).await {
         Ok(Ok(effects)) => Ok(effects),
         Ok(Err(e)) => Err(format!("kernel error: {e:?}")),
@@ -176,34 +179,50 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let mut st = state.lock().await;
-    // `pending_batch_count` is the size of the settlement pending
-    // window — what /pending-batch would return — and is distinct
-    // from `pending_count` (pending *reservations* that haven't been
-    // %claim'd yet). Both are useful surfaces.
-    let claim_id = st.mirror.snapshot.as_ref().map(|s| s.claim_id).unwrap_or(0);
-    let pending_batch_count = claim_id.saturating_sub(st.mirror.last_settled_claim_id);
+    // Hull first so we never hold the kernel mutex while waiting on
+    // hull I/O — keeps `/status` responsive during long `%advance-tip`
+    // pokes in the follower.
+    let (
+        settlement_mode,
+        chain_endpoint,
+        names_count,
+        pending_count,
+        registered_count,
+        snapshot,
+        last_settled_claim_id,
+        pending_batch_count,
+        follower,
+    ) = {
+        let h = state.hull.lock().await;
+        let claim_id = h.mirror.snapshot.as_ref().map(|s| s.claim_id).unwrap_or(0);
+        let pending_batch_count = claim_id.saturating_sub(h.mirror.last_settled_claim_id);
+        (
+            h.settlement.mode.to_string(),
+            h.settlement.chain_endpoint.clone(),
+            h.mirror.names.len(),
+            h.mirror.by_status(RegistrationStatus::Pending).len(),
+            h.mirror.by_status(RegistrationStatus::Registered).len(),
+            h.mirror.snapshot.clone(),
+            h.mirror.last_settled_claim_id,
+            pending_batch_count,
+            h.follower.clone(),
+        )
+    };
 
-    // Phase 7.1: follower / anchor observability. Peek the kernel's
-    // authoritative anchor; fall back to None if the peek fails (the
-    // follower telemetry below surfaces the error separately so the
-    // operator still sees something).
-    let anchor_kernel = st
-        .app
-        .peek(build_anchor_peek())
-        .await
-        .ok()
-        .and_then(|slab| decode_anchor(&slab).ok());
+    let anchor_kernel = {
+        let mut k = state.kernel.lock().await;
+        k.peek(build_anchor_peek())
+            .await
+            .ok()
+            .and_then(|slab| decode_anchor(&slab).ok())
+    };
 
-    let follower = st.follower.clone();
     let (anchor_lag_blocks, follower_is_caught_up) = match (
         follower.last_chain_tip_height,
         anchor_kernel.as_ref().map(|a| a.tip_height),
     ) {
         (Some(chain_tip), Some(anchor_tip)) => {
             let lag = chain_tip.saturating_sub(anchor_tip);
-            // "caught up" = within one batch of the chain tip accounting
-            // for the deliberate finality lag.
             let caught_up = lag <= crate::chain_follower::DEFAULT_FINALITY_DEPTH + 1;
             (Some(lag), Some(caught_up))
         }
@@ -215,13 +234,13 @@ async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
         .map(|t| crate::state::AppState::now_epoch_ms().saturating_sub(t) / 1000);
 
     Json(json!({
-        "settlement_mode": st.settlement.mode.to_string(),
-        "chain_endpoint": st.settlement.chain_endpoint.clone(),
-        "names_count": st.mirror.names.len(),
-        "pending_count": st.mirror.by_status(RegistrationStatus::Pending).len(),
-        "registered_count": st.mirror.by_status(RegistrationStatus::Registered).len(),
-        "snapshot": st.mirror.snapshot,
-        "last_settled_claim_id": st.mirror.last_settled_claim_id,
+        "settlement_mode": settlement_mode,
+        "chain_endpoint": chain_endpoint,
+        "names_count": names_count,
+        "pending_count": pending_count,
+        "registered_count": registered_count,
+        "snapshot": snapshot,
+        "last_settled_claim_id": last_settled_claim_id,
         "pending_batch_count": pending_batch_count,
         "anchor": anchor_kernel.as_ref().map(|a| json!({
             "tip_height": a.tip_height,
@@ -274,16 +293,22 @@ async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
 async fn anchor_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let mut st = state.lock().await;
+    let (follower, settlement_mode, chain_endpoint) = {
+        let h = state.hull.lock().await;
+        (
+            h.follower.clone(),
+            h.settlement.mode.to_string(),
+            h.settlement.chain_endpoint.clone(),
+        )
+    };
 
-    let anchor_kernel = st
-        .app
-        .peek(build_anchor_peek())
-        .await
-        .ok()
-        .and_then(|slab| decode_anchor(&slab).ok());
-
-    let follower = st.follower.clone();
+    let anchor_kernel = {
+        let mut k = state.kernel.lock().await;
+        k.peek(build_anchor_peek())
+            .await
+            .ok()
+            .and_then(|slab| decode_anchor(&slab).ok())
+    };
 
     // If we have neither a kernel anchor nor a single chain-tip
     // observation, we're completely blind — 503 is more useful than
@@ -325,8 +350,8 @@ async fn anchor_handler(
         "last_error_at_epoch_ms":              follower.last_error_at_epoch_ms,
         "finality_depth":                      crate::chain_follower::DEFAULT_FINALITY_DEPTH,
         "max_advance_batch":                   crate::chain_follower::DEFAULT_MAX_ADVANCE_BATCH,
-        "settlement_mode":                     st.settlement.mode.to_string(),
-        "chain_endpoint":                      st.settlement.chain_endpoint.clone(),
+        "settlement_mode":                     settlement_mode,
+        "chain_endpoint":                      chain_endpoint,
     })))
 }
 
@@ -391,20 +416,21 @@ async fn register_handler(
 
     let name = req.name.trim().to_string();
     let address = req.address.trim().to_string();
-    let mut st = state.lock().await;
 
     // Pending name reservations live entirely in the hull mirror — the
     // kernel only knows about claimed (registered) names. This keeps
     // the on-kernel state, and thus the Merkle root the graft commits
     // to, limited to the canonical registry.
-    if let Some(existing) = st.mirror.names.get(&name) {
-        match existing.status {
-            RegistrationStatus::Registered => {
-                return Err(bad_request("Name already registered"));
-            }
-            RegistrationStatus::Pending => {
-                // Legacy worker returns the full pending object with 200.
-                return Ok(Json(serde_json::to_value(existing.clone()).unwrap()));
+    {
+        let h = state.hull.lock().await;
+        if let Some(existing) = h.mirror.names.get(&name) {
+            match existing.status {
+                RegistrationStatus::Registered => {
+                    return Err(bad_request("Name already registered"));
+                }
+                RegistrationStatus::Pending => {
+                    return Ok(Json(serde_json::to_value(existing.clone()).unwrap()));
+                }
             }
         }
     }
@@ -412,15 +438,17 @@ async fn register_handler(
     // Mirror can be stale (e.g. if cache was cleared). Ask the kernel
     // before creating a new pending reservation so register/claim stays
     // consistent with kernel authority.
-    let owner_slab = st
-        .app
-        .peek(build_owner_peek(&name))
-        .await
-        .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+    let owner_slab = {
+        let mut k = state.kernel.lock().await;
+        k.peek(build_owner_peek(&name))
+            .await
+            .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?
+    };
     if let Some(entry) =
         decode_owner(&owner_slab).map_err(|e| server_error(format!("owner decode failed: {e}")))?
     {
-        st.mirror.insert(Registration {
+        let mut h = state.hull.lock().await;
+        h.mirror.insert(Registration {
             address: entry.owner,
             name: name.clone(),
             status: RegistrationStatus::Registered,
@@ -428,7 +456,7 @@ async fn register_handler(
             date: None,
             tx_hash: Some(entry.tx_hash),
         });
-        st.persist();
+        h.persist_mirror();
         return Err(bad_request("Name already registered"));
     }
 
@@ -441,8 +469,11 @@ async fn register_handler(
         date: None,
         tx_hash: None,
     };
-    st.mirror.insert(reg.clone());
-    st.persist();
+    {
+        let mut h = state.hull.lock().await;
+        h.mirror.insert(reg.clone());
+        h.persist_mirror();
+    }
 
     Ok(Json(json!({
         "address": reg.address,
@@ -466,63 +497,76 @@ async fn claim_handler(
     let address = req.address.trim().to_string();
     let tx_hash = req.tx_hash.as_deref().map(str::trim);
 
-    let mut st = state.lock().await;
-
-    let pending = st
-        .mirror
-        .names
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| bad_request("no pending registration"))?;
-    if pending.status != RegistrationStatus::Pending {
-        return Err(bad_request("already registered"));
-    }
-    if pending.address != address {
-        return Err(bad_request("address does not match pending registration"));
-    }
+    let (pending, settlement) = {
+        let h = state.hull.lock().await;
+        let pending = h
+            .mirror
+            .names
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| bad_request("no pending registration"))?;
+        if pending.status != RegistrationStatus::Pending {
+            return Err(bad_request("already registered"));
+        }
+        if pending.address != address {
+            return Err(bad_request("address does not match pending registration"));
+        }
+        if !matches!(h.settlement.mode, vesl_core::SettlementMode::Local)
+            && tx_hash.map_or(true, str::is_empty)
+        {
+            return Err(bad_request("missing txHash"));
+        }
+        (pending, h.settlement.clone())
+    };
 
     let fee = payment::fee_for_name(&name);
-    if !matches!(st.settlement.mode, vesl_core::SettlementMode::Local)
-        && tx_hash.map_or(true, str::is_empty)
-    {
-        return Err(bad_request("missing txHash"));
-    }
-
-    let tx_hash = payment::verify(&st.settlement, &address, &name, fee, tx_hash)
+    let tx_hash = payment::verify(&settlement, &address, &name, fee, tx_hash)
         .await
         .map_err(|e| bad_request(format!("no valid payment: {e}")))?;
     let note = ClaimNoteV1::new(name.clone(), address.clone(), tx_hash.clone());
-    let _chain_submit = crate::chain::submit_claim_note(&st.settlement, &note)
+    let _chain_submit = crate::chain::submit_claim_note(&settlement, &note)
         .await
         .map_err(|e| server_error(format!("claim note submit failed: {e}")))?;
-    st.mirror.enqueue_claim(
-        note.claim_id.clone(),
-        address,
-        name,
-        fee,
-        tx_hash.clone(),
-    );
-    st.persist();
 
-    if matches!(st.settlement.mode, vesl_core::SettlementMode::Local) {
-        drop(st);
+    let is_local = matches!(settlement.mode, vesl_core::SettlementMode::Local);
+    {
+        let mut h = state.hull.lock().await;
+        h.mirror.enqueue_claim(
+            note.claim_id.clone(),
+            address,
+            name,
+            fee,
+            tx_hash.clone(),
+        );
+        h.persist_mirror();
+    }
+
+    if is_local {
         crate::chain_follower::process_once(&state)
             .await
             .map_err(|e| server_error(format!("local replay failed: {e}")))?;
-        st = state.lock().await;
     }
 
-    let status = st
-        .mirror
-        .claim_status(&note.claim_id)
-        .map(|s| s.status)
-        .unwrap_or(ClaimLifecycleStatus::Submitted);
-    if matches!(status, ClaimLifecycleStatus::Rejected) {
-        let reason = st
+    let (status, reason_opt, registration) = {
+        let h = state.hull.lock().await;
+        let status = h
             .mirror
             .claim_status(&note.claim_id)
-            .and_then(|s| s.reason)
-            .unwrap_or_else(|| "claim rejected".into());
+            .map(|s| s.status)
+            .unwrap_or(ClaimLifecycleStatus::Submitted);
+        let reason = if matches!(status, ClaimLifecycleStatus::Rejected) {
+            h.mirror
+                .claim_status(&note.claim_id)
+                .and_then(|s| s.reason)
+        } else {
+            None
+        };
+        let registration = h.mirror.names.get(&note.name).cloned();
+        (status, reason, registration)
+    };
+
+    if matches!(status, ClaimLifecycleStatus::Rejected) {
+        let reason = reason_opt.unwrap_or_else(|| "claim rejected".into());
         if reason.contains("name already registered") {
             return Err(bad_request("Name already registered"));
         }
@@ -531,7 +575,6 @@ async fn claim_handler(
         }
         return Err(bad_request(reason));
     }
-    let registration = st.mirror.names.get(&note.name).cloned();
 
     Ok(Json(ClaimSubmissionResponse {
         message: "Claim submitted; awaiting chain replay".into(),
@@ -556,12 +599,10 @@ async fn set_primary_handler(
     let name = req.name.trim().to_string();
     let address = req.address.trim().to_string();
 
-    let mut st = state.lock().await;
-
     // The kernel is the source of truth for ownership. We don't
     // short-circuit on mirror state — if the mirror is stale we'd
     // rather let the kernel decide and trust its %primary-error.
-    let effects = poke_with_timeout(&mut st.app, build_set_primary_poke(&address, &name))
+    let effects = poke_with_timeout(&state.kernel, build_set_primary_poke(&address, &name))
         .await
         .map_err(|msg| server_error(format!("kernel set-primary poke failed: {msg}")))?;
 
@@ -579,8 +620,11 @@ async fn set_primary_handler(
         ))
     })?;
 
-    st.mirror.set_primary(ok_addr.clone(), ok_name.clone());
-    st.persist_all().await;
+    {
+        let mut h = state.hull.lock().await;
+        h.mirror.set_primary(ok_addr.clone(), ok_name.clone());
+    }
+    state.persist_all().await;
 
     Ok(Json(SetPrimaryResponse {
         address: ok_addr,
@@ -601,8 +645,8 @@ async fn claim_status_handler(
     if claim_id.is_empty() {
         return Err(bad_request("missing claim_id parameter"));
     }
-    let st = state.lock().await;
-    let status = st.mirror.claim_status(&claim_id).ok_or_else(|| {
+    let h = state.hull.lock().await;
+    let status = h.mirror.claim_status(&claim_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
@@ -616,24 +660,20 @@ async fn claim_status_handler(
 async fn snapshot_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let mut st = state.lock().await;
-
-    // Try the peek-backed authoritative path first so the response
-    // is never stale even if the mirror cache was wiped. On a kernel
-    // error fall back to the cached mirror snapshot — this endpoint
-    // is diagnostic and should not 500 on transient peek failures.
     let peek_slab = build_snapshot_peek();
-    let result = st
-        .app
-        .peek(peek_slab)
-        .await
-        .map_err(|e| format!("{e:?}"))
-        .and_then(|slab| decode_snapshot(&slab));
+    let result = {
+        let mut k = state.kernel.lock().await;
+        k.peek(peek_slab)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|slab| decode_snapshot(&slab))
+    };
 
     let snap = match result {
         Ok(s) => s,
         Err(_) => {
-            return match st.mirror.snapshot.clone() {
+            let h = state.hull.lock().await;
+            return match h.mirror.snapshot.clone() {
                 Some(cached) => Ok(Json(serde_json::to_value(cached).unwrap())),
                 None => Err((
                     StatusCode::NOT_FOUND,
@@ -641,7 +681,7 @@ async fn snapshot_handler(
                         error: "no commitment yet — registry is empty".into(),
                     }),
                 )),
-            }
+            };
         }
     };
 
@@ -657,10 +697,11 @@ async fn snapshot_handler(
         ));
     }
 
-    // Refresh the mirror cache opportunistically so subsequent
-    // /status calls don't peek.
-    st.mirror.set_snapshot(snap.claim_id, &snap.hull, &snap.root);
-    st.persist();
+    {
+        let mut h = state.hull.lock().await;
+        h.mirror.set_snapshot(snap.claim_id, &snap.hull, &snap.root);
+        h.persist_mirror();
+    }
 
     Ok(Json(json!({
         "claim_id": snap.claim_id,
@@ -672,27 +713,30 @@ async fn snapshot_handler(
 async fn settle_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<SettleResponse>, (StatusCode, Json<ErrorBody>)> {
-    let mut st = state.lock().await;
-
-    // Peek the pending batch first — the kernel-side `%settle-batch`
-    // arm walks the same window internally, but we snapshot it here
-    // so the HTTP response can tell the client exactly which names
-    // were packaged. Doing the peek before the poke is safe: nothing
-    // else mutates the kernel while the lock is held.
-    let pending_slab = st
-        .app
-        .peek(build_pending_batch_peek())
-        .await
-        .map_err(|e| server_error(format!("pending-batch peek failed: {e:?}")))?;
-    let names = decode_pending_batch(&pending_slab)
-        .map_err(|e| server_error(format!("pending-batch decode failed: {e}")))?;
-
-    // Dispatch the single %settle-batch poke. The kernel handles
-    // batch selection, proof generation, note-id derivation, and
-    // graft dispatch in one atomic step.
-    let effects = poke_with_timeout(&mut st.app, build_settle_batch_poke())
-        .await
-        .map_err(|msg| server_error(format!("kernel settle-batch poke failed: {msg}")))?;
+    let (names, effects) = {
+        let mut k = state.kernel.lock().await;
+        let pending_slab = k
+            .peek(build_pending_batch_peek())
+            .await
+            .map_err(|e| server_error(format!("pending-batch peek failed: {e:?}")))?;
+        let names = decode_pending_batch(&pending_slab)
+            .map_err(|e| server_error(format!("pending-batch decode failed: {e}")))?;
+        let effects = match timeout(POKE_TIMEOUT, k.poke(SystemWire.to_wire(), build_settle_batch_poke()))
+            .await
+        {
+            Ok(Ok(effects)) => effects,
+            Ok(Err(e)) => {
+                return Err(server_error(format!("kernel settle-batch poke failed: {e:?}")));
+            }
+            Err(_) => {
+                return Err(server_error(format!(
+                    "kernel poke exceeded {}s timeout",
+                    POKE_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        (names, effects)
+    };
 
     if let Some(err) = first_error_message(&effects) {
         // `nothing to settle` (empty window), `note already settled`
@@ -716,21 +760,24 @@ async fn settle_handler(
         server_error("settle returned %batch-settled without %vesl-settled")
     })?;
 
-    // Advance the mirror's last-settled cache. The kernel already
-    // bumped its own counter — this is just a fast-read cache for
-    // /status and /pending-batch.
-    st.mirror.set_last_settled_claim_id(batch.claim_count);
-    st.mirror
-        .set_snapshot(batch.claim_count, &settled.hull, &settled.root);
     let note_id_hex = hex_encode(&batch.note_id);
-    let settlement_tx = match crate::chain::post_settlement_receipt(&st.settlement, &note_id_hex).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::warn!("settlement chain post skipped: {e}");
-            None
-        }
+    let settlement_for_post = {
+        let mut h = state.hull.lock().await;
+        let settlement_for_post = h.settlement.clone();
+        h.mirror.set_last_settled_claim_id(batch.claim_count);
+        h.mirror
+            .set_snapshot(batch.claim_count, &settled.hull, &settled.root);
+        settlement_for_post
     };
-    st.persist_all().await;
+    let settlement_tx =
+        match crate::chain::post_settlement_receipt(&settlement_for_post, &note_id_hex).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!("settlement chain post skipped: {e}");
+                None
+            }
+        };
+    state.persist_all().await;
 
     Ok(Json(SettleResponse {
         claim_id: batch.claim_count,
@@ -746,30 +793,29 @@ async fn settle_handler(
 async fn pending_batch_handler(
     State(state): State<SharedState>,
 ) -> Result<Json<PendingBatchResponse>, (StatusCode, Json<ErrorBody>)> {
-    let mut st = state.lock().await;
+    let (names, claim_id, last_settled_claim_id) = {
+        let mut k = state.kernel.lock().await;
+        let pending_slab = k
+            .peek(build_pending_batch_peek())
+            .await
+            .map_err(|e| server_error(format!("pending-batch peek failed: {e:?}")))?;
+        let names = decode_pending_batch(&pending_slab)
+            .map_err(|e| server_error(format!("pending-batch decode failed: {e}")))?;
 
-    let pending_slab = st
-        .app
-        .peek(build_pending_batch_peek())
-        .await
-        .map_err(|e| server_error(format!("pending-batch peek failed: {e:?}")))?;
-    let names = decode_pending_batch(&pending_slab)
-        .map_err(|e| server_error(format!("pending-batch decode failed: {e}")))?;
+        let snap_slab = k
+            .peek(build_snapshot_peek())
+            .await
+            .map_err(|e| server_error(format!("snapshot peek failed: {e:?}")))?;
+        let claim_id = decode_snapshot(&snap_slab).map(|s| s.claim_id).unwrap_or(0);
 
-    let snap_slab = st
-        .app
-        .peek(build_snapshot_peek())
-        .await
-        .map_err(|e| server_error(format!("snapshot peek failed: {e:?}")))?;
-    let claim_id = decode_snapshot(&snap_slab).map(|s| s.claim_id).unwrap_or(0);
-
-    let last_slab = st
-        .app
-        .peek(build_last_settled_peek())
-        .await
-        .map_err(|e| server_error(format!("last-settled peek failed: {e:?}")))?;
-    let last_settled_claim_id = decode_last_settled(&last_slab)
-        .map_err(|e| server_error(format!("last-settled decode failed: {e}")))?;
+        let last_slab = k
+            .peek(build_last_settled_peek())
+            .await
+            .map_err(|e| server_error(format!("last-settled peek failed: {e:?}")))?;
+        let last_settled_claim_id = decode_last_settled(&last_slab)
+            .map_err(|e| server_error(format!("last-settled decode failed: {e}")))?;
+        (names, claim_id, last_settled_claim_id)
+    };
 
     Ok(Json(PendingBatchResponse {
         claim_id,
@@ -780,44 +826,46 @@ async fn pending_batch_handler(
 }
 
 async fn pending_handler(State(state): State<SharedState>) -> Json<Vec<Registration>> {
-    let st = state.lock().await;
-    Json(st.mirror.by_status(RegistrationStatus::Pending))
+    let h = state.hull.lock().await;
+    Json(h.mirror.by_status(RegistrationStatus::Pending))
 }
 
 async fn verified_handler(State(state): State<SharedState>) -> Json<Vec<Registration>> {
-    let st = state.lock().await;
-    Json(st.mirror.by_status(RegistrationStatus::Registered))
+    let h = state.hull.lock().await;
+    Json(h.mirror.by_status(RegistrationStatus::Registered))
 }
 
 async fn resolve_handler(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
-    let mut st = state.lock().await;
-
     if let Some(name) = params.get("name") {
         if !is_valid_name(name) {
             return Err(bad_request("invalid name"));
         }
-        let existing = st
-            .mirror
-            .names
-            .get(name)
-            .filter(|r| r.status == RegistrationStatus::Registered);
-        match existing {
-            Some(r) => Ok(Json(json!({ "address": r.address }))),
+        let mirror_hit = {
+            let h = state.hull.lock().await;
+            h.mirror
+                .names
+                .get(name)
+                .filter(|r| r.status == RegistrationStatus::Registered)
+                .map(|r| r.address.clone())
+        };
+        match mirror_hit {
+            Some(addr) => Ok(Json(json!({ "address": addr }))),
             None => {
-                // Fallback to kernel authority when mirror is stale.
-                let owner_slab = st
-                    .app
-                    .peek(build_owner_peek(name))
-                    .await
-                    .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+                let owner_slab = {
+                    let mut k = state.kernel.lock().await;
+                    k.peek(build_owner_peek(name))
+                        .await
+                        .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?
+                };
                 let entry = decode_owner(&owner_slab)
                     .map_err(|e| server_error(format!("owner decode failed: {e}")))?;
                 match entry {
                     Some(entry) => {
-                        st.mirror.insert(Registration {
+                        let mut h = state.hull.lock().await;
+                        h.mirror.insert(Registration {
                             address: entry.owner.clone(),
                             name: name.clone(),
                             status: RegistrationStatus::Registered,
@@ -825,7 +873,7 @@ async fn resolve_handler(
                             date: None,
                             tx_hash: Some(entry.tx_hash),
                         });
-                        st.persist();
+                        h.persist_mirror();
                         Ok(Json(json!({ "address": entry.owner })))
                     }
                     None => Err((
@@ -841,10 +889,8 @@ async fn resolve_handler(
         if !is_valid_address(address) {
             return Err(bad_request("invalid address"));
         }
-        // One address may own many names — return its designated
-        // primary, not "whichever was registered last". Populated
-        // from kernel %primary-set effects.
-        match st.mirror.primaries.get(address) {
+        let h = state.hull.lock().await;
+        match h.mirror.primaries.get(address) {
             Some(name) => Ok(Json(json!({ "name": name }))),
             None => Err((
                 StatusCode::NOT_FOUND,
@@ -911,89 +957,80 @@ async fn proof_handler(
         _ => None,
     };
 
-    let mut st = state.lock().await;
+    let (entry, proof, snap_from_kernel, anchor) = {
+        let mut k = state.kernel.lock().await;
+        let owner_slab = k
+            .peek(build_owner_peek(&name))
+            .await
+            .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
+        let entry = decode_owner(&owner_slab)
+            .map_err(|e| server_error(format!("owner decode failed: {e}")))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorBody {
+                        error: "name not registered".into(),
+                    }),
+                )
+            })?;
 
-    // Three peeks under one mutex guard — nothing else can mutate
-    // the kernel in between, so `entry`, `proof`, and `snapshot` all
-    // observe the same `claim-id`.
-    let owner_slab = st
-        .app
-        .peek(build_owner_peek(&name))
-        .await
-        .map_err(|e| server_error(format!("owner peek failed: {e:?}")))?;
-    let entry = decode_owner(&owner_slab)
-        .map_err(|e| server_error(format!("owner decode failed: {e}")))?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "name not registered".into(),
-                }),
-            )
-        })?;
-
-    if let Some(ref addr) = expected_address {
-        if &entry.owner != addr {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorBody {
-                    error: "address does not own this name".into(),
-                }),
-            ));
-        }
-    }
-
-    let proof_slab = st
-        .app
-        .peek(build_proof_peek(&name))
-        .await
-        .map_err(|e| server_error(format!("proof peek failed: {e:?}")))?;
-    let proof = decode_proof(&proof_slab)
-        .map_err(|e| server_error(format!("proof decode failed: {e}")))?;
-
-    // Snapshot peek — tolerate a deterministic-exit by falling back
-    // to the mirror cache (same degradation `/snapshot` already
-    // performs). Keeps `/proof` functional for legacy kernels whose
-    // peek arms hit post-upgrade edge cases. If neither peek nor
-    // mirror produces a snapshot, surface a precise error.
-    let snap = match st
-        .app
-        .peek(build_snapshot_peek())
-        .await
-        .map_err(|e| format!("{e:?}"))
-        .and_then(|slab| decode_snapshot(&slab))
-    {
-        Ok(s) => (s.claim_id, hex_encode(&s.hull), hex_encode(&s.root)),
-        Err(peek_err) => match st.mirror.snapshot.clone() {
-            Some(cached) => (cached.claim_id, cached.hull, cached.root),
-            None => {
-                return Err(server_error(format!(
-                    "snapshot peek failed and mirror has no cached snapshot: {peek_err}"
-                )));
+        if let Some(ref addr) = expected_address {
+            if &entry.owner != addr {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorBody {
+                        error: "address does not own this name".into(),
+                    }),
+                ));
             }
-        },
+        }
+
+        let proof_slab = k
+            .peek(build_proof_peek(&name))
+            .await
+            .map_err(|e| server_error(format!("proof peek failed: {e:?}")))?;
+        let proof = decode_proof(&proof_slab)
+            .map_err(|e| server_error(format!("proof decode failed: {e}")))?;
+
+        let snap_from_kernel = k
+            .peek(build_snapshot_peek())
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|slab| decode_snapshot(&slab))
+            .map(|s| (s.claim_id, hex_encode(&s.hull), hex_encode(&s.root)));
+
+        let anchor = match k
+            .peek(build_anchor_peek())
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|slab| decode_anchor(&slab))
+        {
+            Ok(view) => Some(ProofAnchor {
+                tip_digest: hex_encode(&view.tip_digest),
+                tip_height: view.tip_height,
+            }),
+            Err(_) => None,
+        };
+
+        (entry, proof, snap_from_kernel, anchor)
     };
 
-    // Phase 7: best-effort anchor peek. If the kernel anchor peek
-    // fails (legacy state edge case), omit the `anchor` field and
-    // let the wallet's `light_verify` treat the proof as Phase-7-
-    // pre-freshness — the CLI rejects with exit 4 unless explicitly
-    // `--no-freshness`'d. Never 500 on anchor-peek failure; callers
-    // querying `/proof` on pre-Phase-7 state should still succeed
-    // at reading Merkle inclusion.
-    let anchor = match st
-        .app
-        .peek(build_anchor_peek())
-        .await
-        .map_err(|e| format!("{e:?}"))
-        .and_then(|slab| decode_anchor(&slab))
-    {
-        Ok(view) => Some(ProofAnchor {
-            tip_digest: hex_encode(&view.tip_digest),
-            tip_height: view.tip_height,
-        }),
-        Err(_) => None,
+    let snap = match snap_from_kernel {
+        Ok(triple) => triple,
+        Err(peek_err) => {
+            let h = state.hull.lock().await;
+            match h.mirror.snapshot.clone() {
+                Some(cached) => (cached.claim_id, cached.hull, cached.root),
+                None => {
+                    return Err(server_error(format!(
+                        "snapshot peek failed and mirror has no cached snapshot: {peek_err}"
+                    )));
+                }
+            }
+        }
     };
+
+    let last_settled_claim_id = state.hull.lock().await.mirror.last_settled_claim_id;
 
     let (_snap_claim_id, snap_hull_hex, snap_root_hex) = snap;
 
@@ -1017,7 +1054,7 @@ async fn proof_handler(
             .collect(),
         transition: TransitionProofMetadata {
             mode: "claim-window-anchor".into(),
-            settled_claim_id: st.mirror.last_settled_claim_id,
+            settled_claim_id: last_settled_claim_id,
         },
         transition_proof: None,
         anchor,
@@ -1028,25 +1065,25 @@ async fn search_handler(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ErrorBody>)> {
-    let st = state.lock().await;
+    let h = state.hull.lock().await;
 
     if let Some(address) = params.get("address") {
         if !is_valid_address(address) {
             return Err(bad_request("invalid address"));
         }
-        let pending: Vec<Registration> = st
+        let pending: Vec<Registration> = h
             .mirror
             .by_status(RegistrationStatus::Pending)
             .into_iter()
             .filter(|r| r.address == *address)
             .collect();
-        let verified: Vec<Registration> = st
+        let verified: Vec<Registration> = h
             .mirror
             .by_status(RegistrationStatus::Registered)
             .into_iter()
             .filter(|r| r.address == *address)
             .collect();
-        let primary = st.mirror.primaries.get(address).cloned();
+        let primary = h.mirror.primaries.get(address).cloned();
         let body = SearchByAddressResponse {
             address: address.clone(),
             pending,
@@ -1061,7 +1098,7 @@ async fn search_handler(
             return Err(bad_request("invalid name"));
         }
         let price = payment::fee_for_name(&name);
-        let existing = st.mirror.names.get(&name).cloned();
+        let existing = h.mirror.names.get(&name).cloned();
         let body = match existing {
             None => SearchByNameResponse {
                 name,

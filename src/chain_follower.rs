@@ -41,9 +41,9 @@ pub fn spawn(state: SharedState) -> JoinHandle<()> {
             loop {
                 if let Err(err) = tick_once(&s).await {
                     let ts = crate::state::AppState::now_epoch_ms();
-                    let mut st = s.lock().await;
-                    st.follower.record_error("claim_tick", err.clone(), ts);
-                    drop(st);
+                    let mut h = s.hull.lock().await;
+                    h.follower.record_error("claim_tick", err.clone(), ts);
+                    drop(h);
                     tracing::warn!(
                         err = %err,
                         phase = "claim_tick",
@@ -118,11 +118,11 @@ where
     Fut: Future<Output = Result<Option<ConfirmedTxPosition>, String>>,
 {
     let (pending, is_local_mode, chain_endpoint) = {
-        let st = state.lock().await;
+        let h = state.hull.lock().await;
         (
-            st.mirror.pending_claims_in_order(),
-            matches!(st.settlement.mode, vesl_core::SettlementMode::Local),
-            st.settlement.chain_endpoint.clone(),
+            h.mirror.pending_claims_in_order(),
+            matches!(h.settlement.mode, vesl_core::SettlementMode::Local),
+            h.settlement.chain_endpoint.clone(),
         )
     };
     if pending.is_empty() {
@@ -149,53 +149,64 @@ where
     });
 
     for (_height, _index, claim) in ready {
-        let mut st = state.lock().await;
-        let current = match st.mirror.submitted_claims.get(&claim.claim_id) {
-            Some(c) => c.clone(),
-            None => continue,
-        };
-        if !matches!(current.status, ClaimLifecycleStatus::Submitted | ClaimLifecycleStatus::Confirmed) {
-            continue;
+        {
+            let mut h = state.hull.lock().await;
+            let current = match h.mirror.submitted_claims.get(&claim.claim_id) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            if !matches!(
+                current.status,
+                ClaimLifecycleStatus::Submitted | ClaimLifecycleStatus::Confirmed
+            ) {
+                continue;
+            }
+            h.mirror
+                .update_claim_status(&claim.claim_id, ClaimLifecycleStatus::Confirmed, None);
         }
-        st.mirror
-            .update_claim_status(&claim.claim_id, ClaimLifecycleStatus::Confirmed, None);
 
-        let effects = match st
-            .app
-            .poke(
+        let poke_result = {
+            let mut k = state.kernel.lock().await;
+            k.poke(
                 nockapp::wire::SystemWire.to_wire(),
                 build_claim_poke(&claim.name, &claim.address, claim.fee, &claim.tx_hash),
             )
             .await
-        {
+        };
+
+        let mut h = state.hull.lock().await;
+        let effects = match poke_result {
             Ok(e) => e,
             Err(e) => {
-                st.mirror.update_claim_status(
+                h.mirror.update_claim_status(
                     &claim.claim_id,
                     ClaimLifecycleStatus::Rejected,
                     Some(format!("kernel claim poke failed: {e:?}")),
                 );
-                st.persist_all().await;
+                drop(h);
+                state.persist_all().await;
                 continue;
             }
         };
 
         if let Some(err) = first_error_message(&effects) {
-            st.mirror.update_claim_status(
+            h.mirror.update_claim_status(
                 &claim.claim_id,
                 ClaimLifecycleStatus::Rejected,
                 Some(err),
             );
-            st.persist_all().await;
+            drop(h);
+            state.persist_all().await;
             continue;
         }
         if !has_effect(&effects, "claimed") {
-            st.mirror.update_claim_status(
+            h.mirror.update_claim_status(
                 &claim.claim_id,
                 ClaimLifecycleStatus::Rejected,
                 Some("missing %claimed effect".into()),
             );
-            st.persist_all().await;
+            drop(h);
+            state.persist_all().await;
             continue;
         }
 
@@ -208,17 +219,18 @@ where
             date: Some(crate::api::iso8601_for_internal(now)),
             tx_hash: Some(claim.tx_hash.clone()),
         };
-        st.mirror.insert(reg);
+        h.mirror.insert(reg);
         if let Some((addr, primary_name)) = first_primary_set(&effects) {
-            st.mirror.set_primary(addr, primary_name);
+            h.mirror.set_primary(addr, primary_name);
         }
         if let Some(bumped) = first_claim_count_bumped(&effects) {
-            st.mirror
+            h.mirror
                 .set_snapshot(bumped.claim_count, &bumped.hull, &bumped.root);
         }
-        st.mirror
+        h.mirror
             .update_claim_status(&claim.claim_id, ClaimLifecycleStatus::Finalized, None);
-        st.persist_all().await;
+        drop(h);
+        state.persist_all().await;
     }
     Ok(())
 }
@@ -246,10 +258,10 @@ pub async fn advance_anchor_once(
     state: &SharedState,
 ) -> Result<Option<AnchorAdvanceOutcome>, String> {
     let (is_local_mode, chain_endpoint) = {
-        let st = state.lock().await;
+        let h = state.hull.lock().await;
         (
-            matches!(st.settlement.mode, vesl_core::SettlementMode::Local),
-            st.settlement.chain_endpoint.clone(),
+            matches!(h.settlement.mode, vesl_core::SettlementMode::Local),
+            h.settlement.chain_endpoint.clone(),
         )
     };
     if is_local_mode {
@@ -262,16 +274,22 @@ pub async fn advance_anchor_once(
     // Read the kernel's current anchor height via peek. Missing peek
     // responses mean the kernel is not ready; treat as transient.
     let current_anchor_height = {
-        let mut st = state.lock().await;
-        let result = st.app.peek(build_anchor_peek()).await.map_err(|e| {
-            let msg = format!("anchor peek failed: {e:?}");
-            let ts = crate::state::AppState::now_epoch_ms();
-            st.follower.record_error("anchor_peek", msg.clone(), ts);
-            msg
-        })?;
-        match decode_anchor(&result) {
-            Ok(view) => view.tip_height,
-            Err(_) => 0,
+        let peek_result = {
+            let mut k = state.kernel.lock().await;
+            k.peek(build_anchor_peek()).await
+        };
+        match peek_result {
+            Ok(result) => match decode_anchor(&result) {
+                Ok(view) => view.tip_height,
+                Err(_) => 0,
+            },
+            Err(e) => {
+                let msg = format!("anchor peek failed: {e:?}");
+                let ts = crate::state::AppState::now_epoch_ms();
+                let mut h = state.hull.lock().await;
+                h.follower.record_error("anchor_peek", msg.clone(), ts);
+                return Err(msg);
+            }
         }
     };
 
@@ -288,15 +306,15 @@ pub async fn advance_anchor_once(
             // for "am I within finality horizon?" debugging even when
             // the advance itself is a no-op.
             let now = crate::state::AppState::now_epoch_ms();
-            let mut st = state.lock().await;
-            st.follower.record_chain_tip(p.current_chain_tip, now);
+            let mut h = state.hull.lock().await;
+            h.follower.record_chain_tip(p.current_chain_tip, now);
             p
         }
         Ok(None) => return Ok(None),
         Err(e) => {
             let ts = crate::state::AppState::now_epoch_ms();
-            let mut st = state.lock().await;
-            st.follower.record_error("plan", e.clone(), ts);
+            let mut h = state.hull.lock().await;
+            h.follower.record_error("plan", e.clone(), ts);
             return Err(e);
         }
     };
@@ -316,8 +334,8 @@ pub async fn advance_anchor_once(
                 // Fire-and-forget the record call — we're in an async
                 // sync closure, can't await here. Use blocking lock on
                 // the off-chance the mutex is held (fine for tests).
-                if let Ok(mut st) = s2.try_lock() {
-                    st.follower.record_error("header_fetch", msg.clone(), ts);
+                if let Ok(mut h) = s2.hull.try_lock() {
+                    h.follower.record_error("header_fetch", msg.clone(), ts);
                 }
                 msg
             })?;
@@ -325,35 +343,43 @@ pub async fn advance_anchor_once(
         return Ok(None);
     }
 
-    let mut st = state.lock().await;
-    let effects = st
-        .app
-        .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
-        .await
-        .map_err(|e| {
-            let msg = format!("advance-tip poke failed: {e:?}");
-            let ts = crate::state::AppState::now_epoch_ms();
-            st.follower.record_error("advance_poke", msg.clone(), ts);
-            msg
-        })?;
+    let poke_result = {
+        let mut k = state.kernel.lock().await;
+        k.poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
+            .await
+    };
+
+    let effects = poke_result.map_err(|e| {
+        let msg = format!("advance-tip poke failed: {e:?}");
+        let ts = crate::state::AppState::now_epoch_ms();
+        if let Ok(mut h) = state.hull.try_lock() {
+            h.follower.record_error("advance_poke", msg.clone(), ts);
+        }
+        msg
+    })?;
 
     if let Some(err) = first_error_message(&effects) {
         let msg = format!("kernel rejected %advance-tip: {err}");
         let ts = crate::state::AppState::now_epoch_ms();
-        st.follower.record_error("advance_poke", msg.clone(), ts);
+        let mut h = state.hull.lock().await;
+        h.follower.record_error("advance_poke", msg.clone(), ts);
         return Err(msg);
     }
     let Some(advanced) = first_anchor_advanced(&effects) else {
         let msg = "kernel did not emit %anchor-advanced".to_string();
         let ts = crate::state::AppState::now_epoch_ms();
-        st.follower.record_error("advance_poke", msg.clone(), ts);
+        let mut h = state.hull.lock().await;
+        h.follower.record_error("advance_poke", msg.clone(), ts);
         return Err(msg);
     };
 
     let now = crate::state::AppState::now_epoch_ms();
-    st.follower
-        .record_advance(advanced.tip_height, advanced.count, now);
-    st.persist_all().await;
+    {
+        let mut h = state.hull.lock().await;
+        h.follower
+            .record_advance(advanced.tip_height, advanced.count, now);
+    }
+    state.persist_all().await;
 
     Ok(Some(AnchorAdvanceOutcome {
         tip_height: advanced.tip_height,
