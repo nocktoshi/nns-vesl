@@ -449,6 +449,23 @@ pub async fn plan_anchor_advance(
     if horizon <= current_anchor_height {
         return Ok(None);
     }
+
+    // Bootstrap special case: when the kernel is at its default
+    // anchor (`height == 0`), jump straight to the horizon with a
+    // single-header advance instead of walking [1..N].
+    //
+    // Why: on mainnet, walking from genesis means 120k+ sequential
+    // `GetBlockDetails` RPCs. Public endpoints time out long before
+    // that completes, leaving the follower's first tick in an
+    // un-completable state forever.
+    if current_anchor_height == 0 {
+        return Ok(Some(AnchorAdvanceTarget {
+            from_height: horizon,
+            to_height: horizon,
+            current_chain_tip: tip,
+        }));
+    }
+
     let from = current_anchor_height + 1;
     let to = from
         .saturating_add(max_batch.saturating_sub(1))

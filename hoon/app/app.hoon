@@ -879,19 +879,32 @@
         ~[[%anchor-error 'empty advance']]
       ::  Validate chain linkage against current tip (or bootstrap).
       ::
+      ::  Phase 2c bootstrap: when `tip-digest` is `0x0` (fresh
+      ::  kernel, never advanced) the follower MAY seed the anchor
+      ::  with any single header at any height. We accept whatever
+      ::  `parent` and `height` it claims without cross-checking
+      ::  against prior state (there isn't any).
+      ::
+      ::  Trust model: the follower is operator-trusted for the
+      ::  bootstrap seed; wallets later verify `t_nns_digest` +
+      ::  `t_nns_height` in the proof bundle against their own
+      ::  canonical-chain view (Phase 7). If an operator seeds a
+      ::  bogus anchor, wallets detect it via anchor-binding check.
+      ::
       =/  bootstrapping=?  =(0x0 tip-digest.anchor.state)
-      =/  expected-parent=@ux
-        ?:  bootstrapping
-          `@ux`0
-        tip-digest.anchor.state
-      =/  expected-height=@ud
-        ?:  bootstrapping
-          height.i.hs
-        +(tip-height.anchor.state)
-      ?.  =(parent.i.hs expected-parent)
+      ::  Bootstrap bypass: when true, accept the first header's
+      ::  parent and height as-is (no cross-check against prior
+      ::  state — there isn't any). Tail-chain walk below still
+      ::  enforces parent-linkage from hs[0] through hs[n-1].
+      ::
+      ?.  ?|  bootstrapping
+              =(parent.i.hs tip-digest.anchor.state)
+          ==
         :_  state
         ~[[%anchor-error 'first header parent mismatch']]
-      ?.  =(height.i.hs expected-height)
+      ?.  ?|  bootstrapping
+              =(height.i.hs +(tip-height.anchor.state))
+          ==
         :_  state
         ~[[%anchor-error 'first header height off-by-one']]
       ::  Walk the rest and find the last header in a single fold.

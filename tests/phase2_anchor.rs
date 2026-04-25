@@ -105,6 +105,42 @@ async fn advance_tip_bootstrap_accepts_from_genesis() {
 }
 
 #[tokio::test]
+async fn advance_tip_bootstrap_accepts_non_zero_parent() {
+    // Phase 2c jump-to-tip bootstrap fix: the follower can seed the
+    // anchor with a header at arbitrary height whose parent is NOT
+    // 0x0. Required for mainnet, where walking from genesis would
+    // time out public RPCs long before completing.
+    //
+    // Trust model: operator is trusted for the bootstrap seed;
+    // wallets re-verify `(tip_digest, tip_height)` against their
+    // own canonical chain view (Phase 7). Pre-fix, the kernel
+    // required `parent=0x0` on first header, which forced a
+    // from-genesis walk and broke on mainnet.
+    let (_tmp, state) = boot_kernel().await;
+
+    // Single header at height 12345 with a random non-zero parent —
+    // simulating the follower jumping straight to `tip - finality_depth`.
+    let headers = vec![header_at(12_345, 0xAB, 0xCD)];
+
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
+            .await
+            .expect("advance-tip poke")
+    };
+
+    let advanced = first_anchor_advanced(&effects).expect("anchor-advanced effect");
+    assert_eq!(advanced.tip_height, 12_345);
+    assert_eq!(advanced.tip_digest, vec![0xABu8; 40]);
+    assert_eq!(advanced.count, 1);
+    assert!(
+        first_error_message(&effects).is_none(),
+        "bootstrap with non-zero parent must not emit %anchor-error",
+    );
+}
+
+#[tokio::test]
 async fn advance_tip_extends_after_bootstrap() {
     let (_tmp, state) = boot_kernel().await;
 
