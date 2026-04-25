@@ -13,6 +13,6 @@ vesl_home = "../vesl-core"
 settlement_mode = "local"
 
 # --- Chain settings (fakenet/dumbnet only) ---
-# chain_endpoint = "http://localhost:9090"
+# chain_endpoint = "https://localhost:5556"
 # tx_fee = 256
 # accept_timeout_secs = 300

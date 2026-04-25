@@ -3617,6 +3617,7 @@ dependencies = [
  "nockchain-tip5-rs",
  "nockvm",
  "nockvm_macros",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
