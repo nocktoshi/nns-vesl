@@ -1,4 +1,3 @@
-```markdown
 ---
 # NNS Architecture, Proof Model, Recursive-STARK Research, and Roadmap
 Status: consolidated architecture reference + roadmap.  
@@ -10,6 +9,7 @@ This document consolidates:
 - Implementation roadmap and current phase status.
 - Pre-production blockers and open work.
 It preserves implementation details and historical findings, but deduplicates repeated explanations. Superseded findings are retained and marked as such when they explain why the design changed.
+
 ---
 ## Table of contents
 1. [Current canonical status](#1-current-canonical-status)
@@ -26,6 +26,7 @@ It preserves implementation details and historical findings, but deduplicates re
 12. [Current todo backlog](#12-current-todo-backlog)
 13. [Known risks and edge cases](#13-known-risks-and-edge-cases)
 14. [Upstream Vesl issue draft](#14-upstream-vesl-issue-draft)
+
 ---
 # 1. Current canonical status
 ## 1.1 Decision
@@ -37,6 +38,7 @@ That means:
 - Vesl/STARK proofs make the resulting registry state stateless-verifiable by wallets.
 - Wallets trust Nockchain independently, not an NNS server.
 This is the full zkRollup shape:
+
 ```text
 Nockchain orders inputs
 NNS applies deterministic state transitions
@@ -1897,5 +1899,4 @@ Use Phase 3c step 2:
   + bundle digest check
   + wallet-side validator
   + Phase 7 freshness check before production
-```
 ```
