@@ -47,7 +47,6 @@ use nns_vesl::kernel::{
 };
 use nns_vesl::state::{hex_encode, AppState, SharedState};
 use nns_vesl::types::{ProofAnchor, ProofResponse, TransitionProofMetadata};
-use tokio::sync::Mutex;
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -76,11 +75,11 @@ async fn boot_kernel(name: &str) -> (tempfile::TempDir, SharedState) {
     )
     .await
     .expect("kernel boot");
-    let state = Arc::new(Mutex::new(AppState::new(
+    let state = Arc::new(AppState::new(
         app,
         tmp.path().to_path_buf(),
         SettlementConfig::local(),
-    )));
+    ));
     (tmp, state)
 }
 
@@ -92,8 +91,8 @@ async fn advance_to(state: &SharedState, digest: Vec<u8>, height: u64) {
     };
     let poke = build_advance_tip_poke(&[header]);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), poke)
             .await
             .expect("advance-tip poke")
@@ -103,8 +102,8 @@ async fn advance_to(state: &SharedState, digest: Vec<u8>, height: u64) {
 }
 
 async fn peek_anchor(state: &SharedState) -> (Vec<u8>, u64) {
-    let mut st = state.lock().await;
-    let slab = st.app.peek(build_anchor_peek()).await.expect("anchor peek");
+    let mut k = state.kernel.lock().await;
+    let slab = k.peek(build_anchor_peek()).await.expect("anchor peek");
     let view = decode_anchor(&slab).expect("decode anchor");
     (view.tip_digest, view.tip_height)
 }

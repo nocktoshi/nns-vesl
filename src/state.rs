@@ -42,7 +42,6 @@ use crate::types::{ClaimLifecycleStatus, ClaimStatusResponse, Registration, Regi
 /// holding [`AppState::kernel`]. Kernel work (`peek`/`poke`) may run
 /// concurrently with short hull reads (`GET /status`) as long as callers
 /// `drop(kernel)` before locking hull.
-#[derive(Debug)]
 pub struct HullState {
     pub mirror: Mirror,
     pub output_dir: PathBuf,

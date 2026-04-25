@@ -33,7 +33,6 @@ use nns_vesl::kernel::{
 };
 use nns_vesl::payment::fee_for_name;
 use nns_vesl::state::AppState;
-use tokio::sync::Mutex;
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -68,11 +67,11 @@ async fn boot_kernel() -> (tempfile::TempDir, nns_vesl::state::SharedState) {
     )
     .await
     .expect("kernel boot");
-    let state = Arc::new(Mutex::new(AppState::new(
+    let state = Arc::new(AppState::new(
         app,
         tmp.path().to_path_buf(),
         SettlementConfig::local(),
-    )));
+    ));
     (tmp, state)
 }
 
@@ -80,9 +79,8 @@ async fn fee_via_kernel(
     state: &nns_vesl::state::SharedState,
     name: &str,
 ) -> u64 {
-    let mut st = state.lock().await;
-    let res = st
-        .app
+    let mut k = state.kernel.lock().await;
+    let res = k
         .peek(build_fee_for_name_peek(name))
         .await
         .expect("fee peek");
@@ -177,8 +175,8 @@ async fn run_chain_link(
 ) -> bool {
     let poke = build_verify_chain_link_poke(claim_digest, headers, anchored_tip);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), poke)
             .await
             .expect("chain-link poke")
@@ -260,8 +258,8 @@ async fn run_tx_in_page(
 ) -> bool {
     let poke = build_verify_tx_in_page_poke(page_digest, tx_ids, claimed);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("tx-in-page poke")
@@ -425,8 +423,8 @@ async fn run_validate(
 ) -> ValidateClaimResult {
     let poke = build_validate_claim_poke(bundle);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("validate-claim poke")
@@ -629,8 +627,8 @@ async fn advance_anchor_to(
     };
     let poke = build_advance_tip_poke(&[header]);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("advance-tip poke")
@@ -652,8 +650,8 @@ async fn prove_claim_rejects_stale_tip_height() {
 
     let poke = build_prove_claim_poke(&bundle);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
@@ -687,8 +685,8 @@ async fn prove_claim_rejects_mismatched_tip_digest_with_matching_height() {
 
     let poke = build_prove_claim_poke(&b);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
@@ -781,8 +779,8 @@ async fn validate_claim_rejects_witness_underpaid_even_when_claim_fee_matches() 
 async fn set_treasury(state: &nns_vesl::state::SharedState, addr: &str) {
     let poke = build_set_payment_address_poke(addr);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("set-payment-address poke")
@@ -821,8 +819,8 @@ async fn prove_claim_rejects_wrong_treasury() {
 
     let poke = build_prove_claim_poke(&b);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")
@@ -848,8 +846,8 @@ async fn prove_claim_rejects_when_treasury_unset() {
 
     let poke = build_prove_claim_poke(&b);
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(nockapp::wire::SystemWire.to_wire(), poke)
             .await
             .expect("prove-claim poke")

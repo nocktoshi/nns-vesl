@@ -29,7 +29,6 @@ use nns_vesl::kernel::{
     ClaimBundle, ClaimWitness, InStarkValidation, ValidateClaimResult,
 };
 use nns_vesl::{api, state::AppState};
-use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use vesl_core::SettlementConfig;
 
@@ -66,11 +65,11 @@ async fn boot_nns_with_prover() -> (tempfile::TempDir, nns_vesl::state::SharedSt
     )
     .await
     .expect("kernel must boot with prover jets");
-    let state = Arc::new(Mutex::new(AppState::new(
+    let state = Arc::new(AppState::new(
         app,
         tmp.path().to_path_buf(),
         SettlementConfig::local(),
-    )));
+    ));
     (tmp, state)
 }
 
@@ -144,8 +143,8 @@ async fn phase0_baseline_prove_and_verify() {
 
     let start = Instant::now();
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), prove_poke)
             .await
             .expect("%prove-batch poke must complete")
@@ -214,8 +213,8 @@ async fn phase1_redo_prove_identity_sanity() {
     let (_tmp, state) = boot_nns_with_prover().await;
     let t = Instant::now();
     let efx = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_prove_identity_poke())
             .await
             .expect("%prove-identity poke must complete")
@@ -252,8 +251,8 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
 
     let bad_poke = build_verify_stark_poke(&[0xab, 0xcd]);
     let bad_fx = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), bad_poke)
             .await
             .expect("bad jam verify poke")
@@ -267,8 +266,8 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
     let prove_poke = build_prove_batch_poke();
     let t_prove = Instant::now();
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), prove_poke)
             .await
             .expect("%prove-batch poke must complete")
@@ -298,8 +297,8 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
     let verify_poke = build_verify_stark_poke(&proof.proof_jam);
     let t_verify = Instant::now();
     let vfx = {
-        let mut st = state.lock().await;
-        match st.app.poke(SystemWire.to_wire(), verify_poke).await {
+        let mut k = state.kernel.lock().await;
+        match k.poke(SystemWire.to_wire(), verify_poke).await {
             Ok(v) => v,
             Err(e) => panic!("verify poke kernel error (likely verify crash): {e:?}"),
         }
@@ -383,9 +382,8 @@ async fn phase3c_prove_claim_roundtrip() {
 
     // Sanity: bundle must validate before we ask for a proof.
     {
-        let mut st = state.lock().await;
-        let v = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let v = k
             .poke(
                 SystemWire.to_wire(),
                 nns_vesl::kernel::build_validate_claim_poke(&bundle),
@@ -404,8 +402,8 @@ async fn phase3c_prove_claim_roundtrip() {
     // fs-formula is identical).
     let t_prove = Instant::now();
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_prove_claim_poke(&bundle))
             .await
             .expect("%prove-claim poke")
@@ -432,8 +430,8 @@ async fn phase3c_prove_claim_roundtrip() {
     let verify_poke = build_verify_stark_poke(&proof.proof_jam);
     let t_verify = Instant::now();
     let vfx = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), verify_poke)
             .await
             .expect("%verify-stark poke")
@@ -497,8 +495,8 @@ async fn phase3c_step3_prove_arbitrary_roundtrip() {
 
     let t_prove = Instant::now();
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(
                 SystemWire.to_wire(),
                 build_prove_arbitrary_poke(&subject_jam, &formula_jam),
@@ -527,8 +525,8 @@ async fn phase3c_step3_prove_arbitrary_roundtrip() {
     let verify_poke = build_verify_stark_poke(&ap.proof_jam);
     let t_verify = Instant::now();
     let vfx = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), verify_poke)
             .await
             .expect("%verify-stark poke")
@@ -613,8 +611,8 @@ async fn phase3c_step3_validator_in_stark_blocked_upstream() {
     };
 
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(
                 SystemWire.to_wire(),
                 build_prove_claim_in_stark_poke(&bundle),

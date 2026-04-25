@@ -497,7 +497,7 @@ async fn claim_handler(
     let address = req.address.trim().to_string();
     let tx_hash = req.tx_hash.as_deref().map(str::trim);
 
-    let (pending, settlement) = {
+    let (_pending, settlement) = {
         let h = state.hull.lock().await;
         let pending = h
             .mirror

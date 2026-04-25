@@ -14,7 +14,6 @@ use nockapp::wire::{SystemWire, Wire};
 use nns_vesl::chain::{ConfirmedTxPosition};
 use nns_vesl::kernel::{build_claim_poke, first_error_message, has_effect};
 use nns_vesl::{api, state::AppState};
-use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use vesl_core::{SettlementConfig, SettlementMode};
 
@@ -44,11 +43,11 @@ async fn setup() -> (tempfile::TempDir, nns_vesl::state::SharedState) {
     )
     .await
     .expect("kernel boot");
-    let state = Arc::new(Mutex::new(AppState::new(
+    let state = Arc::new(AppState::new(
         app,
         tmp.path().to_path_buf(),
         SettlementConfig::local(),
-    )));
+    ));
     (tmp, state)
 }
 
@@ -266,8 +265,8 @@ async fn invalid_name_is_400() {
 async fn claim_requires_tx_hash() {
     let (_tmp, state) = setup().await;
     {
-        let mut st = state.lock().await;
-        st.settlement.mode = SettlementMode::Fakenet;
+        let mut h = state.hull.lock().await;
+        h.settlement.mode = SettlementMode::Fakenet;
     }
     let router = api::router(state.clone());
 
@@ -347,9 +346,9 @@ async fn kernel_rejects_duplicate_even_when_mirror_forgets() {
     assert_eq!(status, StatusCode::OK);
 
     {
-        let mut st = state.lock().await;
-        st.mirror.names.clear();
-        st.mirror.primaries.clear();
+        let mut h = state.hull.lock().await;
+        h.mirror.names.clear();
+        h.mirror.primaries.clear();
     }
 
     let (status, _) = request_json(
@@ -389,8 +388,8 @@ async fn resolve_by_name_falls_back_to_kernel_when_mirror_is_stale() {
     assert_eq!(status, StatusCode::OK);
 
     {
-        let mut st = state.lock().await;
-        st.mirror.names.clear();
+        let mut h = state.hull.lock().await;
+        h.mirror.names.clear();
     }
 
     let (status, body) = request_json(router, "GET", "/resolve?name=echo.nock", None).await;
@@ -409,14 +408,13 @@ async fn kernel_rejects_duplicate_tx_hash() {
     let tx_hash = "stub-payment-dedup-test";
 
     let effects1 = {
-        let mut st = state.lock().await;
-        st.app
-            .poke(
-                SystemWire.to_wire(),
-                build_claim_poke("foxtrot.nock", ADDR1, 5000, tx_hash),
-            )
-            .await
-            .expect("first claim poke")
+        let mut k = state.kernel.lock().await;
+        k.poke(
+            SystemWire.to_wire(),
+            build_claim_poke("foxtrot.nock", ADDR1, 5000, tx_hash),
+        )
+        .await
+        .expect("first claim poke")
     };
     assert!(
         has_effect(&effects1, "claimed"),
@@ -428,14 +426,13 @@ async fn kernel_rejects_duplicate_tx_hash() {
     );
 
     let effects2 = {
-        let mut st = state.lock().await;
-        st.app
-            .poke(
-                SystemWire.to_wire(),
-                build_claim_poke("golf.nock", ADDR2, 5000, tx_hash),
-            )
-            .await
-            .expect("second claim poke")
+        let mut k = state.kernel.lock().await;
+        k.poke(
+            SystemWire.to_wire(),
+            build_claim_poke("golf.nock", ADDR2, 5000, tx_hash),
+        )
+        .await
+        .expect("second claim poke")
     };
     let err = first_error_message(&effects2)
         .expect("second claim with reused tx-hash must emit %claim-error");
@@ -459,19 +456,19 @@ async fn follower_orders_same_height_claims_by_tx_index() {
     // Force non-local follower path so ordering uses the mocked chain
     // position provider.
     {
-        let mut st = state.lock().await;
-        st.settlement.mode = SettlementMode::Fakenet;
-        st.settlement.chain_endpoint = Some("http://mock-chain".to_string());
+        let mut h = state.hull.lock().await;
+        h.settlement.mode = SettlementMode::Fakenet;
+        h.settlement.chain_endpoint = Some("http://mock-chain".to_string());
 
         // Enqueue in opposite order: tx-a first, tx-b second.
-        st.mirror.enqueue_claim(
+        h.mirror.enqueue_claim(
             "claim-a".to_string(),
             ADDR1.to_string(),
             "zero.nock".to_string(),
             5000,
             "tx-a".to_string(),
         );
-        st.mirror.enqueue_claim(
+        h.mirror.enqueue_claim(
             "claim-b".to_string(),
             ADDR2.to_string(),
             "zero.nock".to_string(),
@@ -498,19 +495,19 @@ async fn follower_orders_same_height_claims_by_tx_index() {
     .await
     .expect("follower pass");
 
-    let st = state.lock().await;
-    let winner = st
+    let h = state.hull.lock().await;
+    let winner = h
         .mirror
         .names
         .get("zero.nock")
         .expect("name should be registered by winner");
     assert_eq!(winner.address, ADDR2, "lower tx index should win");
 
-    let status_a = st
+    let status_a = h
         .mirror
         .claim_status("claim-a")
         .expect("claim-a status present");
-    let status_b = st
+    let status_b = h
         .mirror
         .claim_status("claim-b")
         .expect("claim-b status present");
@@ -947,10 +944,9 @@ async fn batch_note_id_is_deterministic() {
     let (_tmp2, state2) = setup().await;
 
     for state in [state1.clone(), state2.clone()] {
-        let mut st = state.lock().await;
+        let mut k = state.kernel.lock().await;
         for (name, addr, tx) in claims.iter() {
-            let effects = st
-                .app
+            let effects = k
                 .poke(
                     SystemWire.to_wire(),
                     build_claim_poke(name, addr, 5000, tx),

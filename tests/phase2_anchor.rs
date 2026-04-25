@@ -23,7 +23,6 @@ use nns_vesl::kernel::{
     first_error_message, first_payment_address_set, has_effect, AnchorHeader,
 };
 use nns_vesl::state::AppState;
-use tokio::sync::Mutex;
 use vesl_core::SettlementConfig;
 
 fn kernel_jam() -> Vec<u8> {
@@ -45,11 +44,11 @@ async fn boot_kernel() -> (tempfile::TempDir, nns_vesl::state::SharedState) {
     )
     .await
     .expect("kernel boot");
-    let state = Arc::new(Mutex::new(AppState::new(
+    let state = Arc::new(AppState::new(
         app,
         tmp.path().to_path_buf(),
         SettlementConfig::local(),
-    )));
+    ));
     (tmp, state)
 }
 
@@ -78,8 +77,8 @@ async fn advance_tip_bootstrap_accepts_from_genesis() {
     ];
 
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
             .await
             .expect("advance-tip poke")
@@ -92,8 +91,8 @@ async fn advance_tip_bootstrap_accepts_from_genesis() {
     assert!(first_error_message(&effects).is_none());
 
     let view = {
-        let mut st = state.lock().await;
-        let r = st.app.peek(build_anchor_peek()).await.expect("anchor peek");
+        let mut k = state.kernel.lock().await;
+        let r = k.peek(build_anchor_peek()).await.expect("anchor peek");
         decode_anchor(&r).expect("decode anchor")
     };
     assert_eq!(view.tip_height, 3);
@@ -123,8 +122,8 @@ async fn advance_tip_bootstrap_accepts_non_zero_parent() {
     let headers = vec![header_at(12_345, 0xAB, 0xCD)];
 
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
             .await
             .expect("advance-tip poke")
@@ -147,8 +146,8 @@ async fn advance_tip_extends_after_bootstrap() {
     // Bootstrap to height=2.
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
@@ -157,8 +156,8 @@ async fn advance_tip_extends_after_bootstrap() {
     // Extend by two blocks whose parent chains back to the current tip.
     let more = vec![header_at(3, 3, 2), header_at(4, 4, 3)];
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&more))
             .await
             .expect("extend")
@@ -169,8 +168,8 @@ async fn advance_tip_extends_after_bootstrap() {
     assert_eq!(advanced.count, 2);
 
     let view = {
-        let mut st = state.lock().await;
-        let r = st.app.peek(build_anchor_peek()).await.expect("anchor peek");
+        let mut k = state.kernel.lock().await;
+        let r = k.peek(build_anchor_peek()).await.expect("anchor peek");
         decode_anchor(&r).expect("decode anchor")
     };
     assert_eq!(view.tip_height, 4);
@@ -184,8 +183,8 @@ async fn advance_tip_rejects_parent_mismatch() {
     // Bootstrap to height=2.
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
@@ -195,8 +194,8 @@ async fn advance_tip_rejects_parent_mismatch() {
     // digest. Simulates a reorg the follower missed.
     let bad = vec![header_at(3, 3, 99)];
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&bad))
             .await
             .expect("bad advance")
@@ -211,8 +210,8 @@ async fn advance_tip_rejects_parent_mismatch() {
 
     // Anchor should still be at height=2.
     let view = {
-        let mut st = state.lock().await;
-        let r = st.app.peek(build_anchor_peek()).await.expect("anchor peek");
+        let mut k = state.kernel.lock().await;
+        let r = k.peek(build_anchor_peek()).await.expect("anchor peek");
         decode_anchor(&r).expect("decode anchor")
     };
     assert_eq!(view.tip_height, 2);
@@ -225,8 +224,8 @@ async fn advance_tip_rejects_height_gap() {
     // Bootstrap to height=2.
     let boot_headers = vec![header_at(1, 1, 0), header_at(2, 2, 1)];
     {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&boot_headers))
             .await
             .expect("bootstrap");
@@ -236,8 +235,8 @@ async fn advance_tip_rejects_height_gap() {
     // parent digest the kernel requires strict height+1 linkage.
     let gap = vec![header_at(5, 5, 2)];
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&gap))
             .await
             .expect("gap advance")
@@ -260,8 +259,8 @@ async fn advance_tip_rejects_internal_break() {
         header_at(3, 3, 99),
     ];
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&broken))
             .await
             .expect("broken advance")
@@ -277,8 +276,8 @@ async fn advance_tip_rejects_internal_break() {
 async fn advance_tip_empty_list_is_rejected() {
     let (_tmp, state) = boot_kernel().await;
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(SystemWire.to_wire(), build_advance_tip_poke(&[]))
             .await
             .expect("empty advance")
@@ -297,9 +296,8 @@ async fn set_payment_address_binds_on_first_poke() {
 
     // Peek before bootstrap: unit is `~`.
     let before = {
-        let mut st = state.lock().await;
-        let r = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let r = k
             .peek(build_payment_address_peek())
             .await
             .expect("pre peek");
@@ -309,8 +307,8 @@ async fn set_payment_address_binds_on_first_poke() {
 
     let addr = "test-address-abc";
     let effects = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(
                 SystemWire.to_wire(),
                 build_set_payment_address_poke(addr),
@@ -323,9 +321,8 @@ async fn set_payment_address_binds_on_first_poke() {
     assert_eq!(bound, addr);
 
     let after = {
-        let mut st = state.lock().await;
-        let r = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let r = k
             .peek(build_payment_address_peek())
             .await
             .expect("post peek");
@@ -340,8 +337,8 @@ async fn set_payment_address_can_change_before_first_claim() {
 
     for addr in ["first-addr", "second-addr"] {
         let effects = {
-            let mut st = state.lock().await;
-            st.app
+            let mut k = state.kernel.lock().await;
+            k
                 .poke(
                     SystemWire.to_wire(),
                     build_set_payment_address_poke(addr),
@@ -355,9 +352,8 @@ async fn set_payment_address_can_change_before_first_claim() {
     }
 
     let after = {
-        let mut st = state.lock().await;
-        let r = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let r = k
             .peek(build_payment_address_peek())
             .await
             .expect("peek");
@@ -372,9 +368,8 @@ async fn set_payment_address_is_frozen_after_first_claim() {
 
     // Bind initially.
     {
-        let mut st = state.lock().await;
-        let fx = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let fx = k
             .poke(
                 SystemWire.to_wire(),
                 build_set_payment_address_poke("frozen-addr"),
@@ -386,9 +381,8 @@ async fn set_payment_address_is_frozen_after_first_claim() {
 
     // Accept a first claim to bump claim-count.
     {
-        let mut st = state.lock().await;
-        let fx = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let fx = k
             .poke(
                 SystemWire.to_wire(),
                 build_claim_poke("alpha.nock", "owner-zzz", 5000, "tx-freeze-1"),
@@ -400,8 +394,8 @@ async fn set_payment_address_is_frozen_after_first_claim() {
 
     // Further %set-payment-address pokes should error, not mutate.
     let fx = {
-        let mut st = state.lock().await;
-        st.app
+        let mut k = state.kernel.lock().await;
+        k
             .poke(
                 SystemWire.to_wire(),
                 build_set_payment_address_poke("should-be-rejected"),
@@ -414,9 +408,8 @@ async fn set_payment_address_is_frozen_after_first_claim() {
     assert!(err.contains("already bound"), "expected freeze error, got: {err}");
 
     let view = {
-        let mut st = state.lock().await;
-        let r = st
-            .app
+        let mut k = state.kernel.lock().await;
+        let r = k
             .peek(build_payment_address_peek())
             .await
             .expect("peek");
