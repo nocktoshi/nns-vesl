@@ -25,10 +25,11 @@ use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
 use nns_vesl::kernel::{
-    build_fee_for_name_peek, build_validate_claim_poke, build_verify_chain_link_poke,
-    build_verify_tx_in_page_poke, decode_fee_for_name, first_chain_link_result,
-    first_tx_in_page_result, first_validate_claim_result, AnchorHeader, ClaimBundle,
-    ValidateClaimResult,
+    build_advance_tip_poke, build_fee_for_name_peek, build_prove_claim_poke,
+    build_set_payment_address_poke, build_validate_claim_poke, build_verify_chain_link_poke,
+    build_verify_tx_in_page_poke, decode_fee_for_name, first_anchor_advanced,
+    first_chain_link_result, first_claim_proof, first_tx_in_page_result,
+    first_validate_claim_result, AnchorHeader, ClaimBundle, ValidateClaimResult,
 };
 use nns_vesl::payment::fee_for_name;
 use nns_vesl::state::AppState;
@@ -400,6 +401,21 @@ fn good_bundle() -> ClaimBundle {
         page_digest: page_digest.clone(),
         page_tx_ids: vec![tx_hash, other_tx],
         anchored_tip: page_digest,
+        // Phase 7: tip-height of 0 matches the bootstrap kernel anchor.
+        anchored_tip_height: 0,
+        // Level C-A witness: all four fields consistent with the
+        // claim (owner/fee/tx_hash) so the good-bundle stays happy
+        // path. Individual tests mutate one to exercise a rejection.
+        //
+        // treasury_address kept as a placeholder string because
+        // %validate-claim doesn't check it (only %prove-claim does,
+        // against kernel state — tested separately).
+        witness: nns_vesl::kernel::ClaimWitness {
+            tx_id: vec![0x07],
+            spender_pkh: b"owner-address".to_vec(),
+            treasury_amount: 5_000,
+            treasury_address: "nns-treasury".to_string(),
+        },
     }
 }
 
@@ -578,5 +594,270 @@ async fn validate_claim_short_circuits_on_first_error() {
     assert_eq!(
         run_validate(&state, &b).await,
         ValidateClaimResult::Error("invalid-name".into())
+    );
+}
+
+// ----------------------------------------------------------------------
+// Phase 7: anchor-mismatch check on %prove-claim
+// ----------------------------------------------------------------------
+//
+// The kernel's %prove-claim cause refuses to emit a STARK proof unless
+// the bundle's `anchored_tip_height` (and `anchored_tip`) match the
+// kernel's current anchor state. This binds every claim proof to a
+// specific chain-follower snapshot, so a malicious operator can't
+// manually poke stale kernel state and hand the wallet a valid proof.
+//
+// These tests exercise the rejection path — they don't drive the
+// prover (which is prover-heavy and #[ignore]'d in tests/prover.rs),
+// they just confirm the early-reject logic fires correctly.
+
+/// Advance the kernel anchor to a specific (tip-digest, tip-height).
+/// Returns once the `%anchor-advanced` effect confirms the move.
+async fn advance_anchor_to(
+    state: &nns_vesl::state::SharedState,
+    digest: Vec<u8>,
+    height: u64,
+) {
+    // Bootstrapping from genesis: a single header whose parent=0 and
+    // height starts at tip-height+1 (or, in the bootstrap case, equals
+    // the supplied height because the kernel's current tip starts at
+    // height 0 with digest 0).
+    let header = AnchorHeader {
+        digest,
+        height,
+        parent: vec![],
+    };
+    let poke = build_advance_tip_poke(&[header]);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("advance-tip poke")
+    };
+    let advanced = first_anchor_advanced(&effects).expect("anchor-advanced effect");
+    assert_eq!(advanced.tip_height, height);
+}
+
+#[tokio::test]
+async fn prove_claim_rejects_stale_tip_height() {
+    let (_tmp, state) = boot_kernel().await;
+
+    // Move the kernel anchor to height 12. Bundle still claims
+    // anchored_tip_height=0 (the bootstrap default), which is 12
+    // blocks stale. %prove-claim must refuse.
+    advance_anchor_to(&state, vec![0x42], 12).await;
+
+    let bundle = good_bundle(); // anchored_tip_height = 0
+
+    let poke = build_prove_claim_poke(&bundle);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("prove-claim poke")
+    };
+
+    // Expect %validate-claim-error %anchor-mismatch. No %claim-proof
+    // should be emitted — the prover never ran.
+    assert!(
+        first_claim_proof(&effects).is_none(),
+        "prover must not run when bundle anchor disagrees with kernel state"
+    );
+    assert_eq!(
+        first_validate_claim_result(&effects),
+        Some(ValidateClaimResult::Error("anchor-mismatch".into())),
+    );
+}
+
+#[tokio::test]
+async fn prove_claim_rejects_mismatched_tip_digest_with_matching_height() {
+    let (_tmp, state) = boot_kernel().await;
+
+    // Kernel anchor: (0x42, 12). Bundle: (0x99, 12). Heights match,
+    // digests don't — still anchor-mismatch. This specifically guards
+    // against the subtle attack where a fork at the same height would
+    // otherwise pass a naive height-only check.
+    advance_anchor_to(&state, vec![0x42], 12).await;
+
+    let mut b = good_bundle();
+    b.anchored_tip_height = 12;
+    b.anchored_tip = vec![0x99];
+
+    let poke = build_prove_claim_poke(&b);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("prove-claim poke")
+    };
+
+    assert!(first_claim_proof(&effects).is_none());
+    assert_eq!(
+        first_validate_claim_result(&effects),
+        Some(ValidateClaimResult::Error("anchor-mismatch".into())),
+    );
+}
+
+// Happy-path anchor-match test lives in tests/prover.rs —
+// `phase3c_prove_claim_roundtrip` — because it drives the actual
+// prover. Kept there under `#[ignore]` to preserve the prover
+// gate we already have for heavy runs.
+
+// ----------------------------------------------------------------------
+// Level C-A: payment-semantic witness predicates
+// ----------------------------------------------------------------------
+//
+// Four bundle-internal predicates are asserted by validate-claim-bundle:
+//   - matches-tx-id        → witness.tx-id == claim.tx-hash
+//   - pays-sender          → witness.spender-pkh == claim.owner
+//   - pays-amount          → witness.treasury-amount >= fee-for-name
+// The fourth (matches-treasury) compares witness.treasury-address against
+// the kernel's payment-address state — tested under %prove-claim (which
+// does the state-relative check) rather than %validate-claim.
+
+#[tokio::test]
+async fn validate_claim_rejects_witness_tx_id_mismatch() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Hull claims payment tx 0x07 but witness says 0x99 — smells like
+    // the hull swapped one user's tx-id for another's. Reject.
+    b.witness.tx_id = vec![0x99];
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("witness-tx-id-mismatch".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_witness_sender_mismatch() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Witness says a different pkh paid than the claim's owner field.
+    // Catches hostile hull redirecting someone else's payment to a
+    // fresh owner string.
+    b.witness.spender_pkh = b"not-owner".to_vec();
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("witness-sender-mismatch".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_witness_underpaid() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Hull declared fee=5000 (passes C2) but the actual on-chain
+    // treasury-amount was only 4999. The witness-underpaid check is
+    // stricter than C2: C2 trusts the hull's claim.fee, this trusts
+    // what actually moved on chain (as reported by the hull, then
+    // verified by the wallet externally).
+    b.witness.treasury_amount = 4_999;
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("witness-underpaid".into())
+    );
+}
+
+#[tokio::test]
+async fn validate_claim_rejects_witness_underpaid_even_when_claim_fee_matches() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = good_bundle();
+    // Hull lies: claim.fee=5000 passes C2, but actual treasury received 0.
+    // Witness-underpaid is the belt-and-suspenders check that closes
+    // the "hostile hull lies about fee" gap.
+    b.fee = 5_000;
+    b.witness.treasury_amount = 0;
+    assert_eq!(
+        run_validate(&state, &b).await,
+        ValidateClaimResult::Error("witness-underpaid".into())
+    );
+}
+
+// --- Kernel-state-relative: %prove-claim matches-treasury --------------
+
+async fn set_treasury(state: &nns_vesl::state::SharedState, addr: &str) {
+    let poke = build_set_payment_address_poke(addr);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("set-payment-address poke")
+    };
+    // Success effect is %payment-address-set; just confirm no error.
+    assert!(
+        !effects
+            .iter()
+            .any(|e| nns_vesl::kernel::effect_tag(e).as_deref() == Some("payment-address-error")),
+        "set-payment-address rejected"
+    );
+}
+
+/// Advance the kernel's anchor to `(0x42, 1)` and produce a bundle
+/// whose `anchored_tip` / `anchored_tip_height` match — so the Phase 7
+/// anchor-mismatch gate passes and downstream Level C checks get a
+/// chance to run.
+async fn bundle_matching_advanced_anchor(state: &nns_vesl::state::SharedState) -> ClaimBundle {
+    advance_anchor_to(state, vec![0x42], 1).await;
+    let mut b = good_bundle();
+    b.anchored_tip_height = 1;
+    b
+}
+
+#[tokio::test]
+async fn prove_claim_rejects_wrong_treasury() {
+    let (_tmp, state) = boot_kernel().await;
+    let mut b = bundle_matching_advanced_anchor(&state).await;
+    // Configure the kernel's treasury.
+    set_treasury(&state, "nns-treasury").await;
+
+    // Bundle claims payment was sent to a *different* treasury. Proof
+    // must refuse before the prover runs — this is the Level C-A
+    // state-relative check in %prove-claim.
+    b.witness.treasury_address = "attacker-treasury".to_string();
+
+    let poke = build_prove_claim_poke(&b);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("prove-claim poke")
+    };
+
+    assert!(
+        first_claim_proof(&effects).is_none(),
+        "prover must not run when witness treasury != kernel treasury"
+    );
+    assert_eq!(
+        first_validate_claim_result(&effects),
+        Some(ValidateClaimResult::Error("witness-wrong-treasury".into())),
+    );
+}
+
+#[tokio::test]
+async fn prove_claim_rejects_when_treasury_unset() {
+    // Fresh kernel with no payment-address configured yet. %prove-claim
+    // refuses rather than accepting an arbitrary witness treasury —
+    // operator hasn't finished bootstrap.
+    let (_tmp, state) = boot_kernel().await;
+    let b = bundle_matching_advanced_anchor(&state).await;
+
+    let poke = build_prove_claim_poke(&b);
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(nockapp::wire::SystemWire.to_wire(), poke)
+            .await
+            .expect("prove-claim poke")
+    };
+
+    assert!(first_claim_proof(&effects).is_none());
+    assert_eq!(
+        first_validate_claim_result(&effects),
+        Some(ValidateClaimResult::Error("witness-wrong-treasury".into())),
     );
 }

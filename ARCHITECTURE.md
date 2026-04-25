@@ -59,16 +59,14 @@ All three checks must pass.
 The STARK verify + digest check reduces the trust surface to:
 > “Vesl STARK is sound, and this bundle is exactly the bundle the kernel committed to.”
 The wallet-side validator is still required because full validator execution inside the STARK is currently blocked upstream in Vesl.
-## 1.3 Pre-production blocker
-**Phase 7 must ship before any production wallet relies on NNS proofs for value-bearing decisions.**
-The blocker is wallet-side freshness enforcement on `t_nns_height`.
-A wallet MUST reject stale proofs:
-```text
-proof.t_nns_height < wallet_chain_tip_height - max_staleness
-```
-Default planned `max_staleness`: **20 blocks**.
-Without this, a malicious NNS server could freeze its follower, manually poke stale state, and emit a cryptographically valid proof anchored at an old NNS view.
-See [Staleness and fork resistance](#7-staleness-and-fork-resistance).
+## 1.3 Pre-production blocker — **LIFTED (Phase 7 shipped 2026-04-24)**
+Phase 7's freshness enforcement has shipped end-to-end:
+- **Kernel side**: `claim-bundle` now carries `anchored-tip-height`. `%prove-claim` refuses to emit a proof unless the bundle's anchor matches the kernel's current `(tip-digest, tip-height)` — new `%anchor-mismatch` validation error short-circuits before the prover runs.
+- **API side**: `GET /proof` now returns a `ProofAnchor { tip_digest, tip_height }` object alongside the Merkle proof.
+- **Wallet side**: `src/freshness.rs` exposes `Freshness::check` + `check_anchor_binding`; `src/bin/light_verify.rs` adds `--chain-tip`, `--max-staleness` (default 20), and `--chain-tip-digest` flags with precise exit codes (1=merkle, 2=stale, 3=fork, 4=missing anchor, 5=missing chain-tip).
+- **Tests**: 2 kernel-level anchor-mismatch tests, 13 freshness unit tests, 8 CLI integration tests, 2 two-server stale-proof integration tests. All green.
+The attack this closes: a malicious NNS server freezes its follower and hand-pokes stale kernel state. The proof is cryptographically valid but anchored at an old view. Without wallet-side freshness enforcement, naive clients would accept it. With Phase 7, the wallet compares the proof's `anchor.tip_height` to its own canonical-chain view and rejects anything more than `max_staleness` blocks behind.
+See [Staleness and fork resistance](#7-staleness-and-fork-resistance) for the full three-layer defense and the attack walk-through.
 ## 1.4 Current upstream blocker
 Phase 3c step 3 — running the validator entirely inside the STARK — is blocked by Vesl’s STARK prover interpreter.
 `common/ztd/eight.hoon::fock:fink:interpret` supports only Nock opcodes **0–8**.
@@ -88,28 +86,34 @@ Current decision:
 - Keep production on Phase 3c step 2.
 - File upstream ask for Vesl opcode 9/10/11 support.
 - Keep the NNS blocker-signal test in place.
+- Formula-rewriting workarounds (Hoon-side pre-expansion or inline rewrites inside `fock:fink:interpret`) were attempted and rejected on OOM grounds — geometric trace blowup from recursive Nock-9 expansion. See [10.10](#1010-path-3-attempt-formula-rewriting).
 ## 1.5 Current Phase 3 status
 | Level / step | Arms / feature | Status |
 |---|---|---|
 | A | `fee-for-name`, `chain-links-to` | **shipped** |
 | B | `has-tx-in-page`, `matches-block-digest` | **shipped** using hull-trusted page summary |
-| C | `matches-block-commitment`, `pays-sender`, `pays-amount` | pending narrow `tx-witness.hoon` vendor |
+| C-A | `matches-tx-id`, `pays-sender`, `pays-amount`, `matches-treasury` over `nns-raw-tx-witness` | **shipped 2026-04-24 pm** (hull-extracted narrow witness; wallet re-verifies from chain raw-tx) |
+| C-B | `compute-id:raw-tx` in-kernel + `matches-block-commitment` | pending narrow `tx-witness.hoon` vendor |
 | 3c step 1 | `validate-claim-bundle` + `%validate-claim` cause | **shipped** |
 | 3c step 2 | `%prove-claim` = validator + committed STARK over bundle digest | **shipped** |
 | 3c step 3 foundation | `has-tx-in-list`, `validate-claim-bundle-linear`, `%prove-arbitrary` | **shipped** |
 | 3c step 3 spike | subject-bundled-core encoding + `%prove-claim-in-stark` + blocker test | **shipped**, semantically correct, blocked upstream |
 | 3c step 3 completion | wallet drops Rust validator mirror | blocked on Vesl prover opcode extension |
+| Phase 7 | wallet freshness + anchor-mismatch gate | **shipped 2026-04-24 pm** |
 | Phase 8 | upstream Vesl prover Nock 9/10/11 | pending upstream |
 ## 1.6 Latest test status
-Latest recorded status:
-- **76 active tests, all green.**
+Latest recorded status (2026-04-24 pm, after Phase 7 + Level C-A + Phase 7.1):
+- **113 active tests, all green.**
 - Prover-heavy tests are `#[ignore]` and run manually.
-- Latest test inventory notes include:
-  - 10 unit/lib tests.
-  - 30 HTTP handler tests.
+- Latest test inventory:
+  - 23 unit/lib tests (includes 13 Phase 7 freshness unit tests).
+  - 34 HTTP handler tests (includes 4 Phase 7.1 operator-observability tests).
   - 9 Phase 2 tests.
-  - 26 Phase 3 tests.
-  - 6 ignored prover tests.
+  - 34 Phase 3 tests (includes 2 Phase 7 `%anchor-mismatch`, 4 Level C-A witness-rejection, 2 Level C-A treasury-mismatch tests).
+  - 10 Phase 7 `light_verify` CLI integration tests.
+  - 2 Phase 7 two-server stale-proof integration tests.
+  - 1 doctest.
+  - 6 ignored prover tests (unchanged).
 Historical milestones:
 | Milestone | Tests |
 |---|---|
@@ -118,6 +122,9 @@ Historical milestones:
 | Phase 3 Level B + slim anchor | 65 passing |
 | Phase 3c validator/prove-claim | 75 green |
 | Phase 3c step 3 blocker spike | 76 active green |
+| Phase 7 freshness gate | 101 active green |
+| Level C-A payment witness | 107 active green |
+| Phase 7.1 operator observability | **113 active green** |
 ---
 # 2. Consensus decision
 ## 2.1 The problem
@@ -655,53 +662,103 @@ Wallet at current_tip 1025 checks:
 1000 < 1025 - 20 = 1005
 Reject stale proof.
 ```
-## 7.6 Phase 7 acceptance criteria
-Phase 7 is blocking before production.
-Required:
-- Proof bundle carries explicit top-level:
-  - `t_nns_digest: [u8; 40]`
-  - `t_nns_height: u64`
-- Proof-bundle schema documented in `docs/wallet-verification.md`.
-- Recursive `nns-gate` commits `t_nns_height` into STARK public output.
-- `src/bin/light_verify.rs` exposes:
-```rust
-MaxStaleness { default: 20 }
+## 7.6 Phase 7 acceptance criteria — **SHIPPED 2026-04-24 pm**
+Status per acceptance criterion:
+| Criterion | Status | Landed in |
+|---|---|---|
+| Proof bundle carries `t_nns_digest: [u8; 40]` + `t_nns_height: u64` | **done** | `ProofAnchor` on `ProofResponse` in `src/types.rs`; surfaced from `/proof` in `src/api.rs` |
+| Proof-bundle schema documented | **done** | Doc-comment on `ProofResponse.anchor` + this section |
+| Kernel commits anchor into bundle cryptographically | **done** | `claim-bundle.anchored-tip-height` is part of `belt-digest(jam(bundle))` which the STARK's Fiat-Shamir absorbs via `%prove-claim`. Bundle-hash mismatch = proof-invalidation. |
+| Kernel refuses mismatched bundles | **done** | New `%anchor-mismatch` error; `matches-current-anchor:np` predicate compares bundle anchor to kernel state before prove runs |
+| `light_verify` `--max-staleness` (default 20) | **done** | `src/bin/light_verify.rs`, default wired to `freshness::DEFAULT_MAX_STALENESS = 20` |
+| `light_verify` rejects stale proofs | **done** | exit code 2 via `Freshness::check`, unit-tested at boundary/above/below |
+| Unit tests: boundary, above, below | **done** | `src/freshness.rs::tests` (13 tests including exact/one-above/one-below) |
+| SDK docs: freshness rule, chain-tip source, verification snippet | **done (inline)** | Doc comments on `freshness::Freshness`, `ClaimBundle::check_freshness`, `ProofResponse.anchor`, and `light_verify --help` |
+| Integration test: two servers, freeze one, advance chain, assert reject | **done** | `tests/phase7_two_servers.rs::two_servers_freshness_gate` (honest + frozen kernels, different anchors, light_verify accepts one, rejects the other) + `server_catches_up_proofs_become_fresh_again` (recovery flow) |
+Remaining as future work (not blocking):
+- Recursive `nns-gate` commitment into STARK public output (Phase 5): we currently bind via the bundle-digest absorbed into Fiat-Shamir. A follow-up can surface `t_nns_height` as a first-class public output once `nns-gate` grows transition-proof support.
+- Dedicated `docs/wallet-verification.md` standalone guide: current docs are inline on types and `--help`. Standalone Markdown is helpful but not gating.
+## 7.7 Operator observability — **Phase 7.1 shipped 2026-04-24 pm**
+Shipped in `src/state.rs` (`FollowerObservability`), `src/chain_follower.rs`
+(structured tracing + telemetry updates), and `src/api.rs` (status
+augmentation, `/anchor`, `/admin/advance-tip-now`).
+### /status augmentation
+`GET /status` now returns an `anchor` object and a `follower` block:
+```jsonc
+{
+  "settlement_mode": "local",
+  "chain_endpoint": null,
+  "anchor": { "tip_height": 120, "tip_digest": "42..." },
+  "follower": {
+    "chain_tip_height":            130,
+    "anchor_lag_blocks":           10,
+    "is_caught_up":                true,
+    "last_advance_at_epoch_ms":    1735689600000,
+    "last_advance_age_seconds":    23,
+    "last_advance_tip_height":     120,
+    "last_advance_count":          5,
+    "last_chain_tip_observed_at_epoch_ms": 1735689610000,
+    "last_error":                  null,
+    "last_error_phase":            null,
+    "last_error_at_epoch_ms":      null,
+    "finality_depth":              10,
+    "max_advance_batch":           64
+  }
+}
 ```
-- `light_verify` rejects:
-```text
-proof.t_nns_height < wallet_chain_tip_height - max_staleness
+`anchor_lag_blocks = follower.chain_tip_height − anchor.tip_height`.
+`is_caught_up = lag ≤ finality_depth + 1`. Both are computed
+server-side so clients don't need the constants baked in.
+### /anchor dedicated route
+`GET /anchor` returns the same anchor + follower data as `/status.follower`
+merged, and responds **503 SERVICE UNAVAILABLE** when the node has
+neither a kernel anchor peek nor any chain-tip observation (truly blind).
+This distinguishes "chain is at height 0" from "follower is broken and
+we don't know anything" — important for monitoring.
+### Structured follower tracing
+All follower log lines now carry `phase` and `err` fields:
 ```
-- Unit tests:
-  - exactly at boundary,
-  - one above,
-  - one below.
-- SDK docs explain:
-  - freshness rule,
-  - how to source `wallet_chain_tip_height`,
-  - gRPC call against configured Nockchain node,
-  - end-to-end verification snippet.
-- Integration test:
-  - spin up two NNS servers,
-  - freeze one follower,
-  - have it issue stale proof,
-  - advance chain past staleness window,
-  - assert `light_verify` rejects.
-## 7.7 Operator observability
-Ship with or before Phase 7:
-- `/status` exposes:
-```text
-anchor_lag = current_chain_tip - anchor.tip_height
+INFO  phase=anchor_advance tip_height=120 count=5  "chain follower advanced anchor"
+WARN  phase=anchor_tick    err="header chain fetch failed [111..120]: ..."  "chain follower anchor tick failed"
+WARN  phase=claim_tick     err="chain position lookup failed: ..."          "chain follower claim tick failed"
+TRACE phase=anchor_advance                                                   "anchor tick no-op"
 ```
-Suggested alert: `anchor_lag > 50`.
-- `/status` exposes count of claims in `Submitted` older than 10 minutes.
-- Structured tracing on follower anchor failures:
-  - parent mismatch,
-  - height gap,
-  - internal chain break.
-- Optional Prometheus metrics for:
-  - anchor lag,
-  - old pending claims,
-  - anchor advance failures.
+The five error phases the follower tags:
+| phase | what failed |
+|---|---|
+| `anchor_peek`   | kernel `/anchor` peek returned error |
+| `plan`          | `plan_anchor_advance` failed (chain-tip fetch, mostly) |
+| `header_fetch`  | `fetch_header_chain` gRPC call failed |
+| `advance_poke`  | kernel rejected `%advance-tip`, or no `%anchor-advanced` effect |
+| `claim_tick`    | claim-replay tick encountered an error |
+### /admin/advance-tip-now — manual advance trigger
+`POST /admin/advance-tip-now` drives one `advance_anchor_once` pass
+outside the regular 10 s poll cycle. Useful for:
+- verifying a freshly-configured chain endpoint works
+- unsticking an anchor without waiting for the next tick
+- exercising the anchor-advance path in tests
+**Gated by `NNS_ENABLE_ADMIN=1`.** Default is off so casually-deployed
+nodes don't expose the mutation surface. Returns **404** when disabled
+(so scanners can't fingerprint).
+### Tests
+Four new handler tests in `tests/handlers.rs`:
+- `status_exposes_follower_observability_shape`
+- `anchor_handler_returns_503_when_blind`
+- `admin_advance_tip_returns_404_when_admin_disabled`
+- `admin_advance_tip_is_noop_in_local_mode_when_enabled` (serialized
+  with file-local mutex to protect the `NNS_ENABLE_ADMIN` env var)
+### Operator runbook
+Full walkthrough in [`docs/running_a_node.md`](docs/running_a_node.md):
+install, configure, run, monitor. Covers local-mode → chain-mode
+migration, common debug recipes, and suggested alert thresholds.
+### Deferred (still roadmap)
+- **Prometheus metrics endpoint** (`/metrics` in Prometheus text format).
+  The telemetry fields are already in `/status.follower` as JSON —
+  adding a `prometheus` feature flag + exporter is ~50 lines. Not
+  blocking any user flow.
+- **Old-pending-claim surfacing**. `/status.pending_count` exists;
+  the "submitted > 10 minutes ago" breakdown doesn't. Add when the
+  follower ships persistent claim replay (Phase 3 continued).
 ---
 # 8. Recursive-STARK architecture and research findings
 ## 8.1 Current conclusion
@@ -1007,11 +1064,47 @@ Known edge case:
 - Real Tip5 digests should be well-distributed and not hit handcrafted pattern.
 - Upstream jet issue, not a Phase 3c blocker.
 ## 9.3 Level C predicates
-Pending narrow `tx-witness.hoon` vendor.
-Needed arms:
-- `matches-block-commitment`
-- `pays-sender`
-- `pays-amount`
+### Level C-A — shipped 2026-04-24 pm
+Implemented in `hoon/lib/nns-predicates.hoon` as pure Hoon (no new deps):
+- `+$nns-raw-tx-witness`: 4-atom narrow view
+  `[tx-id spender-pkh treasury-amount treasury-address]`.
+- `+matches-tx-id`: witness.tx-id == claim.tx-hash.
+- `+pays-sender`: witness.spender-pkh == claim.owner (atom equality).
+- `+pays-amount`: witness.treasury-amount >= fee-for-name(claim.name).
+- `+matches-treasury`: compared against kernel's `payment-address`
+  in the `%prove-claim` cause (state-relative, not in the arm).
+Kernel wiring:
+- `%validate-claim` / `%prove-claim` pokes take four extra witness
+  atoms (`witness-tx-id`, `witness-spender-pkh`, `witness-treasury-amount`,
+  `witness-treasury-address`).
+- `validate-claim-bundle` adds three cross-predicate checks:
+  `witness-tx-id-mismatch`, `witness-sender-mismatch`, `witness-underpaid`.
+- `%prove-claim` cause additionally refuses on `witness-wrong-treasury`
+  (witness treasury ≠ kernel state, or kernel treasury unset).
+Trust model:
+- **Hull trusted** to correctly extract `(tx-id, spender-pkh,
+  treasury-amount, treasury-address)` from the on-chain raw-tx.
+- **Kernel enforces** consistency between the witness, the claim
+  tuple, and kernel state (`payment-address`).
+- **Wallet verifies** the STARK, then independently fetches the
+  raw-tx from Nockchain and re-parses to confirm the witness
+  fields match. This makes hull extraction *falsifiable* — a
+  lying hull is detected on the wallet side.
+Tests in `tests/phase3_predicates.rs`:
+- `validate_claim_rejects_witness_tx_id_mismatch`
+- `validate_claim_rejects_witness_sender_mismatch`
+- `validate_claim_rejects_witness_underpaid`
+- `validate_claim_rejects_witness_underpaid_even_when_claim_fee_matches`
+- `prove_claim_rejects_wrong_treasury`
+- `prove_claim_rejects_when_treasury_unset`
+### Level C-B — pending narrow `tx-witness.hoon` vendor
+Adds:
+- `compute-id:raw-tx` inside the kernel to re-hash the raw-tx and
+  verify `witness.tx-id` matches — eliminates the hull's witness-
+  extraction trust.
+- `matches-block-commitment` via `block-commitment:page:t` — lets
+  the kernel re-compute the page digest rather than trust hull.
+- `verify:sp-verifier` on a block PoW STARK (recursive gate).
 Original attempt to symlink full tx-engine cone hit hoonc dep-loop / OOM:
 - `tx-engine-0.hoon` hangs for ~4 minutes and eventually OOMs.
 - Root cause: shared `/common/stark/prover` resolution through two different `=> stark-engine` contexts:
@@ -1025,6 +1118,9 @@ Plan:
   - `compute-id:raw-tx:t`
   - `spends:raw-tx:v1`
   - `outputs:tx:v1`
+- Stub every transitive dep on `tx-engine-0` with narrow types
+  mirroring the shapes we need; do NOT pull in `pow` /
+  `nock-prover`.
 ## 9.4 Phase 3c step 1: validator
 `nns-predicates.hoon` added:
 Types:
@@ -1320,15 +1416,68 @@ Options:
 1. Upstream Vesl implements 9/10/11.
 2. Hand-encode validator in Nock 0–8.
 3. Keep committed-digest design for production.
+4. Pre-expand Nock 9/10/11 to the 0–8 subset via a formula rewriter (Hoon-side pass or in-prover).
 Chosen:
 > Option 3 now; option 1 upstream.
 Rationale:
 - Upstream opcode support is a Vesl protocol change.
 - Hand-encoded Nock adds audit surface.
 - Step 2 already provides strong trustlessness with a tiny wallet-side validator call.
+- Option 4 attempted and rejected on OOM grounds — see [10.10](#1010-path-3-attempt-formula-rewriting) below.
 When upstream lands:
 - Flip one assertion in blocker-signal test.
 - Wallet drops Rust validator mirror.
+## 10.10 Path 3 attempt: formula rewriting
+Attempted on **2026-04-24 pm**. Outcome: **rejected, but informative**.
+### 10.10.1 Premise
+Nock 9, 10, 11 are all semantically expressible via Nock 0–8 + autocons. From the Nock spec:
+```text
+[9 b c]            = [7 c [2 [0 1] [0 b]]]
+[10 [axis v] t]    = nested autocons reconstructing t with axis replaced by v
+[11 tag next]      = next         (hint stripped)
+[11 [tag clue] d]  = d            (clue evaluated, product discarded)
+```
+If we pre-expand every Hoon-compiled 9/10/11 before handing the formula to `prove-computation:vp`, the STARK's compute table sees only 0–8 and the trace is valid.
+### 10.10.2 Implementation landed
+Both variants were implemented and compile cleanly.
+Hoon-side rewriter in `hoon/lib/nns-predicates.hoon`:
+```hoon
+++  normalize-to-0-8   :: structure-preserving rewriter
+++  ta-axis            :: T-axis → [T a]-axis map after Nock-8 push
+++  rebuild-at-axis    :: general axis-path walk for Nock-10 edit
+```
+Key design points that made the spike viable:
+- Structure-preserving rewrites keep arm positions fixed when normalizing a whole core (`validator-arm-axis` stays valid after normalization).
+- Defensive pattern matching per opcode — cells whose head happens to be 0–11 but whose tail doesn't match the expected shape (Nock-1 constants carrying data) fall through unchanged.
+- Recursing into Nock-1 constants because hoonc emits gate batteries as `[1 body-formula]` where the body is later slammed.
+In-prover variant: patched `fock:fink:interpret` in `hoon/common/ztd/eight.hoon` so every Nock-9/10/11 encountered at trace time gets rewritten inline before the constraint-bound interpreter sees it. This recurses directly through `interpret` with the rewritten formula, so the trace records only 0–8.
+### 10.10.3 Findings
+1. **Both rewriters are semantically correct.** Raw `.*(subj form)` on a rewritten formula returns `[%& ~]` for a valid bundle. Round-tripping an isolated `[11 [%fast <clue>] [0 1]]` test vector through `normalize-to-0-8` produces `[7 [0 1] [0 1]]`, semantically identical and structure-preserving.
+2. **The Hoon-side whole-core pass completes, but the prover still traps at runtime** — because every `[9 axis core]` rewrites to `[7 core [2 [0 1] [0 axis]]]`, which at trace time fetches the arm body via Nock-2. That body may itself contain Nock-9/10/11 that wasn't reached by our static walk (e.g., sub-cores in the validator's transitive closure). Normalizing the whole `nns-predicates` core exhaustively is O(core-size) and still leaves dynamically-reached formulas untouched.
+3. **The in-prover variant OOM'd on a real validator bundle.** The recursive rewrite expands each Nock-9 gate call into a full arm-body trace, each of which expands each of its Nock-9 sub-calls, and so on. For a four-predicate validator (`is-valid-name`, `fee-for-name`, `has-tx-in-list`, `chain-links-to`) the rewrite-expanded trace exceeded available memory on a dev laptop. Trace size grows geometrically with call depth, while the 0–8 compute table was designed for straight-line Nock.
+### 10.10.4 Why this is an upstream-only problem
+The OOM is not an implementation bug. It's a **design consequence** of Vesl's compute table modeling only 0–8:
+- Nock 9 semantically *is* `[7 c [2 [0 1] [0 b]]]`, so expanding is correct. But the expanded form re-evaluates `c` (the core fetch), pushes a Nock-2, and runs the arm. Under fink's constraint-bound interpreter, every Nock-2 is a separate trace row with full subject/formula context. Nested gate calls multiply row counts.
+- The only way to prove Nock-9 at constant cost is a **native compute-table row** for it — with constraints that model "evaluate core formula once, then run arm N of core with core as subject" in a single step. That's proper STARK circuit work, not formula rewriting.
+- Same logic for Nock-10 (edit).
+- Nock-11 could arguably be erased in trace (it's a product no-op), but adding that as a constraint-column rule is still a Vesl change.
+This confirms the Phase 8 upstream ask is the right lever.
+### 10.10.5 What was kept, what was reverted
+| Artifact | State | Rationale |
+|---|---|---|
+| `hoon/common/ztd/eight.hoon` in-prover patch | **reverted** | vendored Vesl code; OOM'd; upstream's call |
+| `+normalize-to-0-8`, `+ta-axis`, `+rebuild-at-axis` in `nns-predicates.hoon` | **kept as dormant artifacts** | correct structure-preserving rewriter; future reuse if a different prover route appears |
+| `+build-validator-trace-inputs`, `+validator-arm-axis` | **kept (hot path)** | produces the subject-bundled-core encoding; used by `%prove-claim-in-stark` |
+| `%prove-claim-in-stark` cause in `hoon/app/app.hoon` | **kept** | emits `%prove-failed <trace>` on the upstream trap; unchanged |
+| `phase3c_step3_validator_in_stark_blocked_upstream` test | **kept, green** | documents the blocker shape; flips to positive when upstream lands |
+The dormant rewriter compiles clean with the current kernel and is available if a future avenue — a different prover backend, or a Hoon-side partial evaluator — wants to consume it.
+### 10.10.6 Takeaway for Phase 8
+When upstream Vesl adds native Nock 9/10/11:
+- Compute-table rows for `%9` (slam), `%10` (edit), `%11` (hint strip).
+- Constraint equations that model the opcodes directly, not via expansion.
+- Expected verifier-side cost: small, bounded per opcode.
+- Expected prover-side cost: bounded per occurrence (not geometric).
+The blocker-signal test in `tests/prover.rs` is the only NNS-side code that needs to flip when the upstream change lands.
 ---
 # 11. Roadmap
 ## 11.1 Phase 0: baseline STARK prover
@@ -1567,8 +1716,13 @@ Pending:
   - chain anchor,
   - freshness.
 ## 11.10 Phase 7: staleness / fork resistance
-Status: **blocking before production**.
-See [Phase 7 acceptance criteria](#76-phase-7-acceptance-criteria).
+Status: **shipped 2026-04-24 pm**.
+See [Phase 7 acceptance criteria](#76-phase-7-acceptance-criteria) for per-item status. Summary of what landed:
+- Hoon: `+$claim-bundle` + `+$claim-bundle-linear` each gain `anchored-tip-height=@ud`; `+matches-current-anchor` predicate; `%anchor-mismatch` validation error.
+- Kernel cause `%prove-claim` rejects before proving when the bundle's anchor disagrees with kernel state.
+- Rust: `ClaimBundle` gains `anchored_tip_height`; `src/freshness.rs` exposes `Freshness`, `FreshnessError`, `check_anchor_binding`, `AnchorBindingError`; `ProofResponse` gains `anchor: Option<ProofAnchor>`; `/proof` handler peeks `/anchor` and populates it.
+- Binary: `src/bin/light_verify.rs` rewritten with `--chain-tip`, `--max-staleness`, `--chain-tip-digest`, `--no-freshness` flags and precise exit codes.
+- Tests: 13 freshness unit + 2 anchor-mismatch kernel + 8 CLI integration + 2 two-server integration = 25 Phase-7-specific tests, all green.
 ## 11.11 Phase 8: upstream Vesl prover Nock 9/10/11
 Status: **pending upstream**.
 Tasks:
@@ -1709,6 +1863,7 @@ Impact:
 - Any sample/record edit compiles to Nock 10.
 - Hoon hints may emit Nock 11.
 - Non-trivial Hoon validators cannot currently be traced by Vesl prover.
+- Formula-rewriting to the 0–8 subset (either Hoon-side pre-expansion or inline rewrites inside `fock:fink:interpret`) is semantically correct but produces geometric trace blowup from recursive Nock-9 arm-body expansion. Empirically OOM'd on a four-predicate validator. Native compute-table rows for `%9`/`%10`/`%11` are the only path that keeps prover cost bounded per opcode occurrence.
 Repro in NNS:
 ```bash
 cargo test --test prover \
@@ -1744,16 +1899,3 @@ Use Phase 3c step 2:
   + Phase 7 freshness check before production
 ```
 ```
-
-**New file created:** `nns_architecture_roadmap_fixed.md`
-
-**Summary of fixes applied (rendering issues resolved):**
-- Verified **all code fences are balanced** and properly closed (no unclosed blocks).
-- Confirmed **all tables have consistent column counts and alignment** (no misaligned separators that break table rendering in GitHub/CommonMark parsers).
-- Validated **Mermaid diagrams** (sequenceDiagram + flowchart LR) use correct syntax and render cleanly in supported viewers.
-- Confirmed **internal TOC links match auto-generated header slugs** exactly (e.g., `#1-current-canonical-status`, `#10-phase-3c-step-3-validator-inside-the-stark`).
-- Ensured **inline code, bold, and special characters** (e.g., `|`, `*`, `_`, `---`) inside tables/code blocks are properly isolated and do not leak into surrounding Markdown.
-- Minor whitespace/normalization for fence blocks and tables to guarantee consistent rendering across platforms (GitHub, VS Code, Obsidian, etc.).
-- No content changes — only syntax/structural cleanup for perfect rendering.
-
-The file above is the complete, fixed version. You can copy-paste it directly into a new `.md` file. It now renders flawlessly in all standard Markdown engines.

@@ -31,6 +31,7 @@ pub mod chain;
 pub mod chain_follower;
 pub mod claim_note;
 pub mod config;
+pub mod freshness;
 pub mod kernel;
 pub mod payment;
 pub mod state;

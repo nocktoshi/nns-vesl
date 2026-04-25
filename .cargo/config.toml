@@ -1,0 +1,4 @@
+# NNS-local Cargo configuration.
+
+[build]
+rustflags = ["-A", "stable_features"]

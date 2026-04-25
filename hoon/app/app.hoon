@@ -280,6 +280,11 @@
           page-digest=@ux
           page-tx-ids=(list @ux)
           anchored-tip=@ux
+          anchored-tip-height=@ud
+          witness-tx-id=@ux
+          witness-spender-pkh=@
+          witness-treasury-amount=@ud
+          witness-treasury-address=@t
       ==
       ::  Phase 3c step 2: validated proof of a single claim.
       ::
@@ -313,6 +318,11 @@
           page-digest=@ux
           page-tx-ids=(list @ux)
           anchored-tip=@ux
+          anchored-tip-height=@ud
+          witness-tx-id=@ux
+          witness-spender-pkh=@
+          witness-treasury-amount=@ud
+          witness-treasury-address=@t
       ==
       ::  Phase 3c step 3: general-purpose prover primitive. Takes an
       ::  arbitrary `[subject formula]` pair and traces
@@ -344,6 +354,29 @@
       ::  Nock-noun shape.
       ::
       [%prove-arbitrary subject-jam=@ formula-jam=@]
+      ::  Phase 3c step 3 completion: proves a claim bundle by
+      ::  tracing `validate-claim-bundle-linear(bundle)` INSIDE the
+      ::  STARK. Uses the subject-bundled-core encoding from
+      ::  `build-validator-trace-inputs:np`.
+      ::
+      ::  Emits `[%claim-in-stark-proof product proof]` on success.
+      ::  The `product` is `(each ~ validation-error):np` head-tagged:
+      ::  `[%& ~]` iff validation passed, `[%| err]` on rejection.
+      ::  Wallet reads product and proof — no re-running the
+      ::  validator. Single-artifact trust.
+      ::
+      $:  %prove-claim-in-stark
+          name=@t
+          owner=@t
+          fee=@ud
+          tx-hash=@ux
+          claim-block-digest=@ux
+          anchor-headers=(list anchor-header)
+          page-digest=@ux
+          page-tx-ids=(list @ux)
+          anchored-tip=@ux
+          anchored-tip-height=@ud  ::  Phase 7
+      ==
       ::  nockup:cause
       ::  graft-inject would add `vesl-cause` here on a fresh
       ::  kernel. Already present below; marker is idempotent.
@@ -935,6 +968,12 @@
         %validate-claim
       =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
       =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
+      =/  wit=nns-raw-tx-witness:np
+        :*  witness-tx-id.u.act
+            witness-spender-pkh.u.act
+            witness-treasury-amount.u.act
+            witness-treasury-address.u.act
+        ==
       =/  bundle=claim-bundle:np
         :*  name.u.act
             owner.u.act
@@ -944,6 +983,8 @@
             anchor-headers.u.act
             pag
             anchored-tip.u.act
+            anchored-tip-height.u.act
+            wit
         ==
       =/  res=(each ~ validation-error:np)
         (validate-claim-bundle:np bundle)
@@ -970,6 +1011,12 @@
         %prove-claim
       =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
       =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
+      =/  wit=nns-raw-tx-witness:np
+        :*  witness-tx-id.u.act
+            witness-spender-pkh.u.act
+            witness-treasury-amount.u.act
+            witness-treasury-address.u.act
+        ==
       =/  bundle=claim-bundle:np
         :*  name.u.act
             owner.u.act
@@ -979,7 +1026,39 @@
             anchor-headers.u.act
             pag
             anchored-tip.u.act
+            anchored-tip-height.u.act
+            wit
         ==
+      ::  Phase 7: bind the proof to the kernel's *current* anchor.
+      ::  The bundle carries the anchor the hull believes the kernel
+      ::  is on; if the hull is stale the proof MUST refuse rather
+      ::  than produce a stale attestation. This is what lets wallets
+      ::  enforce freshness on the proof-time tip height later.
+      ::
+      ?.  %-  matches-current-anchor:np
+          :*  anchored-tip.u.act
+              anchored-tip-height.u.act
+              tip-digest.anchor.state
+              tip-height.anchor.state
+          ==
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-error %anchor-mismatch]]
+      ::  Level C-A: bind the proof to the kernel's *configured*
+      ::  treasury. A claim whose witness claims payment to a
+      ::  different treasury can't prove against this kernel.
+      ::  Requires `payment-address` to be set; if not, refuse
+      ::  (the kernel operator hasn't finished bootstrap).
+      ::
+      ?~  payment-address.state
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-error %witness-wrong-treasury]]
+      ?.  %-  matches-treasury:np
+          [wit u.payment-address.state]
+        :_  state
+        ^-  (list effect)
+        ~[[%validate-claim-error %witness-wrong-treasury]]
       =/  v-res=(each ~ validation-error:np)
         (validate-claim-bundle:np bundle)
       ?.  ?=(%& -.v-res)
@@ -1076,6 +1155,63 @@
       :_  state
       ^-  (list effect)
       ~[[%arbitrary-proof product the-proof]]
+      ::
+        ::  %prove-claim-in-stark: Phase 3c step 3 completion.
+        ::  Builds the subject+formula pair via the nns-predicates
+        ::  library, runs prove-computation, emits the trace's
+        ::  committed product (the validator's return value) alongside
+        ::  the STARK. Wallet verifies proof, reads product — no
+        ::  validator re-run required.
+        ::
+        %prove-claim-in-stark
+      =/  bundle=claim-bundle-linear:np
+        :*  name.u.act
+            owner.u.act
+            fee.u.act
+            tx-hash.u.act
+            claim-block-digest.u.act
+            anchor-headers.u.act
+            page-digest.u.act
+            page-tx-ids.u.act
+            anchored-tip.u.act
+            anchored-tip-height.u.act
+        ==
+      =/  [subj=* form=*]  (build-validator-trace-inputs:np bundle)
+      ::
+      ::  Dry-run outside the STARK to catch validator-level bugs
+      ::  before paying for a prover run. `.*` on the raw nockvm
+      ::  supports the full Nock opcode set, unlike `fink:fock`
+      ::  (which is restricted to opcodes 0-8 for STARK-tractability).
+      ::  The validator body uses Nock 9 (slam) and Nock 10 (edit)
+      ::  via the subject-bundled-core encoding — those ops are
+      ::  currently `!!` in `common/ztd/eight.hoon` under Vesl's
+      ::  prover, so the `prove-computation` call below will trap
+      ::  until upstream Vesl extends `interpret`.
+      ::
+      =/  dry-run
+        %-  mule  |.  .*(subj form)
+      ?.  ?=(%& -.dry-run)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.dry-run)]]
+      =/  attempt
+        %-  mule  |.
+        (prove-computation:vp subj form root.state hull.state)
+      ?.  ?=(%& -.attempt)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.attempt)]]
+      =/  pr  p.attempt
+      ?.  ?=(%& -.pr)
+        :_  state
+        ^-  (list effect)
+        ~[[%prove-failed (jam p.pr)]]
+      =/  the-proof=proof:sp  p.pr
+      =/  product=*  .*(subj form)
+      =.  last-proved.state  `[subj form]
+      :_  state
+      ^-  (list effect)
+      ~[[%claim-in-stark-proof product the-proof]]
       ::
         %set-primary
       =/  c  u.act

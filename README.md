@@ -525,10 +525,6 @@ cargo +nightly test
 # Light-client proof verification (reads ProofResponse JSON from stdin)
 curl "http://127.0.0.1:3000/proof?name=nns.nock" | cargo +nightly run --bin light_verify
 
-# API parity against the legacy worker
-scripts/parity.py \
-  --old https://nocknames.nockblocks.workers.dev \
-  --new http://127.0.0.1:3000
 ```
 
 ## Settlement

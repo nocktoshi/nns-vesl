@@ -64,15 +64,16 @@ async fn poke_with_timeout(
 
 use crate::kernel::{
     build_last_settled_peek, build_owner_peek, build_pending_batch_peek,
-    build_proof_peek, build_set_primary_poke, build_settle_batch_poke, build_snapshot_peek,
-    decode_last_settled, decode_owner, decode_pending_batch, decode_proof, decode_snapshot,
-    first_batch_settled, first_error_message, first_primary_set, first_vesl_settled,
+    build_anchor_peek, build_proof_peek, build_set_primary_poke, build_settle_batch_poke,
+    build_snapshot_peek, decode_anchor, decode_last_settled, decode_owner, decode_pending_batch,
+    decode_proof, decode_snapshot, first_batch_settled, first_error_message, first_primary_set,
+    first_vesl_settled,
 };
 use crate::claim_note::ClaimNoteV1;
 use crate::payment;
 use crate::state::{hex_encode, SharedState};
 use crate::types::{
-    ClaimRequest, ClaimStatusResponse, ClaimSubmissionResponse, ClaimLifecycleStatus, PendingBatchResponse, ProofNodeView, ProofResponse, ProofSide, TransitionProofMetadata,
+    ClaimRequest, ClaimStatusResponse, ClaimSubmissionResponse, ClaimLifecycleStatus, PendingBatchResponse, ProofAnchor, ProofNodeView, ProofResponse, ProofSide, TransitionProofMetadata,
     RegisterRequest, Registration, RegistrationStatus, SearchByAddressResponse,
     SearchByNameResponse, SearchStatus, SetPrimaryRequest, SetPrimaryResponse, SettleResponse,
 };
@@ -159,6 +160,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/resolve", get(resolve_handler))
         .route("/proof", get(proof_handler))
         .route("/search", get(search_handler))
+        // Phase 7.1 — Operator observability.
+        .route("/anchor", get(anchor_handler))
+        .route("/admin/advance-tip-now", post(admin_advance_tip_now))
         .layer(cors)
         .with_state(state)
 }
@@ -172,22 +176,206 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let st = state.lock().await;
+    let mut st = state.lock().await;
     // `pending_batch_count` is the size of the settlement pending
     // window — what /pending-batch would return — and is distinct
     // from `pending_count` (pending *reservations* that haven't been
     // %claim'd yet). Both are useful surfaces.
     let claim_id = st.mirror.snapshot.as_ref().map(|s| s.claim_id).unwrap_or(0);
     let pending_batch_count = claim_id.saturating_sub(st.mirror.last_settled_claim_id);
+
+    // Phase 7.1: follower / anchor observability. Peek the kernel's
+    // authoritative anchor; fall back to None if the peek fails (the
+    // follower telemetry below surfaces the error separately so the
+    // operator still sees something).
+    let anchor_kernel = st
+        .app
+        .peek(build_anchor_peek())
+        .await
+        .ok()
+        .and_then(|slab| decode_anchor(&slab).ok());
+
+    let follower = st.follower.clone();
+    let (anchor_lag_blocks, follower_is_caught_up) = match (
+        follower.last_chain_tip_height,
+        anchor_kernel.as_ref().map(|a| a.tip_height),
+    ) {
+        (Some(chain_tip), Some(anchor_tip)) => {
+            let lag = chain_tip.saturating_sub(anchor_tip);
+            // "caught up" = within one batch of the chain tip accounting
+            // for the deliberate finality lag.
+            let caught_up = lag <= crate::chain_follower::DEFAULT_FINALITY_DEPTH + 1;
+            (Some(lag), Some(caught_up))
+        }
+        _ => (None, None),
+    };
+
+    let follower_age_seconds = follower
+        .last_advance_at_epoch_ms
+        .map(|t| crate::state::AppState::now_epoch_ms().saturating_sub(t) / 1000);
+
     Json(json!({
         "settlement_mode": st.settlement.mode.to_string(),
+        "chain_endpoint": st.settlement.chain_endpoint.clone(),
         "names_count": st.mirror.names.len(),
         "pending_count": st.mirror.by_status(RegistrationStatus::Pending).len(),
         "registered_count": st.mirror.by_status(RegistrationStatus::Registered).len(),
         "snapshot": st.mirror.snapshot,
         "last_settled_claim_id": st.mirror.last_settled_claim_id,
         "pending_batch_count": pending_batch_count,
+        "anchor": anchor_kernel.as_ref().map(|a| json!({
+            "tip_height": a.tip_height,
+            "tip_digest": crate::state::hex_encode(&a.tip_digest),
+        })),
+        "follower": json!({
+            "chain_tip_height":                follower.last_chain_tip_height,
+            "anchor_lag_blocks":               anchor_lag_blocks,
+            "is_caught_up":                    follower_is_caught_up,
+            "last_advance_at_epoch_ms":        follower.last_advance_at_epoch_ms,
+            "last_advance_age_seconds":        follower_age_seconds,
+            "last_advance_tip_height":         follower.last_advance_tip_height,
+            "last_advance_count":              follower.last_advance_count,
+            "last_chain_tip_observed_at_epoch_ms": follower.last_chain_tip_observed_at_epoch_ms,
+            "last_error":                      follower.last_error,
+            "last_error_phase":                follower.last_error_phase,
+            "last_error_at_epoch_ms":          follower.last_error_at_epoch_ms,
+            "finality_depth":                  crate::chain_follower::DEFAULT_FINALITY_DEPTH,
+            "max_advance_batch":               crate::chain_follower::DEFAULT_MAX_ADVANCE_BATCH,
+        }),
     }))
+}
+
+/// `GET /anchor` — Phase 7.1 dedicated anchor surface.
+///
+/// Returns the kernel's authoritative anchor digest + height
+/// alongside the follower's most recent chain-tip observation,
+/// lag, and last advance timestamp. Wallets use this to seed the
+/// `light_verify --chain-tip --chain-tip-digest` flags; operators
+/// use it as the single-source for "is the follower stuck?".
+///
+/// Response shape (200 on success):
+///
+/// ```json
+/// {
+///   "anchor": { "tip_height": 120, "tip_digest": "0x..." },
+///   "chain_tip_height": 130,
+///   "anchor_lag_blocks": 10,
+///   "is_caught_up": true,
+///   "last_advance_at_epoch_ms": 1735689600000,
+///   "last_error": null,
+///   "finality_depth": 10
+/// }
+/// ```
+///
+/// Returns 503 when the kernel anchor peek fails (and no follower
+/// telemetry is available either) — the operator needs to know the
+/// service is effectively blind rather than getting a confusing
+/// all-nulls 200.
+async fn anchor_handler(
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    let mut st = state.lock().await;
+
+    let anchor_kernel = st
+        .app
+        .peek(build_anchor_peek())
+        .await
+        .ok()
+        .and_then(|slab| decode_anchor(&slab).ok());
+
+    let follower = st.follower.clone();
+
+    // If we have neither a kernel anchor nor a single chain-tip
+    // observation, we're completely blind — 503 is more useful than
+    // a 200 with all nulls.
+    if anchor_kernel.is_none() && follower.last_chain_tip_height.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "anchor peek failed and follower has no chain observations yet".into(),
+            }),
+        ));
+    }
+
+    let anchor_lag_blocks = match (
+        follower.last_chain_tip_height,
+        anchor_kernel.as_ref().map(|a| a.tip_height),
+    ) {
+        (Some(chain_tip), Some(anchor_tip)) => Some(chain_tip.saturating_sub(anchor_tip)),
+        _ => None,
+    };
+    let is_caught_up = anchor_lag_blocks.map(|lag| {
+        lag <= crate::chain_follower::DEFAULT_FINALITY_DEPTH + 1
+    });
+
+    Ok(Json(json!({
+        "anchor": anchor_kernel.as_ref().map(|a| json!({
+            "tip_height": a.tip_height,
+            "tip_digest": crate::state::hex_encode(&a.tip_digest),
+        })),
+        "chain_tip_height":                    follower.last_chain_tip_height,
+        "anchor_lag_blocks":                   anchor_lag_blocks,
+        "is_caught_up":                        is_caught_up,
+        "last_advance_at_epoch_ms":            follower.last_advance_at_epoch_ms,
+        "last_advance_tip_height":             follower.last_advance_tip_height,
+        "last_advance_count":                  follower.last_advance_count,
+        "last_chain_tip_observed_at_epoch_ms": follower.last_chain_tip_observed_at_epoch_ms,
+        "last_error":                          follower.last_error,
+        "last_error_phase":                    follower.last_error_phase,
+        "last_error_at_epoch_ms":              follower.last_error_at_epoch_ms,
+        "finality_depth":                      crate::chain_follower::DEFAULT_FINALITY_DEPTH,
+        "max_advance_batch":                   crate::chain_follower::DEFAULT_MAX_ADVANCE_BATCH,
+        "settlement_mode":                     st.settlement.mode.to_string(),
+        "chain_endpoint":                      st.settlement.chain_endpoint.clone(),
+    })))
+}
+
+/// `POST /admin/advance-tip-now` — Phase 7.1 manual anchor-advance
+/// trigger for debugging.
+///
+/// Drives a single `advance_anchor_once` pass outside the regular
+/// 10 s poll cycle. Useful for:
+///
+/// - verifying a freshly-configured chain endpoint works
+/// - unsticking an anchor without waiting for the next tick
+/// - exercising the anchor-advance path in tests
+///
+/// **Gated by `NNS_ENABLE_ADMIN=1`.** Admin routes are off by
+/// default so a casually-deployed node doesn't expose the
+/// mutation surface to the world. Returns 404 when disabled so
+/// scanners can't fingerprint the presence of admin endpoints.
+async fn admin_advance_tip_now(
+    State(state): State<SharedState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorBody>)> {
+    if !admin_enabled() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: "not found".into(),
+            }),
+        ));
+    }
+
+    match crate::chain_follower::advance_anchor_once(&state).await {
+        Ok(Some(advanced)) => Ok(Json(json!({
+            "advanced": true,
+            "tip_height": advanced.tip_height,
+            "tip_digest": crate::state::hex_encode(&advanced.tip_digest),
+            "count": advanced.count,
+        }))),
+        Ok(None) => Ok(Json(json!({
+            "advanced": false,
+            "reason": "no-op (local mode, endpoint missing, or within finality depth)",
+        }))),
+        Err(e) => Err(server_error(format!("advance-tip failed: {e}"))),
+    }
+}
+
+fn admin_enabled() -> bool {
+    matches!(
+        std::env::var("NNS_ENABLE_ADMIN").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
 }
 
 async fn register_handler(
@@ -763,21 +951,59 @@ async fn proof_handler(
     let proof = decode_proof(&proof_slab)
         .map_err(|e| server_error(format!("proof decode failed: {e}")))?;
 
-    let snap_slab = st
+    // Snapshot peek — tolerate a deterministic-exit by falling back
+    // to the mirror cache (same degradation `/snapshot` already
+    // performs). Keeps `/proof` functional for legacy kernels whose
+    // peek arms hit post-upgrade edge cases. If neither peek nor
+    // mirror produces a snapshot, surface a precise error.
+    let snap = match st
         .app
         .peek(build_snapshot_peek())
         .await
-        .map_err(|e| server_error(format!("snapshot peek failed: {e:?}")))?;
-    let snap = decode_snapshot(&snap_slab)
-        .map_err(|e| server_error(format!("snapshot decode failed: {e}")))?;
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|slab| decode_snapshot(&slab))
+    {
+        Ok(s) => (s.claim_id, hex_encode(&s.hull), hex_encode(&s.root)),
+        Err(peek_err) => match st.mirror.snapshot.clone() {
+            Some(cached) => (cached.claim_id, cached.hull, cached.root),
+            None => {
+                return Err(server_error(format!(
+                    "snapshot peek failed and mirror has no cached snapshot: {peek_err}"
+                )));
+            }
+        },
+    };
+
+    // Phase 7: best-effort anchor peek. If the kernel anchor peek
+    // fails (legacy state edge case), omit the `anchor` field and
+    // let the wallet's `light_verify` treat the proof as Phase-7-
+    // pre-freshness — the CLI rejects with exit 4 unless explicitly
+    // `--no-freshness`'d. Never 500 on anchor-peek failure; callers
+    // querying `/proof` on pre-Phase-7 state should still succeed
+    // at reading Merkle inclusion.
+    let anchor = match st
+        .app
+        .peek(build_anchor_peek())
+        .await
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|slab| decode_anchor(&slab))
+    {
+        Ok(view) => Some(ProofAnchor {
+            tip_digest: hex_encode(&view.tip_digest),
+            tip_height: view.tip_height,
+        }),
+        Err(_) => None,
+    };
+
+    let (_snap_claim_id, snap_hull_hex, snap_root_hex) = snap;
 
     Ok(Json(ProofResponse {
         name,
         owner: entry.owner,
         tx_hash: entry.tx_hash,
         claim_id: entry.claim_count,
-        root: hex_encode(&snap.root),
-        hull: hex_encode(&snap.hull),
+        root: snap_root_hex,
+        hull: snap_hull_hex,
         proof: proof
             .into_iter()
             .map(|p| ProofNodeView {
@@ -794,6 +1020,7 @@ async fn proof_handler(
             settled_claim_id: st.mirror.last_settled_claim_id,
         },
         transition_proof: None,
+        anchor,
     }))
 }
 

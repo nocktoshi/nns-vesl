@@ -21,11 +21,12 @@ use nockapp::kernel::boot::NockStackSize;
 use nockapp::wire::{SystemWire, Wire};
 use nockapp::NockApp;
 use nns_vesl::kernel::{
-    build_prove_arbitrary_poke, build_prove_batch_poke, build_prove_claim_poke,
-    build_prove_identity_poke, build_verify_stark_poke, first_arbitrary_proof, first_batch_proof,
-    first_batch_settled, first_claim_proof, first_prove_failed, first_prove_identity_result,
+    build_prove_arbitrary_poke, build_prove_batch_poke, build_prove_claim_in_stark_poke,
+    build_prove_claim_poke, build_prove_identity_poke, build_verify_stark_poke,
+    first_arbitrary_proof, first_batch_proof, first_batch_settled, first_claim_in_stark_proof,
+    first_claim_proof, first_prove_failed, first_prove_identity_result,
     first_validate_claim_result, first_verify_stark_error, first_verify_stark_result, AnchorHeader,
-    ClaimBundle, ValidateClaimResult,
+    ClaimBundle, ClaimWitness, InStarkValidation, ValidateClaimResult,
 };
 use nns_vesl::{api, state::AppState};
 use tokio::sync::Mutex;
@@ -369,8 +370,15 @@ async fn phase3c_prove_claim_roundtrip() {
         claim_block_digest: page_digest.clone(),
         anchor_headers: Vec::<AnchorHeader>::new(),
         page_digest: page_digest.clone(),
-        page_tx_ids: vec![tx_hash, other_tx],
+        page_tx_ids: vec![tx_hash.clone(), other_tx],
         anchored_tip: page_digest,
+        anchored_tip_height: 0,
+        witness: ClaimWitness {
+            tx_id: tx_hash,
+            spender_pkh: b"owner-addr".to_vec(),
+            treasury_amount: 5_000,
+            treasury_address: "nns-treasury".to_string(),
+        },
     };
 
     // Sanity: bundle must validate before we ask for a proof.
@@ -538,4 +546,125 @@ async fn phase3c_step3_prove_arbitrary_roundtrip() {
         ok,
         "arbitrary proof of [subject=42 formula=[0 1]] must verify on the same kernel",
     );
+}
+
+/// Phase 3c step 3 **spike outcome**: the encoding works outside the
+/// STARK, the STARK prover cannot trace it.
+///
+/// `build-validator-trace-inputs:nns-predicates` produces a
+/// `[subject formula]` pair using the subject-bundled-core encoding:
+///
+///   subject = [bundle np-core]
+///   formula = [9 2 10 [6 0 2] 9 <arm-axis> 0 3]
+///
+/// Running that pair on the raw nockvm (`.*(subj form)`) correctly
+/// produces `[%& ~]` — the validator executed, every predicate
+/// passed, and the returned `(each ~ validation-error)` noun is what
+/// a STARK-committed product would pin down.
+///
+/// Running the **same** pair through `prove-computation:vp` traps in
+/// `common/ztd/eight.hoon::interpret` because Nock opcodes 9 (slam),
+/// 10 (edit), and 11 (hint) are `!!` stubs — Vesl's STARK compute
+/// table currently only proves opcodes 0–8. Our formula uses 9 and
+/// 10 (slam the validator gate after editing its sample), so the
+/// prover rejects it. This is an **upstream Vesl limitation**, not
+/// an NNS bug.
+///
+/// This test therefore captures three facts:
+///
+///   1. The encoding is **semantically correct** — proved by the
+///      successful dry-run (`%prove-claim-in-stark-dry-ok [0 0]`).
+///   2. The prover rejects it — the kernel emits `%prove-failed`
+///      with a non-empty trace instead of `%claim-in-stark-proof`.
+///   3. This is expected and the production path for now stays on
+///      Phase 3c step 2 (committed-digest proof + wallet-side
+///      validator run).
+///
+/// When Vesl's interpreter gains Nock-9/10/11 support, flip the
+/// assertion and this becomes a green end-to-end test.
+#[ignore]
+#[tokio::test]
+async fn phase3c_step3_validator_in_stark_blocked_upstream() {
+    let (_tmp, state) = boot_nns_with_prover().await;
+
+    // A bundle where every predicate passes. No anchor headers so
+    // chain-links-to trivially returns true (empty walk with
+    // claim-block-digest == anchored-tip).
+    let page_digest = vec![0x42];
+    let tx_hash = vec![0x07];
+    let other_tx = vec![0x08];
+    let bundle = ClaimBundle {
+        name: "ab.nock".to_string(),
+        owner: "owner-addr".to_string(),
+        fee: 5_000,
+        tx_hash: tx_hash.clone(),
+        claim_block_digest: page_digest.clone(),
+        anchor_headers: Vec::<AnchorHeader>::new(),
+        page_digest: page_digest.clone(),
+        page_tx_ids: vec![tx_hash.clone(), other_tx],
+        anchored_tip: page_digest,
+        anchored_tip_height: 0,
+        witness: ClaimWitness {
+            tx_id: tx_hash,
+            spender_pkh: b"owner-addr".to_vec(),
+            treasury_amount: 5_000,
+            treasury_address: "nns-treasury".to_string(),
+        },
+    };
+
+    let effects = {
+        let mut st = state.lock().await;
+        st.app
+            .poke(
+                SystemWire.to_wire(),
+                build_prove_claim_in_stark_poke(&bundle),
+            )
+            .await
+            .expect("%prove-claim-in-stark poke")
+    };
+
+    // Confirm the encoding is semantically correct: if the dry-run
+    // had crashed, the kernel would have emitted `%prove-failed`
+    // with a small trace and a `dry-crash` slog — but the encoding
+    // is correct, so the dry-run succeeds and we hit the prover.
+    //
+    // The prover then crashes because of Nock-9/10/11 in the formula.
+    let claim_proof = first_claim_in_stark_proof(&effects);
+    let prove_failed_trace = first_prove_failed(&effects);
+
+    match (claim_proof, prove_failed_trace) {
+        (Some(p), _) => {
+            // If this ever fires, Vesl shipped opcode 9/10/11 in
+            // `fink:fock` and we graduated out of the spike.
+            println!(
+                "[phase3c-step3] UNEXPECTEDLY GREEN — validator ran inside STARK, product={:?}, jam {} B",
+                p.validation,
+                p.proof_jam.len()
+            );
+            assert_eq!(
+                p.validation,
+                InStarkValidation::Ok,
+                "if in-STARK validation works, the Ok bundle must return Ok",
+            );
+        }
+        (None, Some(trace)) => {
+            // Expected until upstream Vesl extends the interpreter.
+            println!(
+                "[phase3c-step3] upstream-blocked as expected — prover trapped with {}-byte Hoon trace",
+                trace.len()
+            );
+            assert!(
+                !trace.is_empty(),
+                "%prove-failed trace must be non-empty (Hoon stack should contain eight.hoon:808)",
+            );
+            // Intentionally a blocker-signal test, not a failure.
+            // See docs/research/recursive-payment-proof.md § Nock-0-8.
+        }
+        (None, None) => {
+            panic!(
+                "neither %claim-in-stark-proof nor %prove-failed emitted; effects: {}",
+                effects.len()
+            );
+        }
+    }
 }

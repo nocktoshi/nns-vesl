@@ -40,6 +40,8 @@ use nock_noun_rs::{
 };
 use nockvm::noun::{Noun, D, T};
 
+use crate::freshness::{AnchorBindingError, Freshness, FreshnessError};
+
 // ---------------------------------------------------------------------------
 // Poke builders
 // ---------------------------------------------------------------------------
@@ -333,7 +335,88 @@ pub struct ClaimBundle {
     pub anchor_headers: Vec<AnchorHeader>,
     pub page_digest: Vec<u8>,
     pub page_tx_ids: Vec<Vec<u8>>,
+    /// Follower-advanced canonical tip digest the bundle's chain
+    /// link should resolve to. Hull must set this to
+    /// `AnchorView::tip_digest` at bundle-build time.
     pub anchored_tip: Vec<u8>,
+    /// Follower-advanced canonical tip height at bundle-build
+    /// time. **Phase 7**: `%prove-claim` refuses to emit a proof
+    /// unless `anchored_tip_height` equals the kernel's current
+    /// `tip-height`; this cryptographically binds the claim proof
+    /// to a specific chain snapshot. Wallets later enforce
+    /// freshness by checking `anchored_tip_height >= their_chain_tip
+    /// - max_staleness`. Default `max_staleness = 20` blocks.
+    pub anchored_tip_height: u64,
+    /// **Level C-A** payment-semantic witness. Hull extracts these
+    /// four fields from the on-chain raw-tx; kernel enforces
+    /// `tx-id == claim.tx_hash`, `spender-pkh == claim.owner`,
+    /// `treasury-amount >= fee-for-name(name)`, and (kernel-state-
+    /// relative) `treasury-address == kernel.payment-address`.
+    ///
+    /// Mirrors `nns-raw-tx-witness` in `hoon/lib/nns-predicates.hoon`.
+    /// All four fields are flattened onto the poke payload (rather
+    /// than nested) to keep the poke-builder simple.
+    pub witness: ClaimWitness,
+}
+
+/// Level C-A narrow witness for a claim's on-chain payment. Maps
+/// to `nns-raw-tx-witness` in Hoon.
+///
+/// **Trust model**: the hull parses a real `raw-tx:v1:t` noun from
+/// Nockchain and packs the four fields below. The kernel enforces
+/// consistency between these fields and the claim tuple. A wallet
+/// receiving a proof *should* independently fetch the raw-tx from
+/// its own Nockchain view and verify that it matches the witness —
+/// this is what makes hull extraction a *falsifiable* trust
+/// assumption rather than an unbounded one. See
+/// `ARCHITECTURE.md` §10.9 "Level C" for the full trust ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimWitness {
+    /// Must equal the bundle's `tx_hash`.
+    pub tx_id: Vec<u8>,
+    /// Paying signer's pkh (atom form). Must equal `claim.owner`
+    /// at the kernel's atomic-equality representation.
+    pub spender_pkh: Vec<u8>,
+    /// Total nicks paid to the treasury address across all
+    /// outputs. Must be `>= fee-for-name(claim.name)`.
+    pub treasury_amount: u64,
+    /// Treasury address the hull extracted from the raw-tx. Must
+    /// equal the kernel's configured `payment-address`.
+    pub treasury_address: String,
+}
+
+impl ClaimBundle {
+    /// Phase 7 convenience: check this bundle's `anchored_tip_height`
+    /// against the wallet's current Nockchain tip view under the
+    /// supplied freshness policy.
+    ///
+    /// Typical wallet flow:
+    ///
+    /// ```no_run
+    /// use nns_vesl::{freshness::Freshness, kernel::ClaimBundle};
+    /// # fn example(bundle: &ClaimBundle, chain_tip_height: u64) -> Result<(), Box<dyn std::error::Error>> {
+    /// let policy = Freshness::default(); // 20 blocks
+    /// bundle.check_freshness(chain_tip_height, policy)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn check_freshness(
+        &self,
+        chain_tip_height: u64,
+        policy: Freshness,
+    ) -> Result<(), FreshnessError> {
+        policy.check(self.anchored_tip_height, chain_tip_height)
+    }
+
+    /// Phase 7 convenience: check this bundle's committed tip digest
+    /// matches the wallet's canonical Nockchain view at the same
+    /// height. Use after `check_freshness` passes.
+    pub fn check_anchor_binding(
+        &self,
+        wallet_view_digest: &[u8],
+    ) -> Result<(), AnchorBindingError> {
+        crate::freshness::check_anchor_binding(&self.anchored_tip, wallet_view_digest)
+    }
 }
 
 /// Build a `[%validate-claim ...]` poke slab.
@@ -371,6 +454,13 @@ pub fn build_validate_claim_poke(bundle: &ClaimBundle) -> NounSlab {
     }
 
     let anchored_tip_atom = make_atom_in(&mut slab, &bundle.anchored_tip);
+    let anchored_tip_height_atom = atom_from_u64(&mut slab, bundle.anchored_tip_height);
+
+    // Level C-A witness: four additional atoms tacked on the end.
+    let w_tx_id_atom = make_atom_in(&mut slab, &bundle.witness.tx_id);
+    let w_spender_atom = make_atom_in(&mut slab, &bundle.witness.spender_pkh);
+    let w_amount_atom = atom_from_u64(&mut slab, bundle.witness.treasury_amount);
+    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.treasury_address);
 
     let poke = T(
         &mut slab,
@@ -385,6 +475,11 @@ pub fn build_validate_claim_poke(bundle: &ClaimBundle) -> NounSlab {
             page_digest_atom,
             tx_ids_list,
             anchored_tip_atom,
+            anchored_tip_height_atom,
+            w_tx_id_atom,
+            w_spender_atom,
+            w_amount_atom,
+            w_treasury_atom,
         ],
     );
     slab.set_root(poke);
@@ -461,6 +556,13 @@ pub fn build_prove_claim_poke(bundle: &ClaimBundle) -> NounSlab {
     }
 
     let anchored_tip_atom = make_atom_in(&mut slab, &bundle.anchored_tip);
+    let anchored_tip_height_atom = atom_from_u64(&mut slab, bundle.anchored_tip_height);
+
+    // Level C-A witness.
+    let w_tx_id_atom = make_atom_in(&mut slab, &bundle.witness.tx_id);
+    let w_spender_atom = make_atom_in(&mut slab, &bundle.witness.spender_pkh);
+    let w_amount_atom = atom_from_u64(&mut slab, bundle.witness.treasury_amount);
+    let w_treasury_atom = make_cord_in(&mut slab, &bundle.witness.treasury_address);
 
     let poke = T(
         &mut slab,
@@ -475,6 +577,11 @@ pub fn build_prove_claim_poke(bundle: &ClaimBundle) -> NounSlab {
             page_digest_atom,
             tx_ids_list,
             anchored_tip_atom,
+            anchored_tip_height_atom,
+            w_tx_id_atom,
+            w_spender_atom,
+            w_amount_atom,
+            w_treasury_atom,
         ],
     );
     slab.set_root(poke);
@@ -593,6 +700,140 @@ pub fn arbitrary_proof(effect: &NounSlab) -> Option<ArbitraryProof> {
 
 pub fn first_arbitrary_proof(effects: &[NounSlab]) -> Option<ArbitraryProof> {
     effects.iter().find_map(arbitrary_proof)
+}
+
+/// Build a `[%prove-claim-in-stark ...]` poke slab.
+///
+/// Same payload shape as `%validate-claim` / `%prove-claim`, but the
+/// kernel builds a subject-bundled-core trace via
+/// `build-validator-trace-inputs:nns-predicates` and runs the
+/// validator *inside* the STARK.
+///
+/// On success emits `[%claim-in-stark-proof product proof]` where
+/// `product` is the traced validator's return — a head-tagged
+/// `(each ~ validation-error)` noun. `[%& ~]` means validation
+/// passed, `[%| err]` names the first failing predicate. The wallet
+/// reads the product directly; no validator re-run needed.
+pub fn build_prove_claim_in_stark_poke(bundle: &ClaimBundle) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-claim-in-stark");
+
+    let name_atom = make_cord_in(&mut slab, &bundle.name);
+    let owner_atom = make_cord_in(&mut slab, &bundle.owner);
+    let fee_atom = atom_from_u64(&mut slab, bundle.fee);
+    let tx_hash_atom = make_atom_in(&mut slab, &bundle.tx_hash);
+    let claim_digest_atom = make_atom_in(&mut slab, &bundle.claim_block_digest);
+
+    let mut headers_list = D(0);
+    for h in bundle.anchor_headers.iter().rev() {
+        let digest = make_atom_in(&mut slab, &h.digest);
+        let parent = make_atom_in(&mut slab, &h.parent);
+        let height = atom_from_u64(&mut slab, h.height);
+        let cell = T(&mut slab, &[digest, height, parent]);
+        headers_list = T(&mut slab, &[cell, headers_list]);
+    }
+
+    let page_digest_atom = make_atom_in(&mut slab, &bundle.page_digest);
+
+    let mut tx_ids_list = D(0);
+    for id in bundle.page_tx_ids.iter().rev() {
+        let key = make_atom_in(&mut slab, id);
+        tx_ids_list = T(&mut slab, &[key, tx_ids_list]);
+    }
+
+    let anchored_tip_atom = make_atom_in(&mut slab, &bundle.anchored_tip);
+    let anchored_tip_height_atom = atom_from_u64(&mut slab, bundle.anchored_tip_height);
+
+    let poke = T(
+        &mut slab,
+        &[
+            tag,
+            name_atom,
+            owner_atom,
+            fee_atom,
+            tx_hash_atom,
+            claim_digest_atom,
+            headers_list,
+            page_digest_atom,
+            tx_ids_list,
+            anchored_tip_atom,
+            anchored_tip_height_atom,
+        ],
+    );
+    slab.set_root(poke);
+    slab
+}
+
+/// The validator's return value as it appears inside the STARK's
+/// committed product. Mirrors Hoon's `(each ~ validation-error):np`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InStarkValidation {
+    /// `[%& ~]` — every predicate passed. The STARK attests to this.
+    Ok,
+    /// `[%| <tag>]` — some predicate rejected. The STARK attests to
+    /// the specific `<tag>` (`invalid-name`, `fee-below-schedule`,
+    /// `page-digest-mismatch`, `tx-not-in-page`, `chain-broken`).
+    Rejected(String),
+}
+
+/// Payload of `[%claim-in-stark-proof product proof]`.
+pub struct ClaimInStarkProof {
+    pub validation: InStarkValidation,
+    pub proof_jam: Vec<u8>,
+}
+
+impl std::fmt::Debug for ClaimInStarkProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimInStarkProof")
+            .field("validation", &self.validation)
+            .field("proof_jam_len", &self.proof_jam.len())
+            .finish()
+    }
+}
+
+pub fn claim_in_stark_proof(effect: &NounSlab) -> Option<ClaimInStarkProof> {
+    if effect_tag(effect)? != "claim-in-stark-proof" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let product_noun = rest.head();
+    let proof_noun = rest.tail();
+
+    // Decode `(each ~ validation-error)`:
+    //   [%& 0]   -> Ok  (loobean 0 = %.y)
+    //   [%| <tag-atom>] -> Rejected(tag)
+    let product_cell = product_noun
+        .as_cell()
+        .ok()?;
+    let tag_atom = product_cell.head().as_atom().ok()?;
+    let tag_val = tag_atom.as_u64().ok()?;
+    let validation = match tag_val {
+        0 => InStarkValidation::Ok,
+        1 => {
+            let err_atom = product_cell.tail().as_atom().ok()?;
+            let bytes = err_atom.as_ne_bytes();
+            let s = std::str::from_utf8(bytes)
+                .ok()?
+                .trim_end_matches('\0')
+                .to_string();
+            InStarkValidation::Rejected(s)
+        }
+        _ => return None,
+    };
+
+    let mut stack = new_stack();
+    let proof_jam = jam_to_bytes(&mut stack, proof_noun);
+
+    Some(ClaimInStarkProof {
+        validation,
+        proof_jam,
+    })
+}
+
+pub fn first_claim_in_stark_proof(effects: &[NounSlab]) -> Option<ClaimInStarkProof> {
+    effects.iter().find_map(claim_in_stark_proof)
 }
 
 // ---------------------------------------------------------------------------

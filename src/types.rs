@@ -220,6 +220,37 @@ pub struct ProofResponse {
     pub transition: TransitionProofMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transition_proof: Option<String>,
+    /// **Phase 7**: the follower-advanced Nockchain tip at the
+    /// moment this proof was generated. Wallets use this together
+    /// with their own view of the canonical chain tip to reject
+    /// stale proofs:
+    ///
+    /// ```text
+    /// anchor.tip_height >= wallet_chain_tip_height - max_staleness
+    /// ```
+    ///
+    /// Default `max_staleness = 20` blocks. Without this check a
+    /// malicious server could freeze its follower and hand-poke
+    /// stale state into a cryptographically valid proof. See
+    /// `ARCHITECTURE.md` §7 for the full attack analysis.
+    ///
+    /// Optional for backwards compat — older NNS servers omit it.
+    /// New light clients SHOULD require it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ProofAnchor>,
+}
+
+/// Follower-advanced anchor snapshot carried in `ProofResponse`.
+/// Phase 7 — see [`ProofResponse::anchor`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofAnchor {
+    /// Hex-encoded 40-byte Tip5 digest of the tip block. Wallets
+    /// cross-reference this against their own canonical-chain view
+    /// at `tip_height` to detect fork attacks.
+    pub tip_digest: String,
+    /// Nockchain height of the tip block. Freshness rule compares
+    /// against the wallet's canonical tip height.
+    pub tip_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

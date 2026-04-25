@@ -98,6 +98,8 @@
       anchor-headers=(list anchor-header)
       page=nns-page-summary            :: the claim's block summary
       anchored-tip=@ux                 :: kernel's current anchor tip
+      anchored-tip-height=@ud          :: Phase 7: tip height at prove time
+      witness=nns-raw-tx-witness       :: Level C-A: payment semantics
   ==
 ::
 ::  +$claim-bundle-linear: Phase 3c step 3 variant of `claim-bundle`
@@ -122,6 +124,7 @@
       page-digest=@ux
       page-tx-ids=(list @ux)
       anchored-tip=@ux
+      anchored-tip-height=@ud            :: Phase 7: tip height at prove time
   ==
 ::
 ::  +$validation-error: tag-only union that names which predicate
@@ -136,6 +139,51 @@
       %page-digest-mismatch            :: claim-block-digest ≠ page.digest
       %tx-not-in-page                  :: tx-hash not in page.tx-ids
       %chain-broken                    :: anchor-headers don't link page to tip
+      %anchor-mismatch                 :: Phase 7: bundle anchor ≠ kernel state
+      %witness-tx-id-mismatch          :: Level C: witness.tx-id ≠ claim.tx-hash
+      %witness-sender-mismatch         :: Level C: witness.spender-pkh ≠ claim.owner
+      %witness-underpaid               :: Level C: witness.treasury-amount < fee
+      %witness-wrong-treasury          :: Level C: witness.treasury-address ≠ kernel state
+  ==
+::
+::  +$nns-raw-tx-witness: **Level C-A** — narrow view of a
+::  Nockchain v1 raw-tx's payment semantics. The hull extracts
+::  these four atoms from the full `raw-tx:v1:t` noun fetched from
+::  Nockchain and packs them into every `%prove-claim` poke; the
+::  kernel then enforces consistency between the witness, the
+::  claim tuple, and its own `payment-address` state.
+::
+::  Why four atoms and not the full raw-tx:
+::    - `tx-engine-1` pulls in `tx-engine-0` transitively, which
+::      hits a hoonc dep-cycle with `/common/stark/prover`
+::      (tracked in ARCHITECTURE.md §9.3). A narrow witness keeps
+::      `nns-predicates.hoon` dep-light — it still depends only on
+::      `/common/zeke`.
+::    - All four predicates below collapse to atom-equality or
+::      `gte`; no tx-engine arms needed at the kernel.
+::
+::  Trust model (Level C-A):
+::    - Hull trusted to extract `spender-pkh` / `treasury-amount`
+::      / `treasury-address` from the raw-tx correctly. A hostile
+::      hull can lie about these, so the wallet must re-verify by
+::      fetching `tx-id` from Nockchain and re-parsing.
+::    - Kernel cryptographically enforces: `tx-id` = claim's
+::      `tx-hash`; `spender-pkh` = claim.owner; treasury amount >=
+::      fee schedule; treasury address = kernel `payment-address`.
+::    - Wallet verifies STARK + re-parses raw-tx from chain to
+::      confirm witness extraction was honest. One extra chain
+::      query vs. today; zero extra trust.
+::
+::  Level C-B (future) adds `compute-id:raw-tx` re-hashing inside
+::  the kernel to eliminate the raw-tx extraction trust entirely.
+::  Blocked on a narrow `tx-engine` vendor that breaks the dep
+::  cycle. Tracked in ARCHITECTURE.md §9.3.
+::
++$  nns-raw-tx-witness
+  $:  tx-id=@ux              :: must equal claim.tx-hash
+      spender-pkh=@          :: paying signer's pkh (atom form)
+      treasury-amount=@ud    :: nicks paid to the NNS treasury
+      treasury-address=@t    :: must equal kernel's payment-address
   ==
 ::
 ::  +fee-for-name: NNS fee schedule, keyed on the stem length of a
@@ -243,6 +291,77 @@
   ^-  ?
   =(digest.pag claimed-digest)
 ::
+::  --- Level C-A payment-semantic predicates ---------------------
+::
+::  Each is a thin equality/arithmetic check on the
+::  `nns-raw-tx-witness` that the hull extracts from the on-chain
+::  raw-tx. See the type comment on `+$nns-raw-tx-witness` for the
+::  trust model.
+::
+::  +matches-tx-id: witness claims this is the same tx the hull
+::  claims the user paid with. Catches a hostile hull trying to
+::  swap one tx's payment for another's.
+::
+++  matches-tx-id
+  |=  [witness=nns-raw-tx-witness claim-tx-hash=@ux]
+  ^-  ?
+  =(tx-id.witness claim-tx-hash)
+::
+::  +pays-sender: the raw-tx was signed by the claim's owner. The
+::  hull extracts the spender's pkh; the kernel enforces that it
+::  equals `claim.owner`. Atom-equality is used because both sides
+::  are pre-canonicalised to the same representation at bundle
+::  construction — the hull either bundles a pkh-form owner string,
+::  or the kernel's `payment-address` setter normalises it.
+::
+++  pays-sender
+  |=  [witness=nns-raw-tx-witness claim-owner=@t]
+  ^-  ?
+  =(`@`claim-owner spender-pkh.witness)
+::
+::  +pays-amount: the treasury received at least the fee-schedule
+::  minimum for this name. The witness carries a pre-summed
+::  `treasury-amount`; the kernel re-applies the schedule. A
+::  hostile hull can't lie low because the wallet re-parses the
+::  chain raw-tx.
+::
+++  pays-amount
+  |=  [witness=nns-raw-tx-witness min-fee=@ud]
+  ^-  ?
+  (gte treasury-amount.witness min-fee)
+::
+::  +matches-treasury: the witness's declared treasury address is
+::  the same one the kernel was configured with. Closes the loop:
+::  no proof binds to a payment unless it flowed to THIS NNS
+::  instance's treasury, regardless of what the hull claims.
+::
+++  matches-treasury
+  |=  [witness=nns-raw-tx-witness kernel-treasury=@t]
+  ^-  ?
+  =(treasury-address.witness kernel-treasury)
+::
+::  +matches-current-anchor: Phase 7 freshness binding.
+::
+::  Kernel's `%prove-claim` uses this to confirm the bundle was
+::  built against the kernel's *current* anchor tip. A wallet later
+::  reads `anchored-tip-height` out of the bundle (cryptographically
+::  committed via `bundle-digest`) and checks it against its own
+::  chain-tip view. See ARCHITECTURE.md §7 for the attack this
+::  closes (malicious operator pokes stale kernel manually).
+::
+::  A small predicate rather than inline `=` because it's the
+::  single conceptual check that binds the *proof* to a *snapshot
+::  of the chain-follower state* — naming it makes that explicit.
+::
+++  matches-current-anchor
+  |=  $:  bundle-tip=@ux   bundle-height=@ud
+          state-tip=@ux    state-height=@ud
+      ==
+  ^-  ?
+  ?&  =(bundle-tip state-tip)
+      =(bundle-height state-height)
+  ==
+::
 ::  +has-tx-in-list: Phase 3c step 3 variant of `has-tx-in-page`.
 ::
 ::  O(n) linear walk over a flat `(list @ux)`, no Tip5 hashing. Trades
@@ -307,27 +426,38 @@
   (all-valid-chars (cut 3 [0 slen] name))
 ::
 ::  +validate-claim-bundle: Phase 3c gate validator. Composes the
-::  Level A + Level B predicates + the cheap G1/C2 format/fee checks
-::  into a single arm. Returns either `[%.y ~]` on success, or
-::  `[%.n err]` naming the first predicate that rejected the bundle.
+::  Level A + Level B + Level C-A predicates + the cheap G1/C2
+::  format/fee checks into a single arm. Returns either `[%.y ~]`
+::  on success, or `[%.n err]` naming the first predicate that
+::  rejected the bundle.
 ::
 ::  Ordering is cheap-to-expensive so we short-circuit quickly on bad
 ::  input. The expensive step is `chain-links-to`, which walks the
 ::  full header chain with Tip5 equality comparisons (the follower
 ::  should never submit a bundle whose chain isn't sound anyway).
 ::
-::  Predicates NOT yet enforced (Level C, pending tx-witness vendor):
-::    - `verify:sp-verifier` on a block PoW STARK (block-proof field
-::      is not yet in the bundle)
-::    - `compute-id:raw-tx:t`             — claimed tx-hash really is
-::                                          this raw-tx
-::    - `pays-sender` / `pays-amount`     — C5 payment semantics
-::    - `matches-block-commitment`        — recompute page commitment
-::                                          from full page noun
-::  Until Level C lands, the hull must be trusted to have built the
-::  `page-summary` and `anchor-headers` from real chain data. The
-::  wallet-side freshness check (Phase 7) handles the remaining gap;
-::  see `docs/PROOF_STORAGE.md`.
+::  Bundle-only checks (all cryptographically bound via the STARK's
+::  bundle-digest commitment). The kernel `%prove-claim` cause adds
+::  two *state-relative* checks that aren't here:
+::    - `matches-current-anchor` (Phase 7): bundle anchor == kernel
+::      anchor state.
+::    - `matches-treasury` (Level C-A): witness treasury-address ==
+::      kernel payment-address.
+::  Both require peeking kernel state and so live in the cause, not
+::  this self-contained arm.
+::
+::  Predicates NOT yet enforced (Level C-B, future):
+::    - `compute-id:raw-tx:t` inside the kernel (would eliminate the
+::      hull's witness-extraction trust).
+::    - `verify:sp-verifier` on a block PoW STARK.
+::    - `matches-block-commitment` — recompute page commitment
+::      from the full page noun.
+::  Level C-B needs a narrow `tx-engine` vendor that breaks the
+::  hoonc dep-cycle; tracked in ARCHITECTURE.md §9.3. The hull
+::  remains trusted for those fields until then, but its
+::  trustworthiness is *falsifiable*: a wallet that fetches the
+::  raw-tx from Nockchain and re-parses it can independently
+::  verify every witness field.
 ::
 ++  validate-claim-bundle
   |=  bundle=claim-bundle
@@ -335,9 +465,22 @@
   ::  G1 — name format.
   ?.  (is-valid-name name.bundle)
     [%| %invalid-name]
-  ::  C2 — fee >= fee-for-name.
+  ::  C2 — declared fee >= schedule. Belt-and-suspenders with the
+  ::  witness-underpaid check below; short-circuits on the cheap
+  ::  atom comparison before we start touching witness fields.
   ?.  (gte fee.bundle (fee-for-name name.bundle))
     [%| %fee-below-schedule]
+  ::  Level C-A — witness's tx-id == claim.tx-hash.
+  ?.  (matches-tx-id witness.bundle tx-hash.bundle)
+    [%| %witness-tx-id-mismatch]
+  ::  Level C-A — witness's sender pkh == claim.owner.
+  ?.  (pays-sender witness.bundle owner.bundle)
+    [%| %witness-sender-mismatch]
+  ::  Level C-A — actual treasury-flowed amount >= fee schedule.
+  ::  Stricter than C2: hull can declare any `fee` it likes, but
+  ::  the chain tx's treasury flow is falsifiable.
+  ?.  (pays-amount witness.bundle (fee-for-name name.bundle))
+    [%| %witness-underpaid]
   ::  Level B — claim-block-digest matches page.digest.
   ?.  (matches-block-digest page.bundle claim-block-digest.bundle)
     [%| %page-digest-mismatch]
@@ -394,4 +537,212 @@
       ==
     [%| %chain-broken]
   [%& ~]
+::
+::  --- Phase 3c step 3 (validator-in-STARK) ---
+::
+::  HOT PATH: only `validator-arm-axis` and `build-validator-trace-inputs`
+::  are reached from the kernel's `%prove-claim-in-stark` cause. They
+::  feed the subject-bundled-core encoding into `prove-computation:vp`,
+::  which currently traps inside Vesl's STARK prover — see Current
+::  upstream blocker in `ARCHITECTURE.md`.
+::
+::  DORMANT ARTIFACTS: `+normalize-to-0-8`, `+ta-axis`, `+rebuild-at-axis`
+::  below are preserved research code from the Path-3 spike
+::  (2026-04-24). They implement a structure-preserving Nock-9/10/11
+::  rewriter intended to pre-expand Hoon-compiled formulas into the
+::  0-8 subset that Vesl's compute table models. They compile cleanly
+::  but are not invoked: embedding them inside `fink:fock::interpret`
+::  (the equivalent in-prover approach) OOM'd on real validator
+::  bodies because each rewritten Nock-9 arm call expands into a
+::  full-subtree trace, giving a geometric blowup in trace size. The
+::  proper fix is native opcode support in Vesl's compute-table
+::  constraints (Phase 8). Kept as a starting point for that work.
+::
+::  `validator-arm-axis` captures, at compile time, the axis at which
+::  hoonc places `validate-claim-bundle-linear` inside this core's
+::  battery. `!=(arm)` produces the Nock formula for arm access; for
+::  a `|%` arm that formula has shape
+::
+::      `[11 <hint> [9 <axis> <core-path>]]`
+::
+::  (hoonc wraps every arm access in a `%fast`/`%mean` hint). We
+::  peel the Nock-11 if present and pull out `<axis>`. `^~` forces
+::  compile-time evaluation — the result is a literal atom in the
+::  compiled kernel, zero poke-time cost, and a Hoon rename turns
+::  into a compile error rather than a silent runtime bug.
+::
+++  validator-arm-axis
+  ^~
+  =/  probe  !=(validate-claim-bundle-linear)
+  =/  inner=*
+    ?.  ?=([%11 * *] probe)  probe
+    +>.probe
+  ?>  ?=([@ @ *] inner)
+  +<.inner
+::
+::  +ta-axis: map axis K of T to its axis inside the post-Nock-8-push
+::  subject `[T a]`. Used by `+rebuild-at-axis` to produce correct
+::  axis references when reconstructing an edited T.
+::
+::      ta-axis(1) = 2             (T is at axis 2 of [T a])
+::      ta-axis(2) = 4             (head of T = head of head of [T a])
+::      ta-axis(3) = 5             (tail of T)
+::      ta-axis(6) = 10            (head of tail of T)
+::      ta-axis(7) = 11            (tail of tail of T)
+::
+++  ta-axis
+  |=  k=@
+  ^-  @
+  ?:  =(1 k)  2
+  =/  parent  $(k (div k 2))
+  ?:  =(0 (mod k 2))
+    (mul 2 parent)
+  +((mul 2 parent))
+::
+::  +rebuild-at-axis: produce a Nock formula that — when evaluated
+::  against the post-Nock-8-push subject `[T a]` — yields T with
+::  `axis` replaced by whatever `current` evaluates to. Walks the
+::  axis path from deepest to root, wrapping `current` at each
+::  step with an autocons of the unaffected sibling branch.
+::
+++  rebuild-at-axis
+  |=  [axis=@ current=*]
+  ^-  *
+  ?:  =(1 axis)  current
+  =/  parent   (div axis 2)
+  =/  is-head  =(0 (mod axis 2))
+  =/  sibling  ?:(is-head +(axis) (dec axis))
+  =/  sibling-ta-axis  (ta-axis sibling)
+  =/  sibling-fetch=*  [%0 sibling-ta-axis]
+  =/  new-current=*
+    ?:  is-head  [current sibling-fetch]
+    [sibling-fetch current]
+  $(axis parent, current new-current)
+::
+::  +normalize-to-0-8: rewrite a Nock formula so it uses only
+::  opcodes 0–8 + autocons (cell-headed formula). This lets
+::  `fink:fock` (Vesl's STARK prover, which currently traps on
+::  Nock 9/10/11) trace Hoon-compiled formulas.
+::
+::  Rewrites, proven equivalent to the Nock spec:
+::
+::    [9 b c]          →  [7 (normalize c) [2 [0 1] [0 b]]]
+::      (direct: the spec *defines* Nock-9 as this sequence)
+::
+::    [10 [axis v] t]  →  [8 (normalize t)
+::                          (rebuild-at-axis axis [7 [0 3] (normalize v)])]
+::      (noun surgery: Nock-8 pushes T onto subject; `rebuild-at-axis`
+::      walks the axis path producing nested autocons that
+::      reconstructs T with the target axis replaced by V)
+::
+::    [11 * *]         →  [7 [0 1] (normalize next)]
+::      (spec: product is `*[a <next>]`; we wrap in `[7 [0 1] …]`
+::      rather than collapsing to `next` so the rewrite stays
+::      **structure-preserving** — `[%11 * *]` and `[%7 [0 1] *]`
+::      are both 3-slot cells with `next` at axis 7. Critical when
+::      normalizing whole cores: arm axes stay put.)
+::
+::  Constants `[1 c]` are recursed into because hoonc emits gate
+::  batteries as `[1 <body-formula>]` constants, where the body
+::  formula is later evaluated via Nock-2 after gate construction.
+::  Those inner formulas contain hints and cross-arm calls. The
+::  theoretical risk: a genuine data atom structured as
+::  `[9|10|11 X Y]` would get rewritten, but such data doesn't
+::  occur in Hoon-compiled cores (np-core's data is atoms and
+::  cores whose batteries are themselves formulas).
+::
+++  normalize-to-0-8
+  |=  f=*
+  ^-  *
+  ?@  f  f
+  ?.  ?=(@ -.f)
+    [$(f -.f) $(f +.f)]
+  ::
+  ::  Each opcode arm defensively pattern-matches the expected
+  ::  formula shape before rewriting. If `f` has head=0..11 but
+  ::  doesn't match the spec shape (e.g., hoonc-emitted Nock-1
+  ::  constants carrying data that happens to look opcode-like —
+  ::  `[1 [6 5]]` is a real shape that appears in compiled cores),
+  ::  we return `f` unchanged. Malformed formulas stay malformed,
+  ::  real data stays real data.
+  ::
+  ?+  -.f  f
+      %0  f
+    ::
+      %1  [%1 $(f +.f)]
+    ::
+      %2
+    ?.  ?=([@ * *] f)  f
+    [%2 $(f -.+.f) $(f +.+.f)]
+    ::
+      %3  [%3 $(f +.f)]
+      %4  [%4 $(f +.f)]
+    ::
+      %5
+    ?.  ?=([@ * *] f)  f
+    [%5 $(f -.+.f) $(f +.+.f)]
+    ::
+      %6
+    ?.  ?=([@ * * *] f)  f
+    [%6 $(f -.+.f) $(f -.+.+.f) $(f +.+.+.f)]
+    ::
+      %7
+    ?.  ?=([@ * *] f)  f
+    [%7 $(f -.+.f) $(f +.+.f)]
+    ::
+      %8
+    ?.  ?=([@ * *] f)  f
+    [%8 $(f -.+.f) $(f +.+.f)]
+    ::
+      %9
+    ?.  ?=([@ @ *] f)  f
+    =/  axis=@   +<.f
+    =/  core=*   $(f +>.f)
+    [%7 core [%2 [%0 1] [%0 axis]]]
+    ::
+      %10
+    ?.  ?=([@ [@ *] *] f)  f
+    =/  edit-axis=@  -.-.+.f
+    =/  value=*      $(f +.-.+.f)
+    =/  target=*     $(f +.+.f)
+    =/  v-fetch=*    [%7 [%0 3] value]
+    =/  rebuild=*    (rebuild-at-axis edit-axis v-fetch)
+    [%8 target rebuild]
+    ::
+      %11
+    ?.  ?=([@ * *] f)  f
+    =/  next=*  $(f +.+.f)
+    [%7 [%0 1] next]
+  ==
+::
+::  +build-validator-trace-inputs: produce `[subject formula]` for
+::  `prove-computation:vp` such that `fink:fock [s f]` would run
+::  `validate-claim-bundle-linear(bundle)` INSIDE the STARK.
+::
+::  Subject layout:  `[bundle np-core]`
+::  Formula:         `[9 2 10 [6 0 2] 9 <arm-axis> 0 3]`
+::
+::  `..validate-claim-bundle-linear` gives us the pure enclosing
+::  core; a naive `=/ self-core .` would capture
+::  `[bundle-arg [gate-battery np-core]]` (the gate's own subject)
+::  and break axis resolution.
+::
+::  STATUS: the raw `[9 ... 10 ... 9 ... 0 3]` formula evaluates
+::  correctly on the raw nockvm (dry-run in `%prove-claim-in-stark`
+::  returns `[%& ~]` for a valid bundle) but `prove-computation:vp`
+::  traps on the Nock-9/10/11 opcodes — see `ARCHITECTURE.md` §
+::  Current upstream blocker. We emit the formula as-is and let the
+::  prover trap; the `%prove-claim-in-stark` cause captures that
+::  trap and emits `%prove-failed` so the blocker-signal test in
+::  `tests/prover.rs` can assert the specific failure shape.
+::
+::  When Vesl's prover ships native Nock 9/10/11 support, this arm
+::  continues to work unchanged.
+::
+++  build-validator-trace-inputs
+  |=  bundle=claim-bundle-linear
+  ^-  [subject=* formula=*]
+  =/  np-core  ..validate-claim-bundle-linear
+  :-  [bundle np-core]
+  [9 2 10 [6 0 2] 9 validator-arm-axis 0 3]
 --

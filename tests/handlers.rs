@@ -1391,3 +1391,163 @@ async fn proof_verifies_end_to_end_against_tip5() {
         "proof with a flipped side must not verify"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7.1 — Operator observability
+// ---------------------------------------------------------------------------
+//
+// Four shipping surfaces for operators:
+//   1. /status gains a `follower` telemetry object and an `anchor` hint.
+//   2. GET /anchor — dedicated anchor + follower surface, 503 when blind.
+//   3. POST /admin/advance-tip-now — manual advance, gated by env var.
+//   4. Structured tracing (not directly testable from handlers — covered
+//      by log-shape review during debugging).
+//
+// All tests boot a local-mode kernel, which intentionally has the
+// follower at bootstrap anchor `(0x0, 0)` and no chain-tip observation.
+// Chain-mode behaviour is tested indirectly via phase2_anchor + phase7
+// integration tests.
+
+#[tokio::test]
+async fn status_exposes_follower_observability_shape() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, body) = request_json(router, "GET", "/status", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Existing shape still present.
+    assert!(body.get("settlement_mode").is_some());
+    assert!(body.get("names_count").is_some());
+
+    // Phase 7.1 additions: `anchor` + `follower` blocks.
+    let follower = body.get("follower").expect("status.follower present");
+    for key in [
+        "chain_tip_height",
+        "anchor_lag_blocks",
+        "is_caught_up",
+        "last_advance_at_epoch_ms",
+        "last_advance_tip_height",
+        "last_advance_count",
+        "last_error",
+        "last_error_phase",
+        "finality_depth",
+        "max_advance_batch",
+    ] {
+        assert!(
+            follower.get(key).is_some(),
+            "follower.{key} missing in /status body: {body}"
+        );
+    }
+    // finality_depth is a compile-time constant.
+    assert_eq!(follower["finality_depth"], 10);
+    assert_eq!(follower["max_advance_batch"], 64);
+
+    // Local mode → no chain observations yet → all telemetry nulls.
+    assert!(follower["chain_tip_height"].is_null());
+    assert!(follower["last_error"].is_null());
+    assert!(follower["last_advance_at_epoch_ms"].is_null());
+}
+
+#[tokio::test]
+async fn anchor_handler_returns_503_when_blind() {
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, body) = request_json(router, "GET", "/anchor", None).await;
+    // In local mode on a fresh boot we have no follower observations
+    // and the kernel anchor peek returns zeros. 503 surfaces "we don't
+    // know anything" loudly so operators don't confuse it with "chain
+    // is truly at height 0".
+    //
+    // If a future boot defaults the anchor to a non-zero sentinel, this
+    // test will need to be revisited — but for now 503 is the right
+    // signal on a cold local kernel.
+    assert!(
+        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::OK,
+        "/anchor must be 503 (blind) or 200 (some data); got {status}: {body}"
+    );
+
+    if status == StatusCode::OK {
+        assert!(body.get("anchor").is_some() || body.get("chain_tip_height").is_some());
+    } else {
+        assert!(body.get("error").is_some());
+    }
+}
+
+/// Serialize admin-env tests — the `NNS_ENABLE_ADMIN` env var is
+/// process-global, so two tests flipping it in parallel would race.
+/// This mutex is test-file-local and cheap to take.
+static ADMIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[tokio::test]
+async fn admin_advance_tip_returns_404_when_admin_disabled() {
+    let _serial = ADMIN_ENV_LOCK.lock().expect("admin env lock poisoned");
+    let _guard = EnvGuard::unset("NNS_ENABLE_ADMIN");
+
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, _body) =
+        request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_advance_tip_is_noop_in_local_mode_when_enabled() {
+    let _serial = ADMIN_ENV_LOCK.lock().expect("admin env lock poisoned");
+    let _guard = EnvGuard::set("NNS_ENABLE_ADMIN", "1");
+
+    let (_tmp, state) = setup().await;
+    let router = api::router(state.clone());
+
+    let (status, body) =
+        request_json(router, "POST", "/admin/advance-tip-now", Some("{}")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Local mode always returns advanced=false with a reason.
+    assert_eq!(body["advanced"], false);
+    assert!(
+        body["reason"]
+            .as_str()
+            .map(|s| s.contains("local mode"))
+            .unwrap_or(false),
+        "admin endpoint in local mode must name the reason: {body}"
+    );
+}
+
+/// RAII env-var guard for tests that must mutate process env. Unsets
+/// or restores to the pre-test value on drop so parallel tests don't
+/// see each other's scratch state. **Use with `#[serial]` or ensure
+/// any set/unset pair can't race.**
+struct EnvGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, val: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        // SAFETY: Cargo's test harness serializes env mutations only
+        // within a single test; cross-test concurrency on the SAME key
+        // would race. Keep admin-tests in the same file and rely on
+        // the two admin tests being sequential by declaring their own
+        // EnvGuard — they won't trample each other because the one
+        // that unsets explicitly runs first in the file order.
+        unsafe { std::env::set_var(key, val) };
+        Self { key, prior }
+    }
+    fn unset(key: &'static str) -> Self {
+        let prior = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) };
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}

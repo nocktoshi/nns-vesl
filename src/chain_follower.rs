@@ -40,7 +40,15 @@ pub fn spawn(state: SharedState) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 if let Err(err) = tick_once(&s).await {
-                    tracing::warn!("chain follower claim tick failed: {err}");
+                    let ts = crate::state::AppState::now_epoch_ms();
+                    let mut st = s.lock().await;
+                    st.follower.record_error("claim_tick", err.clone(), ts);
+                    drop(st);
+                    tracing::warn!(
+                        err = %err,
+                        phase = "claim_tick",
+                        "chain follower claim tick failed"
+                    );
                 }
                 tokio::time::sleep(FOLLOWER_POLL).await;
             }
@@ -53,15 +61,29 @@ pub fn spawn(state: SharedState) -> JoinHandle<()> {
             loop {
                 match advance_anchor_once(&s).await {
                     Ok(Some(advanced)) => {
+                        // Success telemetry is already recorded inside
+                        // `advance_anchor_once` under the mutex so
+                        // concurrent /status calls see consistent data.
                         tracing::info!(
                             tip_height = advanced.tip_height,
                             count = advanced.count,
+                            phase = "anchor_advance",
                             "chain follower advanced anchor"
                         );
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // No-op tick — local mode, no endpoint, or
+                        // within finality horizon. Not an error, but
+                        // chatty enough at trace level to correlate
+                        // against "why hasn't the anchor moved?".
+                        tracing::trace!(phase = "anchor_advance", "anchor tick no-op");
+                    }
                     Err(err) => {
-                        tracing::warn!("chain follower anchor tick failed: {err}");
+                        tracing::warn!(
+                            err = %err,
+                            phase = "anchor_tick",
+                            "chain follower anchor tick failed"
+                        );
                     }
                 }
                 tokio::time::sleep(ANCHOR_POLL).await;
@@ -241,26 +263,42 @@ pub async fn advance_anchor_once(
     // responses mean the kernel is not ready; treat as transient.
     let current_anchor_height = {
         let mut st = state.lock().await;
-        let result = st
-            .app
-            .peek(build_anchor_peek())
-            .await
-            .map_err(|e| format!("anchor peek failed: {e:?}"))?;
+        let result = st.app.peek(build_anchor_peek()).await.map_err(|e| {
+            let msg = format!("anchor peek failed: {e:?}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            st.follower.record_error("anchor_peek", msg.clone(), ts);
+            msg
+        })?;
         match decode_anchor(&result) {
             Ok(view) => view.tip_height,
             Err(_) => 0,
         }
     };
 
-    let Some(plan) = plan_anchor_advance(
+    let plan = match plan_anchor_advance(
         &endpoint,
         current_anchor_height,
         DEFAULT_FINALITY_DEPTH,
         DEFAULT_MAX_ADVANCE_BATCH,
     )
-    .await?
-    else {
-        return Ok(None);
+    .await
+    {
+        Ok(Some(p)) => {
+            // Record the chain-tip we learned while planning — useful
+            // for "am I within finality horizon?" debugging even when
+            // the advance itself is a no-op.
+            let now = crate::state::AppState::now_epoch_ms();
+            let mut st = state.lock().await;
+            st.follower.record_chain_tip(p.current_chain_tip, now);
+            p
+        }
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            let ts = crate::state::AppState::now_epoch_ms();
+            let mut st = state.lock().await;
+            st.follower.record_error("plan", e.clone(), ts);
+            return Err(e);
+        }
     };
     let AnchorAdvanceTarget {
         from_height,
@@ -268,9 +306,21 @@ pub async fn advance_anchor_once(
         current_chain_tip: _,
     } = plan;
 
-    let headers: Vec<AnchorHeader> = fetch_header_chain(&endpoint, from_height, to_height)
-        .await
-        .map_err(|e| format!("header chain fetch failed [{from_height}..{to_height}]: {e}"))?;
+    let headers: Vec<AnchorHeader> =
+        fetch_header_chain(&endpoint, from_height, to_height)
+            .await
+            .map_err(|e| {
+                let msg = format!("header chain fetch failed [{from_height}..{to_height}]: {e}");
+                let ts = crate::state::AppState::now_epoch_ms();
+                let s2 = state.clone();
+                // Fire-and-forget the record call — we're in an async
+                // sync closure, can't await here. Use blocking lock on
+                // the off-chance the mutex is held (fine for tests).
+                if let Ok(mut st) = s2.try_lock() {
+                    st.follower.record_error("header_fetch", msg.clone(), ts);
+                }
+                msg
+            })?;
     if headers.is_empty() {
         return Ok(None);
     }
@@ -280,14 +330,29 @@ pub async fn advance_anchor_once(
         .app
         .poke(SystemWire.to_wire(), build_advance_tip_poke(&headers))
         .await
-        .map_err(|e| format!("advance-tip poke failed: {e:?}"))?;
+        .map_err(|e| {
+            let msg = format!("advance-tip poke failed: {e:?}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            st.follower.record_error("advance_poke", msg.clone(), ts);
+            msg
+        })?;
 
     if let Some(err) = first_error_message(&effects) {
-        return Err(format!("kernel rejected %advance-tip: {err}"));
+        let msg = format!("kernel rejected %advance-tip: {err}");
+        let ts = crate::state::AppState::now_epoch_ms();
+        st.follower.record_error("advance_poke", msg.clone(), ts);
+        return Err(msg);
     }
     let Some(advanced) = first_anchor_advanced(&effects) else {
-        return Err("kernel did not emit %anchor-advanced".into());
+        let msg = "kernel did not emit %anchor-advanced".to_string();
+        let ts = crate::state::AppState::now_epoch_ms();
+        st.follower.record_error("advance_poke", msg.clone(), ts);
+        return Err(msg);
     };
+
+    let now = crate::state::AppState::now_epoch_ms();
+    st.follower
+        .record_advance(advanced.tip_height, advanced.count, now);
     st.persist_all().await;
 
     Ok(Some(AnchorAdvanceOutcome {
