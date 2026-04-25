@@ -21,10 +21,10 @@ nockapp-grpc = { path = "../nockchain/crates/nockapp-grpc" }
 zkvm-jetpack = { path = "../nockchain/crates/zkvm-jetpack" }
 
 # Vesl SDK — sibling clone at ~/vesl
-vesl-core = { path = "../vesl/crates/vesl-core" }
-nock-noun-rs = { path = "../vesl/crates/nock-noun-rs" }
-nockchain-tip5-rs = { path = "../vesl/crates/nockchain-tip5-rs" }
-nockchain-client-rs = { path = "../vesl/crates/nockchain-client-rs" }
+vesl-core = { path = "../vesl-core/crates/vesl-core" }
+nock-noun-rs = { path = "../vesl-core/crates/nock-noun-rs" }
+nockchain-tip5-rs = { path = "../vesl-core/crates/nockchain-tip5-rs" }
+nockchain-client-rs = { path = "../vesl-core/crates/nockchain-client-rs" }
 
 tokio = { version = "1.32", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 tonic = { version = "0.14", features = ["tls-webpki-roots"] }
