@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 
 use crate::chain::{
     confirmed_tx_position, fetch_header_chain, plan_anchor_advance, AnchorAdvanceTarget,
-    ConfirmedTxPosition,
+    AnchorPlan, ConfirmedTxPosition,
 };
 use crate::kernel::{
     build_advance_tip_poke, build_anchor_peek, build_claim_poke, decode_anchor,
@@ -293,7 +293,10 @@ pub async fn advance_anchor_once(
         }
     };
 
-    let plan = match plan_anchor_advance(
+    let AnchorPlan {
+        current_chain_tip,
+        advance,
+    } = match plan_anchor_advance(
         &endpoint,
         current_anchor_height,
         DEFAULT_FINALITY_DEPTH,
@@ -301,16 +304,7 @@ pub async fn advance_anchor_once(
     )
     .await
     {
-        Ok(Some(p)) => {
-            // Record the chain-tip we learned while planning — useful
-            // for "am I within finality horizon?" debugging even when
-            // the advance itself is a no-op.
-            let now = crate::state::AppState::now_epoch_ms();
-            let mut h = state.hull.lock().await;
-            h.follower.record_chain_tip(p.current_chain_tip, now);
-            p
-        }
-        Ok(None) => return Ok(None),
+        Ok(p) => p,
         Err(e) => {
             let ts = crate::state::AppState::now_epoch_ms();
             let mut h = state.hull.lock().await;
@@ -318,6 +312,21 @@ pub async fn advance_anchor_once(
             return Err(e);
         }
     };
+
+    // Always record the tip we observed — including when `advance` is
+    // `None` (anchor already at horizon). Otherwise `/status` shows
+    // `chain_tip_height: null` forever after a restart even though
+    // the node is healthy.
+    let now = crate::state::AppState::now_epoch_ms();
+    {
+        let mut h = state.hull.lock().await;
+        h.follower.record_chain_tip(current_chain_tip, now);
+    }
+
+    let Some(plan) = advance else {
+        return Ok(None);
+    };
+
     let AnchorAdvanceTarget {
         from_height,
         to_height,

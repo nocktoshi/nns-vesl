@@ -425,9 +425,10 @@ pub async fn fetch_current_tip_height(endpoint: &str) -> Result<u64, String> {
 /// kernel's current anchor height, a configurable finality depth, and
 /// a per-tick header budget.
 ///
-/// Returns `Some(target)` when the caller should fetch
-/// `[from_height .. to_height]` and issue `%advance-tip`, or `None`
-/// when the anchor is already at or past the finality horizon.
+/// Always includes [`AnchorPlan::current_chain_tip`] when the chain
+/// tip query succeeds — even when [`AnchorPlan::advance`] is `None`
+/// (already at finality horizon) — so operators still see
+/// `chain_tip_height` in `/status` after restarts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorAdvanceTarget {
     pub from_height: u64,
@@ -435,19 +436,32 @@ pub struct AnchorAdvanceTarget {
     pub current_chain_tip: u64,
 }
 
+/// Observed chain tip plus optional header range to ingest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorPlan {
+    pub current_chain_tip: u64,
+    pub advance: Option<AnchorAdvanceTarget>,
+}
+
 pub async fn plan_anchor_advance(
     endpoint: &str,
     current_anchor_height: u64,
     finality_depth: u64,
     max_batch: u64,
-) -> Result<Option<AnchorAdvanceTarget>, String> {
+) -> Result<AnchorPlan, String> {
     let tip = fetch_current_tip_height(endpoint).await?;
     if tip <= finality_depth {
-        return Ok(None);
+        return Ok(AnchorPlan {
+            current_chain_tip: tip,
+            advance: None,
+        });
     }
-    let horizon = tip - finality_depth;
+    let horizon = tip.saturating_sub(finality_depth);
     if horizon <= current_anchor_height {
-        return Ok(None);
+        return Ok(AnchorPlan {
+            current_chain_tip: tip,
+            advance: None,
+        });
     }
 
     // Bootstrap special case: when the kernel is at its default
@@ -459,20 +473,26 @@ pub async fn plan_anchor_advance(
     // that completes, leaving the follower's first tick in an
     // un-completable state forever.
     if current_anchor_height == 0 {
-        return Ok(Some(AnchorAdvanceTarget {
-            from_height: horizon,
-            to_height: horizon,
+        return Ok(AnchorPlan {
             current_chain_tip: tip,
-        }));
+            advance: Some(AnchorAdvanceTarget {
+                from_height: horizon,
+                to_height: horizon,
+                current_chain_tip: tip,
+            }),
+        });
     }
 
     let from = current_anchor_height + 1;
     let to = from
         .saturating_add(max_batch.saturating_sub(1))
         .min(horizon);
-    Ok(Some(AnchorAdvanceTarget {
-        from_height: from,
-        to_height: to,
+    Ok(AnchorPlan {
         current_chain_tip: tip,
-    }))
+        advance: Some(AnchorAdvanceTarget {
+            from_height: from,
+            to_height: to,
+            current_chain_tip: tip,
+        }),
+    })
 }
