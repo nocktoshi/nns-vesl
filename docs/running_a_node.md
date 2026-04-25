@@ -12,6 +12,10 @@ For the full architecture and design rationale, see
 ## Quick Start
 
 ```bash
+# clone vesl
+git clone https://github.com/zkvesl/vesl-core.git
+cd vesl-core && git checkout dev
+cd ~
 # clone nns repo
 git clone https://github.com/nocktoshi/nns-vesl.git
 cd nns-vesl
