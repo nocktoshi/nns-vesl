@@ -37,4 +37,4 @@ pub mod payment;
 pub mod state;
 pub mod types;
 
-pub use state::{AppState, HullState, SharedState};
+pub use state::{AppState, SharedState};
