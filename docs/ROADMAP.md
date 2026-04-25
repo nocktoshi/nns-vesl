@@ -11,57 +11,94 @@ implementation sequence.
 > [§Phase 7](#phase-7--staleness--fork-resistance-blocking-before-production)
 > below for the acceptance criteria.
 
-## Today update (2026-04-24 pm) — Phase 3c step 3 foundation
+## Today update (2026-04-24 pm) — Phase 3c step 3 spike: **blocked upstream**
 
-Landed the infrastructure Phase 3c step 3 needs, without yet closing
-the last trust gap. The concrete deliverables:
+The subject-bundled-core encoding is implemented, correct, and
+fails inside Vesl's STARK prover because of a hard opcode
+restriction in Vesl itself. Production path stays on Phase 3c
+step 2 (committed-digest proof + wallet-side validator run);
+full in-STARK validation is filed as a Vesl-upstream ask.
 
-1. **Tip5-free validator variant**: new `++has-tx-in-list` (O(n)
-   linear walk, no Tip5 jets in the trace) + `++validate-claim-bundle-linear`
-   that uses it. Semantically identical to `validate-claim-bundle`
-   on realistic inputs (blocks carry tens to low-hundreds of
-   tx-ids; O(n) is negligible vs total trace cost).
-2. **General-purpose prover primitive**: new `%prove-arbitrary`
-   kernel cause accepting jammed `(subject, formula)` bytes from the
-   hull. Kernel cues both, runs `prove-computation:vp`, emits
-   `[%arbitrary-proof product proof]`. This is the cause that a
-   future canonical Nock-encoding of `validate-claim-bundle-linear`
-   will be piped through.
-3. **Spike test**: `phase3c_step3_prove_arbitrary_roundtrip` builds
-   a trivial `[subject=42 formula=[4 [4 [4 [0 1]]]]]` pair from
-   Rust, pokes `%prove-arbitrary`, verifies the proof through
-   `%verify-stark`. **Measured: 610 ms prove, 602 ms verify,
-   ok=true, 59 235 B proof JAM**. Confirms the pipeline accepts
-   caller-supplied formulas end-to-end.
+### What landed
 
-### What's still deferred
+1. **Subject-bundled-core encoding** — in
+   `hoon/lib/nns-predicates.hoon`:
+   - `++validator-arm-axis` — compile-time `^~`-pinned constant
+     extracting hoonc's arm axis via `!=(arm)` introspection.
+     Handles the `[11 hint [9 axis core-path]]` wrapper that hoonc
+     emits for bare arm references.
+   - `++build-validator-trace-inputs` — given a
+     `claim-bundle-linear`, returns `[subject formula]` =
+     `[[bundle ..validate-claim-bundle-linear] [9 2 10 [6 0 2] 9 20 0 3]]`.
+     The `..arm` idiom (not `.`) is load-bearing — `.` inside the
+     gate body includes the gate's own sample and breaks axis
+     resolution.
+2. **`%prove-claim-in-stark` kernel cause** — same payload shape
+   as `%validate-claim` / `%prove-claim`. Runs
+   `build-validator-trace-inputs`, dry-runs the trace outside the
+   STARK via `.*(subj form)` under `mule` (catches validator-level
+   bugs without paying prover cost), then hands the same pair to
+   `prove-computation:vp`. On success: `%claim-in-stark-proof
+   product proof` where `product` is a head-tagged
+   `(each ~ validation-error)`. On prover rejection:
+   `%prove-failed trace`.
+3. **Rust wiring** — `build_prove_claim_in_stark_poke`,
+   `ClaimInStarkProof`, `InStarkValidation::{Ok, Rejected(String)}`
+   + extractors in `src/kernel.rs`.
+4. **Blocker-signal test** —
+   `phase3c_step3_validator_in_stark_blocked_upstream`. Green
+   today: confirms the encoding is semantically correct (kernel
+   would emit `%claim-in-stark-proof` if the prover could trace
+   it), confirms the prover traps with a non-empty Hoon stack
+   trace (empirically 600 bytes, pointing at
+   `common/ztd/eight.hoon:808`). When upstream Vesl extends the
+   interpreter, this test becomes a green end-to-end test by
+   flipping one branch of its assertion.
 
-The remaining gap to full "validator inside the STARK" is the
-**Nock-formula encoding** of `validate-claim-bundle-linear`. The
-Hoon arm exists; what doesn't exist yet is a self-contained Nock
-formula that `fink:fock [subject=bundle formula]` can trace without
-depending on the kernel's compile-time context axes. This is
-non-trivial because Hoon-compiled formulas inherit axis references
-from the compile-time subject — when handed to
-`prove-computation` with a bundle-only subject, those references
-break.
+### The upstream blocker
 
-Approaches to attempt in a follow-up:
+Vesl's STARK prover Nock interpreter
+(`hoon/common/ztd/eight.hoon::fock:fink:interpret`) supports **Nock
+opcodes 0–8 only**. Opcodes **9 (slam), 10 (edit), 11 (hint)** are
+`!!` (crash) stubs:
 
-1. **Hand-crafted Nock** — write the formula directly by
-   translating the validator arm's Nock tree, with axis 1 pointing
-   at the bundle. ~100 lines of Nock, tedious but tractable.
-2. **Subject-bundled core** — build `subject = [bundle validator-core]`,
-   formula = `[9 <arm-axis> 10 [6 0 2] 0 3]` (Nock-9 slam). Needs
-   hoonc introspection to extract `<arm-axis>` reliably.
-3. **Formula rebasing tool** — generic Hoon-to-self-contained-Nock
-   pass that walks a compiled formula and rewrites axis refs to a
-   caller-supplied subject layout. Useful for every future
-   validator-in-STARK use case.
+```
+[%9 axis=* core=*]              !!
+[%10 [axis=@ value=*] target=*] !!
+[%11 tag=@ next=*]              !!
+[%11 [tag=@ clue=*] next=*]     !!
+```
 
-All three are compatible with the shipped `%prove-arbitrary` cause
-— whichever one lands first plugs in without changes to the kernel
-or Rust builders.
+This is identical byte-for-byte in both our vendored
+`hoon/common/ztd/eight.hoon` and upstream
+(`vesl/templates/graft-scaffold/hoon/common/ztd/eight.hoon` and
+`nockchain/hoon/common/ztd/eight.hoon`). Verified.
+
+Any Hoon-level gate call compiles to Nock-9 (slam); any record
+edit compiles to Nock-10. Our validator uses both. The dry-run
+outside the STARK succeeds — raw nockvm implements all twelve
+opcodes — but `prove-computation` rejects the trace.
+
+Full analysis: `docs/research/recursive-payment-proof.md`
+§ "Step 3 spike — outcome".
+
+### Production path (unchanged)
+
+Wallet flow remains **Phase 3c step 2**'s committed-digest design:
+
+```
+wallet receives (bundle, claim_proof_blob)
+  ├── verify_stark(claim_proof_blob)           ; STARK says digest = X
+  ├── recompute belt-digest(jam(bundle)) == X  ; local hash check
+  └── validate-claim-bundle(bundle) == Ok      ; wallet-side Rust mirror
+```
+
+All three must pass. The STARK verify + digest check reduces the
+trust surface to "Vesl STARK is sound"; the local validator call
+costs microseconds. When Vesl ships opcode 9/10/11 support, the
+third step folds into the first (STARK commits the validator's
+*output*) and the wallet drops its Rust mirror entirely. One
+assertion flip on the NNS side.
 
 ### Updated Phase 3 status table
 
@@ -73,12 +110,37 @@ or Rust builders.
 | 3c step 1 | `validate-claim-bundle` + `%validate-claim` cause | **shipped** |
 | 3c step 2 | `%prove-claim` = validator + committed STARK over bundle-digest | **shipped** (option-B recursion) |
 | 3c step 3 foundation | `has-tx-in-list` + `validate-claim-bundle-linear` + `%prove-arbitrary` | **shipped** |
-| 3c step 3 completion | Nock-formula encoding of `validate-claim-bundle-linear` + wire into `%prove-arbitrary` | pending encoding spike |
+| 3c step 3 spike | Subject-bundled-core encoding + `%prove-claim-in-stark` cause + blocker-signal test | **shipped (semantically correct; prover blocked upstream on Vesl Nock 9/10/11)** |
+| 3c step 3 completion | Wallet drops Rust validator mirror after upstream lands | **blocked on Vesl prover extension** — see Phase 8 below |
 
 ### Totals
 
-**75 active tests, all green** (10 unit + 30 handlers + 9 phase2 +
-26 phase3 + 5 ignored prover — step 3 added one prover-heavy test).
+**76 active tests, all green** (10 unit + 30 handlers + 9 phase2 +
+26 phase3 + 6 ignored prover — step 3 spike added the blocker-signal
+prover test).
+
+## Phase 8 — Upstream: Vesl prover Nock 9/10/11
+
+Track the upstream Vesl work that unblocks Phase 3c step 3
+completion (validator runs entirely inside the STARK, wallet
+drops its validator mirror).
+
+- [ ] **File ask upstream** in Vesl: extend
+      `common/ztd/eight.hoon::fock:fink:interpret` to handle Nock
+      9 (slam), 10 (edit), 11 (hint). Shipping `%9` alone unlocks
+      NNS — we can avoid `%10` by building the subject with the
+      bundle at the gate's sample slot directly rather than
+      editing it in.
+- [ ] **Upstream merge + next Vesl release.**
+- [ ] **Re-bench** `phase3c_step3_validator_in_stark_blocked_upstream`
+      on the new Vesl. Expected outcome: test hits the "UNEXPECTEDLY
+      GREEN" branch and becomes a plain end-to-end validator-in-STARK
+      assertion.
+- [ ] **Drop the wallet-side Rust validator mirror** in the wallet
+      SDK (~150 lines).
+
+Blocker-signal test is already green today; no further NNS work
+is needed until upstream lands.
 
 ## Today update (2026-04-24 pm) — Phase 3c validator + committed proof
 

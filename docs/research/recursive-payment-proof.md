@@ -407,3 +407,220 @@ a given bundle, ready to pass into `%prove-arbitrary`.
   (`[%& ~]` or `[%| <err>]`) rather than the bundle-digest alone.
 - Wallet SDK shrinks by ~150 lines (no Hoon → Rust validator
   mirror needed).
+
+---
+
+## Step 3 spike — outcome (finding: **upstream Vesl limitation**)
+
+The subject-bundled-core encoding (approach 2) was implemented end
+to end. It works **outside** the STARK and traps **inside** it for
+reasons internal to Vesl's prover.
+
+### What was built
+
+In `hoon/lib/nns-predicates.hoon`:
+
+- `++validator-arm-axis` — a `^~`-pinned compile-time constant that
+  extracts hoonc's chosen arm axis for
+  `validate-claim-bundle-linear` by introspecting `!=(arm)`. Handles
+  both bare `[9 <axis> <core-path>]` and hint-wrapped
+  `[11 <hint> [9 <axis> <core-path>]]` shapes. Empirically resolves
+  to axis **20** under the current nns-predicates core layout.
+- `++build-validator-trace-inputs` — given a `claim-bundle-linear`,
+  returns the `[subject formula]` pair:
+
+  ```
+  subject = [bundle np-core]     ; np-core = ..validate-claim-bundle-linear
+  formula = [9 2 10 [6 0 2] 9 20 0 3]
+  ```
+
+  The `..arm` idiom is load-bearing: a naive `=/ self-core  .`
+  captures `[sample gate-battery np-core]` because `.` inside the
+  gate body includes the gate's own sample. `..arm` strips that
+  off and gives the pure enclosing core.
+
+In `hoon/app/app.hoon`:
+
+- `%prove-claim-in-stark` cause — takes the same payload as
+  `%validate-claim` / `%prove-claim`, runs `build-validator-trace-inputs`,
+  **dry-runs the trace on raw nockvm** via
+  `.*(subj form)` under `mule` (catches validator-level bugs
+  before a prover run), then hands the same pair to
+  `prove-computation:vp`. On success: `%claim-in-stark-proof
+  product proof`. On prover rejection: `%prove-failed trace`.
+
+In `src/kernel.rs`:
+
+- `build_prove_claim_in_stark_poke` + `ClaimInStarkProof` +
+  `InStarkValidation::{Ok, Rejected(String)}` + extractors.
+
+### What the spike proved
+
+1. **The encoding is semantically correct.** The dry-run
+   (`.*(subj form)` outside the STARK) produces `[0 0]` =
+   `[%& ~]` for a valid bundle — the validator ran end-to-end via
+   the bundled-core formula and returned "Ok". Verified with a
+   traced kernel run (test:
+   `phase3c_step3_validator_in_stark_blocked_upstream`).
+2. **`..validate-claim-bundle-linear` is the correct subject
+   capture**, not `.`. Confirmed empirically — the `.` variant
+   segfaulted because axis-20 of `[bundle-arg [gate-battery np-core]]`
+   is bundle data, not the arm.
+3. **`validator-arm-axis` is stable** at compile time — `^~` bakes
+   it into the kernel image. Hoon rename drills would break it
+   loudly (type assertion fails at compile) rather than silently.
+
+### Why `prove-computation` traps
+
+The Vesl STARK prover's Nock interpreter lives in
+`hoon/common/ztd/eight.hoon::fock:fink:interpret` (same file in
+Nockchain upstream and the Vesl graft-scaffold — verified byte for
+byte). The `interpret` arm handles **Nock opcodes 0–8 only**;
+opcodes **9, 10, 11 trap with `!!`**:
+
+```
+[%9 axis=* core=*]      !!
+[%10 [axis=@ value=*] target=*]  !!
+[%11 tag=@ next=*]      !!
+[%11 [tag=@ clue=*] next=*]      !!
+```
+
+Our formula uses **Nock 9** (slam the validator arm) and
+**Nock 10** (edit the gate's sample). Every Hoon-level gate call
+or record edit compiles to at least one of these. Therefore any
+validator non-trivial enough to walk a list, compare fields, or
+branch will collide with this restriction.
+
+The raw nockvm (outside Vesl's prover) implements all twelve
+opcodes natively — that's why the dry-run succeeds. The STARK
+prover's interpreter is **deliberately** restricted: its compute
+table's constraints only model opcodes 0–8, so anything else
+would produce an un-verifiable trace.
+
+This is not a bug in Vesl; it's a scope choice. Nockchain's
+`puzzle-nock` (the program proved in block PoW) is carefully
+authored to stay inside opcodes 0–8 for exactly this reason.
+
+### Scope cost
+
+To prove a real Hoon validator **inside** Vesl's STARK we need one
+of:
+
+1. **Upstream Vesl extends `fink:fock`** to opcodes 9/10/11. This
+   means adding compute-table rows, proving constraints, and trace
+   decomposition for each. Significant work (2–4 weeks for one
+   experienced Vesl contributor per opcode, probably longer for
+   review). Not in NNS's scope.
+2. **Hand-encode the validator in Nock 0–8.** Feasible in principle
+   for a fixed-shape bundle (arithmetic comparisons + unrolled
+   list walks over bounded-length tx-id lists). Infeasible for
+   variable-length structures (name-char validation, anchor-header
+   chains) because Nock-9-less recursion requires Y-combinator
+   encoding — auditable but absurdly fragile.
+3. **Abandon in-STARK validation for now** and rely on the
+   committed-digest architecture (Phase 3c step 2): STARK commits
+   to `belt-digest(jam(bundle))`; wallet re-runs the validator on
+   the supplied bundle and cross-checks the digest. One extra ~µs
+   hash + one validator call on the wallet. Strongly trustless.
+
+### Decision
+
+**Adopt option 3.** Rationale:
+
+- Option 1 is not an NNS project — it's a Vesl protocol change.
+  We'll file a feature request upstream (see
+  `docs/ROADMAP.md` → Phase 8 → "Upstream: Vesl prover Nock
+  9/10/11"). Until then, the encoding, cause, and test we shipped
+  sit dormant and become green automatically when upstream lands.
+- Option 2 trades audit surface: each hand-encoded Nock formula is
+  a new thing to review. Phase 3c step 2's committed digest already
+  gives us the "wallet doesn't re-follow the chain" property —
+  step 3 only eliminates the residual wallet-side validator call,
+  which is microseconds of Rust.
+- Option 3 preserves a single, reviewable Hoon validator and
+  defers the in-STARK execution cleanly.
+
+### Production wallet flow (Phase 3c step 2 is the current anchor)
+
+```
+wallet receives (bundle, claim_proof_blob)
+  │
+  ├── verify_stark(claim_proof_blob)
+  │     └─ STARK attests: committed-digest = belt-digest(jam(bundle))
+  │
+  ├── recompute belt-digest(jam(bundle)) locally
+  │     └─ must match the proof's committed digest
+  │
+  └── run validate-claim-bundle(bundle) in Rust mirror
+        └─ must return Ok
+```
+
+All three must pass. If/when upstream Vesl extends `interpret` to
+opcodes 9/10/11, the third step collapses into the first and the
+wallet flow becomes:
+
+```
+wallet receives (bundle, claim_proof_blob)
+  │
+  └── verify_stark(claim_proof_blob)
+        ├─ STARK attests: validator ran on `bundle` and returned Ok
+        └─ wallet reads the committed product [%& ~] directly
+```
+
+Flipping the assertion in
+`phase3c_step3_validator_in_stark_blocked_upstream` is the only
+NNS-side code change needed on that day.
+
+### Filed-upstream note (issue-ready draft)
+
+> **Title**: Extend `fock:fink:interpret` to Nock opcodes 9, 10, 11
+>
+> **Context**: Building [NNS](https://github.com/...)  (Nockchain
+> Name Service) on the Vesl graft. Phase 3c of the NNS zkRollup
+> plan aims to prove bundle validation *inside* the STARK so light
+> clients verify a single proof instead of
+> (proof + digest check + Rust validator mirror).
+>
+> **Observation**: `common/ztd/eight.hoon::fock:fink:interpret`
+> (lines 807–818) traps on Nock opcodes 9, 10, 11:
+>
+> ```
+> [%9 axis=* core=*]              !!
+> [%10 [axis=@ value=*] target=*] !!
+> [%11 tag=@ next=*]              !!
+> [%11 [tag=@ clue=*] next=*]     !!
+> ```
+>
+> Raw nockvm supports all twelve; the STARK interpreter only
+> handles 0–8. Any Hoon-level gate call compiles to Nock-9 (slam);
+> any record/sample edit compiles to Nock-10. Hoon hints emit
+> Nock-11. This means no Hoon validator non-trivial enough to walk
+> a list or compare fields can be traced by the current Vesl
+> prover.
+>
+> **Repro** (external, in NNS repo):
+> `cargo test --test prover phase3c_step3_validator_in_stark_blocked_upstream -- --ignored --nocapture`.
+> Confirms encoding runs correctly outside the STARK
+> (`.*(subj form)` → `[0 0]` = `[%& ~]`) and traps inside with a
+> Hoon stack trace through `eight.hoon:808`.
+>
+> **Specific asks, in priority order**:
+>
+> 1. `[%9 axis core]` (slam). Trace decomposition:
+>    `core → arm-formula → subject-for-arm`, then recurse. Trace
+>    cost scales with slammed arm's depth. Shipping this alone
+>    unlocks NNS (we can build the subject with bundle at the
+>    gate's sample slot directly, sidestepping `%10`).
+> 2. `[%10 [axis value] target]` (edit). Noun-surgery; constraint
+>    models `target` with axis replaced by `value`.
+> 3. `[%11 tag next]` / `[%11 [tag clue] next]` (hint). Least
+>    load-bearing — safe to erase in trace (no semantic effect on
+>    product) if the constraint system prefers to strip hints.
+>
+> **Downstream effect** when shipped: NNS's blocker-signal test
+> `phase3c_step3_validator_in_stark_blocked_upstream` becomes a
+> green end-to-end validator-in-STARK test with no NNS-side code
+> change other than flipping one assertion. Wallet SDK sheds its
+> ~150-line Rust validator mirror.
+>
+> Happy to contribute traces / test fixtures if useful.
