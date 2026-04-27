@@ -624,32 +624,6 @@
         ::
     ==
   ::
-  ::  Path Y2: %scan-block — parent link + height monotonicity,
-  ::  then `+claim-scanner:np` over the supplied candidates.
-  ::
-  ++  scan-block-poke
-    |=  c=cause
-    ^-  [(list effect) v0-state]
-    ?>  ?=(%scan-block -.c)
-    =/  boot=?
-      &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
-    ?.  ?|(boot =(parent.c last-proved-digest.state))
-      :-  ~[[%scan-block-error 'parent-mismatch']]
-      state
-    ?.  =(height.c +(last-proved-height.state))
-      :-  ~[[%scan-block-error 'height-not-successor']]
-      state
-    =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
-    =/  pag=nns-page-summary:np  [page-digest.c tx-set]
-    =/  new-acc=nns-accumulator:na
-      (claim-scanner:np accumulator.state pag height.c candidates.c)
-    =/  acc-root=@  (root-atom:na new-acc)
-    =.  accumulator.state  new-acc
-    =.  last-proved-height.state  height.c
-    =.  last-proved-digest.state  digest.pag
-    :-  ~[[%scan-block-done height.c digest.pag acc-root]]
-    state
-  ::
   ++  poke
     |=  =ovum:moat
     ^-  [(list effect) _state]
@@ -659,8 +633,29 @@
       [~ state]
     ?-  -.u.act
         ::
+        ::  Path Y2: %scan-block — parent link + height monotonicity,
+        ::  then `+claim-scanner:np` over the supplied candidates.
+        ::
         %scan-block
-      (scan-block-poke u.act)
+      =/  c  u.act
+      =/  boot=?
+        &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
+      ?.  ?|(boot =(parent.c last-proved-digest.state))
+        :_  state
+        ~[[%scan-block-error 'parent-mismatch']]
+      ?.  =(height.c +(last-proved-height.state))
+        :_  state
+        ~[[%scan-block-error 'height-not-successor']]
+      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
+      =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+      =/  new-acc=nns-accumulator:na
+        (claim-scanner:np accumulator.state pag height.c candidates.c)
+      =/  acc-root=@  (root-atom:na new-acc)
+      =.  accumulator.state  new-acc
+      =.  last-proved-height.state  height.c
+      =.  last-proved-digest.state  digest.pag
+      :_  state
+      ~[[%scan-block-done height.c digest.pag acc-root]]
       ::
         ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
         ::  [%prove-identity-result ok=?] so the test can confirm the
