@@ -265,7 +265,7 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
             SystemWire.to_wire(),
             build_scan_block_poke(
                 &parent,
-                details.height,
+                next_height,
                 &page_digest,
                 &page_tx_ids,
                 &candidates,
