@@ -8,7 +8,7 @@ Generic wallets today often expose **amount + recipient** flows only. NNS requir
 
 - The client must build **NoteData entries** exactly as `ClaimNoteV1::to_note_data` does (see `src/claim_note.rs`).
 - The claim must sit on an **output** of the registering transaction; the follower walks `details.outputs` only.
-- **`owner`** in the claim tuple should align with how the hull builds the payment witness (see `claim_witness_from_transaction` in `src/chain_follower.rs`): typically the spending note name matches `owner` for correct Level C-A checks.
+- **`owner`** in the claim tuple should match how the hull builds the payment witness (see `claim_witness_from_transaction` in `src/chain_follower.rs`): typically the spending input’s `note_name_b58` equals `owner` for correct Level C-A checks.
 
 Until wallets ship first-class “attach NoteData / app-specific payload” UX, operators rely on **custom tx builders** or patched **nockchain-wallet** tooling.
 
@@ -16,9 +16,7 @@ Until wallets ship first-class “attach NoteData / app-specific payload” UX, 
 
 | Key | Value |
 |-----|--------|
-| `nns/v1/claim-version` | `u64`, must be `1` |
-| `nns/v1/claim-id` | opaque bytes (UTF-8 string in practice) |
-| `nns/v1/claim` | JAM of `[name=cord owner=cord tx_hash=cord]` |
+| `nns/v1/claim` | JAM of `[name=cord owner=cord tx_hash=cord]` (UTF-8 cords). Version is implied by the `v1` key; uniqueness for wallets/proofs comes from **chain height** and **tx id**, not a separate claim-id blob. |
 
 Optional Phase 2d keys (`nns/v1/raw-tx`, `nns/v1/page`, …) are documented in `src/claim_note.rs`; the Path Y follower does not require them for the current scanner path.
 

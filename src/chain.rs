@@ -181,7 +181,10 @@ pub async fn submit_claim_note(
         .await
         .map_err(|e| format!("chain probe failed: {e}"))?;
     let payload_len = note.jam_tuple().len();
-    Ok(Some(format!("queued-{}-{payload_len}", note.claim_id)))
+    Ok(Some(format!(
+        "queued-{}-{}-{payload_len}",
+        note.name, note.tx_hash
+    )))
 }
 
 // =========================================================================

@@ -2,21 +2,16 @@
 //! Wallet / CLI support is limited today — see `docs/claim-note-wallet-support.md`
 //! and <https://github.com/nockchain/nockchain/pull/85>.
 use nock_noun_rs::{cue_from_bytes, jam_to_bytes, make_cord, new_stack, T};
-use nockchain_client_rs::{
-    find_opaque_bytes_entry, jam_opaque_bytes_entry, jam_u64_entry, NoteData,
-};
+use nockchain_client_rs::{find_opaque_bytes_entry, jam_opaque_bytes_entry, NoteData};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
+/// Key for the JAM'd claim triple `[name=cord owner=cord tx_hash=cord]`.
+/// Version is implied by the `v1` path segment (no separate `claim-version` entry).
 pub const CLAIM_NOTE_KEY: &str = "nns/v1/claim";
-pub const CLAIM_NOTE_VERSION_KEY: &str = "nns/v1/claim-version";
-pub const CLAIM_NOTE_ID_KEY: &str = "nns/v1/claim-id";
 
 /// Phase 2d — optional chain-bundle keys. A claim-note with any of
-/// these is a "post-Phase-2" note carrying the on-chain evidence the
-/// recursive `nns-gate` circuit will consume in Phase 3. Claim-notes
-/// without them are treated as legacy (accepted in local mode,
-/// rejected by a strict Phase 3 circuit).
+/// these is a "post-Phase-2" note carrying on-chain evidence the
+/// recursive `nns-gate` circuit will consume in Phase 3.
 pub const CLAIM_NOTE_RAW_TX_KEY: &str = "nns/v1/raw-tx";
 pub const CLAIM_NOTE_PAGE_KEY: &str = "nns/v1/page";
 pub const CLAIM_NOTE_BLOCK_PROOF_KEY: &str = "nns/v1/block-proof";
@@ -58,8 +53,6 @@ impl ClaimChainBundle {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimNoteV1 {
-    pub version: u64,
-    pub claim_id: String,
     pub name: String,
     pub owner: String,
     pub tx_hash: String,
@@ -72,8 +65,6 @@ pub struct ClaimNoteV1 {
 impl ClaimNoteV1 {
     pub fn new(name: String, owner: String, tx_hash: String) -> Self {
         Self {
-            version: 1,
-            claim_id: Uuid::new_v4().to_string(),
             name,
             owner,
             tx_hash,
@@ -89,7 +80,7 @@ impl ClaimNoteV1 {
         self
     }
 
-    /// Canonical jam payload for the claim tuple.
+    /// Canonical jam payload for the claim triple `[name owner tx_hash]`.
     pub fn jam_tuple(&self) -> Vec<u8> {
         let mut stack = new_stack();
         let n = make_cord(&mut stack, &self.name);
@@ -101,16 +92,11 @@ impl ClaimNoteV1 {
 
     /// Encode this claim note as NoteData entries for a NoteV1 output.
     ///
-    /// Legacy `nns/v1/claim-*` entries are always emitted. Phase 2d
-    /// chain-bundle keys are emitted only when present — absent keys
-    /// are indistinguishable from a legacy note on the wire so
-    /// downstream readers can stay backward-compatible.
+    /// Emits only **`nns/v1/claim`** (JAM triple) plus any optional Phase 2d
+    /// chain-bundle keys when set. Version is implied by the key path; block
+    /// height / tx id on chain disambiguate claims for wallets and proofs.
     pub fn to_note_data(&self) -> NoteData {
-        let mut entries = vec![
-            jam_u64_entry(CLAIM_NOTE_VERSION_KEY, self.version),
-            jam_opaque_bytes_entry(CLAIM_NOTE_ID_KEY, self.claim_id.as_bytes()),
-            jam_opaque_bytes_entry(CLAIM_NOTE_KEY, &self.jam_tuple()),
-        ];
+        let mut entries = vec![jam_opaque_bytes_entry(CLAIM_NOTE_KEY, &self.jam_tuple())];
         if let Some(bytes) = self.chain_bundle.raw_tx_jam.as_ref() {
             entries.push(jam_opaque_bytes_entry(CLAIM_NOTE_RAW_TX_KEY, bytes));
         }
@@ -132,17 +118,8 @@ impl ClaimNoteV1 {
     /// `ClaimChainBundle` fields — callers that require them (e.g.
     /// strict Phase 3 follower) must check `chain_bundle.is_complete`.
     pub fn from_note_data(note_data: &NoteData) -> Result<Self, String> {
-        let version = nockchain_client_rs::find_u64_entry(note_data, CLAIM_NOTE_VERSION_KEY)
-            .map_err(|e| format!("missing claim version: {e}"))?;
-        if version != 1 {
-            return Err(format!("unsupported claim version: {version}"));
-        }
-        let claim_id_bytes = find_opaque_bytes_entry(note_data, CLAIM_NOTE_ID_KEY)
-            .map_err(|e| format!("missing claim id: {e}"))?;
-        let claim_id =
-            String::from_utf8(claim_id_bytes).map_err(|e| format!("claim id is not utf8: {e}"))?;
         let tuple_jam = find_opaque_bytes_entry(note_data, CLAIM_NOTE_KEY)
-            .map_err(|e| format!("missing claim tuple: {e}"))?;
+            .map_err(|e| format!("missing nns/v1/claim: {e}"))?;
         let mut stack = new_stack();
         let tuple = cue_from_bytes(&mut stack, &tuple_jam)
             .ok_or_else(|| "failed to decode claim tuple".to_string())?;
@@ -165,8 +142,6 @@ impl ClaimNoteV1 {
         };
 
         Ok(Self {
-            version,
-            claim_id,
             name: atom_to_cord(name)?,
             owner: atom_to_cord(owner)?,
             tx_hash: atom_to_cord(tx_hash)?,
@@ -190,8 +165,6 @@ mod tests {
 
     fn sample_note() -> ClaimNoteV1 {
         ClaimNoteV1 {
-            version: 1,
-            claim_id: "c-123".to_string(),
             name: "foo.nock".to_string(),
             owner: "owner-xyz".to_string(),
             tx_hash: "tx-abc".to_string(),
@@ -203,8 +176,6 @@ mod tests {
     fn note_data_roundtrip_preserves_fields() {
         let note = sample_note();
         let decoded = ClaimNoteV1::from_note_data(&note.to_note_data()).expect("decode");
-        assert_eq!(decoded.version, note.version);
-        assert_eq!(decoded.claim_id, note.claim_id);
         assert_eq!(decoded.name, note.name);
         assert_eq!(decoded.owner, note.owner);
         assert_eq!(decoded.tx_hash, note.tx_hash);

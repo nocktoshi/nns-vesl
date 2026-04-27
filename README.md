@@ -164,11 +164,9 @@ claims asynchronously.
 - When `chain_endpoint` is configured, follower apply order is
 canonicalized by chain block inclusion height plus transaction index
 inside that block (`GetTransactionBlock` + `GetBlockDetails`).
-- Claim-note payloads now have a canonical NoteData schema in
+- On-chain claim **NoteData** (Path Y) uses a single required entry in
 `src/claim_note.rs`:
-  - `nns/v1/claim-version` (jammed `@ud`)
-  - `nns/v1/claim-id` (opaque bytes)
-  - `nns/v1/claim` (jammed `[name owner tx-hash]`)
+  - `nns/v1/claim` — JAM of `[name owner tx-hash]` as UTF-8 cords; `v1` in the key is the version.
 - Payment-replay protection is *on-kernel*: the `tx-hashes` set is
 part of the same jammed state a STARK attests to, so there is no
 hull-side cache to fall out of sync or get wiped across restarts.
