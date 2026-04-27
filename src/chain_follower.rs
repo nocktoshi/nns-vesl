@@ -18,6 +18,9 @@ use crate::kernel::{
 use crate::payment::{fee_for_name, sum_treasury_outputs_v1, TREASURY_LOCK_ROOT_B58};
 use crate::state::SharedState;
 
+/// Sleep between ticks **only** when there is nothing to scan (caught up
+/// within finality) or after an error — avoids gRPC busy-loops. While a
+/// finalized backlog exists, consecutive `%scan-block` steps run back-to-back.
 const FOLLOWER_POLL: Duration = Duration::from_secs(2);
 
 /// How far behind the chain tip the follower waits before committing a
@@ -34,16 +37,18 @@ pub const DEFAULT_MAX_ADVANCE_BATCH: u64 = 1;
 pub fn spawn(state: SharedState) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match scan_once(&state).await {
+            let idle = match scan_once(&state).await {
                 Ok(Some(scanned)) => {
                     tracing::info!(
                         height = scanned.height,
                         phase = "scan_block",
                         "chain follower scanned block"
                     );
+                    false
                 }
                 Ok(None) => {
                     tracing::trace!(phase = "scan_block", "scan tick no-op");
+                    true
                 }
                 Err(err) => {
                     let ts = crate::state::AppState::now_epoch_ms();
@@ -55,9 +60,14 @@ pub fn spawn(state: SharedState) -> JoinHandle<()> {
                         phase = "scan_block",
                         "chain follower scan tick failed"
                     );
+                    true
                 }
+            };
+            if idle {
+                tokio::time::sleep(FOLLOWER_POLL).await;
+            } else {
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(FOLLOWER_POLL).await;
         }
     })
 }

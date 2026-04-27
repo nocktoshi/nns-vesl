@@ -546,7 +546,7 @@ Defaults (see `src/chain_follower.rs`):
 ```text
 DEFAULT_FINALITY_DEPTH = 10
 DEFAULT_MAX_ADVANCE_BATCH = 1   (Path Y scanner; value may differ from old anchor follower)
-poll interval = 10 s
+idle poll = 2 s (only between ticks with no block to scan, or after an error; backlog has no sleep)
 ```
 ## 5.10 Byte budget
 Approximate future verification bundle for `alice.nock`:
@@ -1641,7 +1641,7 @@ Added anchor advance task:
 ```text
 advance_anchor_once
 ```
-Runs every 10 seconds.
+Path Y: scans backlog blocks back-to-back; sleeps 2 s only when idle or after a scan error.
 Uses:
 ```text
 DEFAULT_FINALITY_DEPTH = 10
