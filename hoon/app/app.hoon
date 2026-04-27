@@ -624,6 +624,75 @@
         ::
     ==
   ::
+  ::  Path Y2: %scan-block — parent link + height monotonicity,
+  ::  then `+claim-scanner:np` over the supplied candidates.
+  ::
+  ++  scan-block-poke
+    |=  c=cause
+    ^-  [(list effect) v0-state]
+    ?>  ?=(%scan-block -.c)
+    =/  boot=?
+      &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
+    ?.  ?|(boot =(parent.c last-proved-digest.state))
+      :_  state
+      ~[[%scan-block-error 'parent-mismatch']]
+    ?.  =(height.c +(last-proved-height.state))
+      :_  state
+      ~[[%scan-block-error 'height-not-successor']]
+    ::  Progress on stderr (level 2). Pair with hull `RUST_LOG` / follower
+    ::  logs when debugging scans.
+    ::
+    =/  slog-enter=@t
+      %+  crip
+      ;:  weld
+        "nns: scan-block start height="
+        (trip (scot %ud height.c))
+        " prev_height="
+        (trip (scot %ud last-proved-height.state))
+        " page_tx_ids="
+        (trip (scot %ud (lent page-tx-ids.c)))
+        " candidates="
+        (trip (scot %ud (lent candidates.c)))
+        ""
+      ==
+    ~>  %slog.[2 slog-enter]
+    =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
+    =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+    =/  n-tx-set=@ud  ~(wyt z-in tx-set)
+    =/  slog-page=@t
+      %+  crip
+      ;:  weld
+        "nns: scan-block page summary built z_set_size="
+        (trip (scot %ud n-tx-set))
+        " block_id="
+        (trip (scot %ux page-digest.c))
+        ""
+      ==
+    ~>  %slog.[2 slog-page]
+    =/  new-acc=nns-accumulator:na
+      (claim-scanner:np accumulator.state pag height.c candidates.c)
+    =/  acc-root=@  (root-atom:na new-acc)
+    =/  acc-sz=@ud  (size:na new-acc)
+    =/  slog-done=@t
+      %+  crip
+      ;:  weld
+        "nns: scan-block done height="
+        (trip (scot %ud height.c))
+        " acc_root="
+        (trip (scot %ux acc-root))
+        " acc_size="
+        (trip (scot %ud acc-sz))
+        " block_digest="
+        (trip (scot %ux digest.pag))
+        ""
+      ==
+    ~>  %slog.[2 slog-done]
+    =.  accumulator.state  new-acc
+    =.  last-proved-height.state  height.c
+    =.  last-proved-digest.state  digest.pag
+    :-  ~[[%scan-block-done height.c digest.pag acc-root]]
+    state
+  ::
   ++  poke
     |=  =ovum:moat
     ^-  [(list effect) _state]
@@ -633,41 +702,8 @@
       [~ state]
     ?-  -.u.act
         ::
-        ::  Path Y2: %scan-block — parent link + height monotonicity,
-        ::  then `+claim-scanner:np` over the supplied candidates.
-        ::
         %scan-block
-      =/  c  u.act
-      =/  boot=?
-        &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
-      ?.  ?|(boot =(parent.c last-proved-digest.state))
-        :_  state
-        ~[[%scan-block-error 'parent-mismatch']]
-      ?.  =(height.c +(last-proved-height.state))
-        :_  state
-        ~[[%scan-block-error 'height-not-successor']]
-      ::  Traps inside `z-silt` / z-in `gas`→`put` (see /common/zoon.hoon)
-      ::  or `claim-scanner` surface as an empty hull effect list unless
-      ::  caught — wrap so operators get `%scan-block-error` instead.
-      ::
-      =/  res
-        %-  mule
-        |.
-        =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
-        =/  pag=nns-page-summary:np  [page-digest.c tx-set]
-        =/  new-acc=nns-accumulator:na
-          (claim-scanner:np accumulator.state pag height.c candidates.c)
-        =/  acc-root=@  (root-atom:na new-acc)
-        [new-acc acc-root digest.pag]
-      ?.  ?=(%& -.res)
-        :_  state
-        ~[[%scan-block-error 'scan-trapped']]
-      =/  [new-acc=nns-accumulator:na acc-root=@ digest-h=@ux]  p.res
-      =.  accumulator.state  new-acc
-      =.  last-proved-height.state  height.c
-      =.  last-proved-digest.state  digest-h
-      :_  state
-      ~[[%scan-block-done height.c digest-h acc-root]]
+      (scan-block-poke u.act)
       ::
         ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
         ::  [%prove-identity-result ok=?] so the test can confirm the
