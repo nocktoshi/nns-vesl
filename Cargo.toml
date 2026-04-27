@@ -17,6 +17,7 @@ nockapp = { path = "../nockchain/crates/nockapp", default-features = false }
 nockvm = { path = "../nockchain/crates/nockvm/rust/nockvm" }
 nockvm_macros = { path = "../nockchain/crates/nockvm/rust/nockvm_macros" }
 nockapp-grpc = { path = "../nockchain/crates/nockapp-grpc" }
+nockchain-types = { path = "../nockchain/crates/nockchain-types" }
 # STARK prover hot state — required to produce real proofs from nns-gate.
 zkvm-jetpack = { path = "../nockchain/crates/zkvm-jetpack" }
 

@@ -175,6 +175,222 @@ pub fn build_verify_stark_poke(proof_jam: &[u8]) -> NounSlab {
     slab
 }
 
+/// Build `[%verify-stark-explicit blob=@ subject-jam=@ formula-jam=@]`.
+///
+/// Each jam slice is the raw JAM bytes of the proof noun and of the
+/// traced `subject` / `formula` nouns — the same triple cached in
+/// `last-proved` for `%verify-stark`. Path Y4 `light_verify` uses this
+/// so wallets verify without mutating kernel state.
+pub fn build_verify_stark_explicit_poke(
+    proof_jam: &[u8],
+    subject_jam: &[u8],
+    formula_jam: &[u8],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "verify-stark-explicit");
+    let blob = make_atom_in(&mut slab, proof_jam);
+    let sj = make_atom_in(&mut slab, subject_jam);
+    let fj = make_atom_in(&mut slab, formula_jam);
+    let poke = T(&mut slab, &[tag, blob, sj, fj]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Boot the NNS kernel from `kernel_jam`, poke `%verify-stark-explicit`,
+/// and return the loobean from `[%verify-stark-result ok=?]`.
+///
+/// Uses the same prover hot-state registration as hull tests so
+/// `verify:vesl-stark-verifier` jets match `%prove-*` paths. Requires a
+/// kernel JAM built from a Hoon source that includes `%verify-stark-explicit`.
+pub async fn verify_stark_explicit_offline(
+    kernel_jam: &[u8],
+    proof_jam: &[u8],
+    subject_jam: &[u8],
+    formula_jam: &[u8],
+) -> Result<bool, String> {
+    use nockapp::kernel::boot;
+    use nockapp::kernel::boot::NockStackSize;
+    use nockapp::wire::{SystemWire, Wire};
+    use nockapp::NockApp;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nns-light-stark-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+
+    let run = async {
+        let mut cli = boot::default_boot_cli(true);
+        cli.stack_size = NockStackSize::Large;
+        let prover_hot_state = zkvm_jetpack::hot::produce_prover_hot_state();
+        let mut app: NockApp = boot::setup(
+            kernel_jam,
+            cli,
+            prover_hot_state.as_slice(),
+            "nns-light-verify-stark",
+            Some(dir.clone()),
+        )
+        .await
+        .map_err(|e| format!("kernel boot: {e:?}"))?;
+
+        let poke = build_verify_stark_explicit_poke(proof_jam, subject_jam, formula_jam);
+        let fx = app
+            .poke(SystemWire.to_wire(), poke)
+            .await
+            .map_err(|e| format!("verify poke: {e:?}"))?;
+
+        if let Some(msg) = first_verify_stark_error(&fx) {
+            return Err(msg);
+        }
+        first_verify_stark_result(&fx)
+            .ok_or_else(|| "kernel emitted no %verify-stark-result".to_string())
+    };
+
+    let out = run.await;
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// [`verify_stark_explicit_offline`] on a fresh current-thread runtime.
+pub fn verify_stark_explicit_blocking(
+    kernel_jam: &[u8],
+    proof_jam: &[u8],
+    subject_jam: &[u8],
+    formula_jam: &[u8],
+) -> Result<bool, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(verify_stark_explicit_offline(
+            kernel_jam,
+            proof_jam,
+            subject_jam,
+            formula_jam,
+        ))
+}
+
+/// Build `[%verify-accumulator-snapshot ...]`.
+///
+/// `expected_root` is the raw `@` bytes of `(root-atom:na acc)` (same encoding
+/// as `/scan-state` `root` and `accumulator_root_hex` from the hull).
+pub fn build_verify_accumulator_snapshot_poke(
+    expected_root: &[u8],
+    acc_jam: &[u8],
+    name: &str,
+    owner: &str,
+    tx_hash: &[u8],
+    claim_height: u64,
+    block_digest: &[u8],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "verify-accumulator-snapshot");
+    let er = make_atom_in(&mut slab, expected_root);
+    let aj = make_atom_in(&mut slab, acc_jam);
+    let name_n = make_cord_in(&mut slab, name);
+    let owner_n = make_cord_in(&mut slab, owner);
+    let txh = make_atom_in(&mut slab, tx_hash);
+    let ch = atom_from_u64(&mut slab, claim_height);
+    let bd = make_atom_in(&mut slab, block_digest);
+    let poke = T(
+        &mut slab,
+        &[tag, er, aj, name_n, owner_n, txh, ch, bd],
+    );
+    slab.set_root(poke);
+    slab
+}
+
+/// Boot kernel, poke `%verify-accumulator-snapshot`, return loobean from
+/// `[%accumulator-snapshot-verify-result ok=?]`.
+pub async fn verify_accumulator_snapshot_offline(
+    kernel_jam: &[u8],
+    expected_root: &[u8],
+    acc_jam: &[u8],
+    name: &str,
+    owner: &str,
+    tx_hash: &[u8],
+    claim_height: u64,
+    block_digest: &[u8],
+) -> Result<bool, String> {
+    use nockapp::kernel::boot;
+    use nockapp::kernel::boot::NockStackSize;
+    use nockapp::wire::{SystemWire, Wire};
+    use nockapp::NockApp;
+
+    let dir = std::env::temp_dir().join(format!(
+        "nns-light-acc-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+
+    let run = async {
+        let mut cli = boot::default_boot_cli(true);
+        cli.stack_size = NockStackSize::Large;
+        let prover_hot_state = zkvm_jetpack::hot::produce_prover_hot_state();
+        let mut app: NockApp = boot::setup(
+            kernel_jam,
+            cli,
+            prover_hot_state.as_slice(),
+            "nns-light-verify-acc",
+            Some(dir.clone()),
+        )
+        .await
+        .map_err(|e| format!("kernel boot: {e:?}"))?;
+
+        let poke = build_verify_accumulator_snapshot_poke(
+            expected_root,
+            acc_jam,
+            name,
+            owner,
+            tx_hash,
+            claim_height,
+            block_digest,
+        );
+        let fx = app
+            .poke(SystemWire.to_wire(), poke)
+            .await
+            .map_err(|e| format!("accumulator verify poke: {e:?}"))?;
+
+        if let Some(msg) = first_accumulator_snapshot_verify_error(&fx) {
+            return Err(msg);
+        }
+        first_accumulator_snapshot_verify_result(&fx).ok_or_else(|| {
+            "kernel emitted no %accumulator-snapshot-verify-result".to_string()
+        })
+    };
+
+    let out = run.await;
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// [`verify_accumulator_snapshot_offline`] on a fresh current-thread runtime.
+pub fn verify_accumulator_snapshot_blocking(
+    kernel_jam: &[u8],
+    expected_root: &[u8],
+    acc_jam: &[u8],
+    name: &str,
+    owner: &str,
+    tx_hash: &[u8],
+    claim_height: u64,
+    block_digest: &[u8],
+) -> Result<bool, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(verify_accumulator_snapshot_offline(
+            kernel_jam,
+            expected_root,
+            acc_jam,
+            name,
+            owner,
+            tx_hash,
+            claim_height,
+            block_digest,
+        ))
+}
+
 /// One entry in the `%advance-tip` header list.
 ///
 /// `digest` and `parent` are raw 40-byte Tip5 hashes (5 × 8-byte
@@ -374,6 +590,19 @@ pub struct ClaimWitness {
     pub output_lock_root: String,
 }
 
+/// One `nns/v1/claim` candidate extracted from a Nockchain block.
+///
+/// This mirrors `+$nns-claim-candidate` in `hoon/lib/nns-predicates.hoon`
+/// and is the per-transaction payload folded by `%scan-block`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimCandidate {
+    pub name: String,
+    pub owner: String,
+    pub fee: u64,
+    pub tx_hash: Vec<u8>,
+    pub witness: ClaimWitness,
+}
+
 impl ClaimBundle {
     /// Phase 7 convenience: check this bundle's `anchored_tip_height`
     /// against the wallet's current Nockchain tip view under the
@@ -406,6 +635,61 @@ impl ClaimBundle {
     ) -> Result<(), AnchorBindingError> {
         crate::freshness::check_anchor_binding(&self.anchored_tip, wallet_view_digest)
     }
+}
+
+/// Build a `[%scan-block parent height page-digest page-tx-ids candidates]`
+/// poke slab.
+///
+/// This is the Path Y non-recursive precursor: the follower supplies one
+/// canonical block, the kernel checks parent/height monotonicity, then folds
+/// valid candidates into the accumulator.
+pub fn build_scan_block_poke(
+    parent: &[u8],
+    height: u64,
+    page_digest: &[u8],
+    page_tx_ids: &[Vec<u8>],
+    candidates: &[ClaimCandidate],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "scan-block");
+    let parent_atom = make_atom_in(&mut slab, parent);
+    let height_atom = atom_from_u64(&mut slab, height);
+    let page_digest_atom = make_atom_in(&mut slab, page_digest);
+
+    let mut tx_ids_list = D(0);
+    for id in page_tx_ids.iter().rev() {
+        let tx_id = make_atom_in(&mut slab, id);
+        tx_ids_list = T(&mut slab, &[tx_id, tx_ids_list]);
+    }
+
+    let mut candidates_list = D(0);
+    for c in candidates.iter().rev() {
+        let name = make_cord_in(&mut slab, &c.name);
+        let owner = make_cord_in(&mut slab, &c.owner);
+        let fee = atom_from_u64(&mut slab, c.fee);
+        let tx_hash = make_atom_in(&mut slab, &c.tx_hash);
+        let w_tx_id = make_atom_in(&mut slab, &c.witness.tx_id);
+        let w_spender = make_atom_in(&mut slab, &c.witness.spender_pkh);
+        let w_amount = atom_from_u64(&mut slab, c.witness.treasury_amount);
+        let w_treasury = make_cord_in(&mut slab, &c.witness.output_lock_root);
+        let witness = T(&mut slab, &[w_tx_id, w_spender, w_amount, w_treasury]);
+        let candidate = T(&mut slab, &[name, owner, fee, tx_hash, witness]);
+        candidates_list = T(&mut slab, &[candidate, candidates_list]);
+    }
+
+    let poke = T(
+        &mut slab,
+        &[
+            tag,
+            parent_atom,
+            height_atom,
+            page_digest_atom,
+            tx_ids_list,
+            candidates_list,
+        ],
+    );
+    slab.set_root(poke);
+    slab
 }
 
 /// Build a `[%validate-claim ...]` poke slab.
@@ -823,6 +1107,96 @@ pub fn first_claim_in_stark_proof(effects: &[NounSlab]) -> Option<ClaimInStarkPr
     effects.iter().find_map(claim_in_stark_proof)
 }
 
+/// Build a `[%prove-recursive-step prev-proof-jam prev-subject-jam
+/// prev-formula-jam]` poke. Y0 recursive-composition spike. See
+/// `y0_recursive_composition_spike` in `tests/prover.rs` for the
+/// call-site and expected outcome.
+///
+/// `prev_proof_jam` / `prev_subject_jam` / `prev_formula_jam` are the
+/// JAM bytes of a previously-emitted `proof:sp`, its traced subject,
+/// and its traced formula (typically captured from an `%arbitrary-proof`
+/// effect + the caller-constructed subject/formula the prover ran on).
+///
+/// The kernel wraps `verify:vesl-stark-verifier(prev-proof, ~, 0,
+/// prev-subject, prev-formula)` in a subject-bundled-core trace and
+/// runs it through `prove-computation:vp`. Two effects come out:
+///
+///   1. `[%recursive-step-dry-run-ok ok=?]` — whether the raw nockvm
+///      accepted (`ok=%.y`) or rejected (`ok=%.n`) the recursive
+///      verification, independently of whether the STARK can trace it.
+///   2. Either `[%recursive-step-proof product proof]` (prover
+///      succeeded — recursive composition is tractable today) OR
+///      `[%prove-failed trace]` (expected outcome — Vesl's prover
+///      trapped on Nock 9/10/11 inside `verify:vv`).
+pub fn build_prove_recursive_step_poke(
+    prev_proof_jam: &[u8],
+    prev_subject_jam: &[u8],
+    prev_formula_jam: &[u8],
+) -> NounSlab {
+    let mut slab = NounSlab::new();
+    let tag = make_tag_in(&mut slab, "prove-recursive-step");
+    let proof = make_atom_in(&mut slab, prev_proof_jam);
+    let subject = make_atom_in(&mut slab, prev_subject_jam);
+    let formula = make_atom_in(&mut slab, prev_formula_jam);
+    let poke = T(&mut slab, &[tag, proof, subject, formula]);
+    slab.set_root(poke);
+    slab
+}
+
+/// Payload of `[%recursive-step-proof product proof]` emitted by
+/// `%prove-recursive-step` on a *successful* recursive-composition
+/// prove. Seeing this in a test is the go-signal for Path Y step Y3.
+#[derive(Debug)]
+pub struct RecursiveStepProof {
+    /// JAM of whatever the outer formula evaluated to — should be a
+    /// Hoon loobean: `%.y` = 0 (inner proof verified), `%.n` = 1.
+    pub product_jam: Vec<u8>,
+    /// JAM of the outer STARK proof (the recursive-step proof).
+    pub proof_jam: Vec<u8>,
+}
+
+pub fn recursive_step_proof(effect: &NounSlab) -> Option<RecursiveStepProof> {
+    if effect_tag(effect)? != "recursive-step-proof" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let product_noun = rest.head();
+    let proof_noun = rest.tail();
+    let mut stack = new_stack();
+    let product_jam = jam_to_bytes(&mut stack, product_noun);
+    let proof_jam = jam_to_bytes(&mut stack, proof_noun);
+    Some(RecursiveStepProof {
+        product_jam,
+        proof_jam,
+    })
+}
+
+pub fn first_recursive_step_proof(effects: &[NounSlab]) -> Option<RecursiveStepProof> {
+    effects.iter().find_map(recursive_step_proof)
+}
+
+/// `ok` from `[%recursive-step-dry-run-ok ok=?]`. `true` means the raw
+/// nockvm successfully computed `verify:vv(prev-proof, ~, 0,
+/// prev-subject, prev-formula)` and it returned `%.y`. This is the
+/// encoding-level sanity gate — if dry-run is `false` we're asking
+/// the STARK to trace a trap, and the spike is invalid before we even
+/// get to the Vesl-prover question.
+pub fn recursive_step_dry_run_ok(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "recursive-step-dry-run-ok" {
+        return None;
+    }
+    let noun = unsafe { *effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let ok_atom = cell.tail().as_atom().ok()?;
+    Some(ok_atom.as_u64().ok()? == 0)
+}
+
+pub fn first_recursive_step_dry_run_ok(effects: &[NounSlab]) -> Option<bool> {
+    effects.iter().find_map(recursive_step_dry_run_ok)
+}
+
 // ---------------------------------------------------------------------------
 // Peek builders
 // ---------------------------------------------------------------------------
@@ -857,6 +1231,46 @@ pub fn build_last_settled_peek() -> NounSlab {
 /// `(unit ...)` is `~` when the name is not in the registry.
 pub fn build_owner_peek(name: &str) -> NounSlab {
     name_peek("owner", name)
+}
+
+/// Build a `/accumulator/<name>` peek path slab.
+///
+/// Kernel response: `[~ ~ (unit nns-accumulator-entry)]` where
+/// `nns-accumulator-entry = [owner=@t tx-hash=@ux claim-height=@ud block-digest=@ux]`.
+pub fn build_accumulator_peek(name: &str) -> NounSlab {
+    name_peek("accumulator", name)
+}
+
+/// Build a `/accumulator-proof/<name>` peek path slab.
+///
+/// Kernel response: `[~ ~ (unit @)]`, the z-map axis for a present key.
+/// This is an inclusion locator, not yet a full sibling-hash proof.
+pub fn build_accumulator_proof_peek(name: &str) -> NounSlab {
+    name_peek("accumulator-proof", name)
+}
+
+/// Build an `/accumulator-root ~` peek path slab.
+///
+/// Kernel response: `[~ ~ @]`, a lossy atom representation of the
+/// accumulator's Tip5 root. Wallet inclusion proofs should compare against the
+/// full z-map root once the inclusion-proof helper lands.
+pub fn build_accumulator_root_peek() -> NounSlab {
+    single_tag_peek("accumulator-root")
+}
+
+/// Build `/accumulator-jam ~` peek path slab.
+///
+/// Kernel response: `[~ ~ @]` — atom is `jam(accumulator)` (same encoding as
+/// `PathY4LookupBundle.accumulator_snapshot_jam_hex`).
+pub fn build_accumulator_jam_peek() -> NounSlab {
+    single_tag_peek("accumulator-jam")
+}
+
+/// Build a `/scan-state ~` peek path slab.
+///
+/// Kernel response: `[~ ~ height=@ud digest=@ux root=@ size=@ud]`.
+pub fn build_scan_state_peek() -> NounSlab {
+    single_tag_peek("scan-state")
 }
 
 /// Build a `/proof/<name>` peek path slab.
@@ -1002,6 +1416,122 @@ pub struct NameEntry {
     pub owner: String,
     pub tx_hash: String,
     pub claim_count: u64,
+}
+
+/// A row in the Path Y accumulator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatorEntry {
+    pub owner: String,
+    pub tx_hash: Vec<u8>,
+    pub claim_height: u64,
+    pub block_digest: Vec<u8>,
+}
+
+/// Decode the `[~ ~ (unit nns-accumulator-entry)]` peek result for
+/// `/accumulator/<name>`. Returns `Ok(None)` when the name is absent.
+pub fn decode_accumulator_entry(result: &NounSlab) -> Result<Option<AccumulatorEntry>, String> {
+    let inner = peek_unwrap_some(result)?;
+    if inner.as_atom().is_ok() {
+        return Ok(None);
+    }
+    let unit_cell = inner
+        .as_cell()
+        .map_err(|_| "accumulator: expected (unit entry) cell".to_string())?;
+    let entry = unit_cell.tail();
+    let entry_cell = entry
+        .as_cell()
+        .map_err(|_| "accumulator: entry not a cell".to_string())?;
+    let owner = atom_to_cord(entry_cell.head())?;
+    let rest = entry_cell
+        .tail()
+        .as_cell()
+        .map_err(|_| "accumulator: entry tail not a cell".to_string())?;
+    let tx_hash = atom_to_le_bytes(rest.head())?;
+    let rest = rest
+        .tail()
+        .as_cell()
+        .map_err(|_| "accumulator: entry tail2 not a cell".to_string())?;
+    let claim_height = rest
+        .head()
+        .as_atom()
+        .map_err(|_| "accumulator: claim_height not atom".to_string())?
+        .as_u64()
+        .map_err(|_| "accumulator: claim_height overflows u64".to_string())?;
+    let block_digest = atom_to_le_bytes(rest.tail())?;
+    Ok(Some(AccumulatorEntry {
+        owner,
+        tx_hash,
+        claim_height,
+        block_digest,
+    }))
+}
+
+/// Decode `[~ ~ (unit @)]` from `/accumulator-proof/<name>`.
+pub fn decode_accumulator_proof_axis(result: &NounSlab) -> Result<Option<Vec<u8>>, String> {
+    let inner = peek_unwrap_some(result)?;
+    if inner.as_atom().is_ok() {
+        return Ok(None);
+    }
+    let unit_cell = inner
+        .as_cell()
+        .map_err(|_| "accumulator-proof: expected (unit @) cell".to_string())?;
+    Ok(Some(atom_to_le_bytes(unit_cell.tail())?))
+}
+
+/// Decode `[~ ~ @]` from `/accumulator-root`.
+pub fn decode_accumulator_root(result: &NounSlab) -> Result<Vec<u8>, String> {
+    let inner = peek_unwrap_some(result)?;
+    atom_to_le_bytes(inner)
+}
+
+/// Decode `[~ ~ @]` from `/accumulator-jam` (JAM of the full `nns-accumulator`).
+pub fn decode_accumulator_jam(result: &NounSlab) -> Result<Vec<u8>, String> {
+    decode_accumulator_root(result)
+}
+
+/// The Path Y scan cursor and accumulator summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanState {
+    pub last_proved_height: u64,
+    pub last_proved_digest: Vec<u8>,
+    pub accumulator_root: Vec<u8>,
+    pub accumulator_size: u64,
+}
+
+/// Decode `[~ ~ height digest root size]` from `/scan-state`.
+pub fn decode_scan_state(result: &NounSlab) -> Result<ScanState, String> {
+    let inner = peek_unwrap_some(result)?;
+    let cell = inner
+        .as_cell()
+        .map_err(|_| "scan-state: expected cell".to_string())?;
+    let last_proved_height = cell
+        .head()
+        .as_atom()
+        .map_err(|_| "scan-state: height not atom".to_string())?
+        .as_u64()
+        .map_err(|_| "scan-state: height overflows u64".to_string())?;
+    let rest = cell
+        .tail()
+        .as_cell()
+        .map_err(|_| "scan-state: tail not a cell".to_string())?;
+    let last_proved_digest = atom_to_le_bytes(rest.head())?;
+    let rest = rest
+        .tail()
+        .as_cell()
+        .map_err(|_| "scan-state: tail2 not a cell".to_string())?;
+    let accumulator_root = atom_to_le_bytes(rest.head())?;
+    let accumulator_size = rest
+        .tail()
+        .as_atom()
+        .map_err(|_| "scan-state: size not atom".to_string())?
+        .as_u64()
+        .map_err(|_| "scan-state: size overflows u64".to_string())?;
+    Ok(ScanState {
+        last_proved_height,
+        last_proved_digest,
+        accumulator_root,
+        accumulator_size,
+    })
 }
 
 /// Decode the `[~ ~ (unit name-entry)]` peek result for
@@ -1245,6 +1775,49 @@ pub fn first_anchor_advanced(effects: &[NounSlab]) -> Option<AnchorAdvanced> {
     effects.iter().find_map(anchor_advanced)
 }
 
+/// Successful `%scan-block` effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanBlockDone {
+    pub height: u64,
+    pub digest: Vec<u8>,
+    pub accumulator_root: Vec<u8>,
+}
+
+pub fn scan_block_done(effect: &NounSlab) -> Option<ScanBlockDone> {
+    if effect_tag(effect)? != "scan-block-done" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let rest = cell.tail().as_cell().ok()?;
+    let height = rest.head().as_atom().ok()?.as_u64().ok()?;
+    let rest = rest.tail().as_cell().ok()?;
+    let digest = atom_to_le_bytes(rest.head()).ok()?;
+    let accumulator_root = atom_to_le_bytes(rest.tail()).ok()?;
+    Some(ScanBlockDone {
+        height,
+        digest,
+        accumulator_root,
+    })
+}
+
+pub fn first_scan_block_done(effects: &[NounSlab]) -> Option<ScanBlockDone> {
+    effects.iter().find_map(scan_block_done)
+}
+
+pub fn scan_block_error(effect: &NounSlab) -> Option<String> {
+    if effect_tag(effect)? != "scan-block-error" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    atom_to_cord(cell.tail()).ok()
+}
+
+pub fn first_scan_block_error(effects: &[NounSlab]) -> Option<String> {
+    effects.iter().find_map(scan_block_error)
+}
+
 /// Read `(address, name)` from a `[%primary-set address=@t name=@t]`
 /// effect. Returns `None` for any other effect shape.
 pub fn primary_set(effect: &NounSlab) -> Option<(String, String)> {
@@ -1448,6 +2021,46 @@ pub fn verify_stark_error(effect: &NounSlab) -> Option<String> {
 
 pub fn first_verify_stark_error(effects: &[NounSlab]) -> Option<String> {
     effects.iter().find_map(verify_stark_error)
+}
+
+/// `ok` from `[%accumulator-snapshot-verify-result ok=?]`.
+pub fn accumulator_snapshot_verify_result(effect: &NounSlab) -> Option<bool> {
+    if effect_tag(effect)? != "accumulator-snapshot-verify-result" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let ok_atom = cell.tail().as_atom().ok()?;
+    let v = ok_atom.as_u64().ok()?;
+    Some(v == 0)
+}
+
+pub fn first_accumulator_snapshot_verify_result(effects: &[NounSlab]) -> Option<bool> {
+    effects
+        .iter()
+        .find_map(accumulator_snapshot_verify_result)
+}
+
+pub fn accumulator_snapshot_verify_error(effect: &NounSlab) -> Option<String> {
+    if effect_tag(effect)? != "accumulator-snapshot-verify-error" {
+        return None;
+    }
+    let noun = unsafe { effect.root() };
+    let cell = noun.as_cell().ok()?;
+    let msg = cell.tail().as_atom().ok()?;
+    let bytes = msg.as_ne_bytes();
+    Some(
+        std::str::from_utf8(bytes)
+            .ok()?
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+
+pub fn first_accumulator_snapshot_verify_error(effects: &[NounSlab]) -> Option<String> {
+    effects
+        .iter()
+        .find_map(accumulator_snapshot_verify_error)
 }
 
 /// Returns the first `(address, name)` payload across `effects` from

@@ -119,6 +119,7 @@
 /+  vp=vesl-prover
 /+  vv=vesl-verifier
 /+  np=nns-predicates
+/+  na=nns-accumulator
 /=  sp  /common/stark/prover
 /=  nv  /common/nock-verifier
 /=  four  /common/ztd/four
@@ -134,7 +135,6 @@
 ::
 =>
 |%
-+$  name-entry  [owner=@t tx-hash=@t claim-count=@ud]
 ::
 ::  +$anchor-header: minimal header triple sufficient for parent-chain
 ::  verification. The full Nockchain page header carries a `proof:sp`,
@@ -167,40 +167,28 @@
       tip-height=@ud    :: page-number of tip
   ==
 ::
-+$  versioned-state
+::  +$v0-state: Path Y prerelease kernel — z-map accumulator + chain-scan
+::  cursor.  Tag `%v0` is the on-disk / jam identity for this shape; it
+::  does not refer to the old HTTP-era names map (that stack is gone).
+::
++$  v0-state
   $:  %v0
+      accumulator=nns-accumulator:na
+      last-proved-height=@ud
+      last-proved-digest=@ux
       vesl=vesl-state
-      names=(map @t name-entry)
-      tx-hashes=(set @t)
-      primaries=(map @t @t)
-      claim-count=@ud
-      last-settled-claim-id=@ud
-      root=@
-      hull=@
-      ::  Cached (subject, formula) for the most recent %prove-batch.
-      ::  Phase 1-redo uses this so %verify-stark can replay the exact
-      ::  inputs the prover traced (`batch` contents may change between
-      ::  prove and verify). `~` when no batch has been proved yet.
+      ::  Cached (subject, formula) for the most recent successful
+      ::  `prove-computation` (%prove-arbitrary, %prove-claim-in-stark,
+      ::  %prove-recursive-step). `~` until first prove.
       ::
       last-proved=(unit [subject=* formula=*])
-      ::  Phase 2: follower-advanced anchor.
-      ::
-      anchor=anchored-chain
-      ::  nockup:state
-      ::  graft-inject would add `vesl=vesl-state` here on a fresh
-      ::  kernel. Already present above; marker is idempotent.
-      ::
   ==
 ::
 ::
 +$  effect  *
 ::
 +$  cause
-  $%  [%claim name=@t owner=@t fee=@ud tx-hash=@t]
-      [%set-primary address=@t name=@t]
-      [%settle-batch ~]
-      [%prove-batch ~]
-      ::  Phase 1-redo: cue JAM and run `verify:nv` (same jets as
+  $%  ::  Phase 1-redo: cue JAM and run `verify:nv` (same jets as
       ::  on-chain block PoW STARK verification). Read-only; for
       ::  benchmarking recursion cost — verify is not inside the
       ::  fink-traced `prove-computation` subject.
@@ -209,6 +197,25 @@
       ::  before `cue`.
       ::
       [%verify-stark blob=*]
+      ::  Path Y4 / wallet offline: cue proof plus caller-supplied
+      ::  `subject-jam` and `formula-jam` atoms (raw JAM bytes of the
+      ::  traced nouns), then `verify:vesl-stark-verifier` — same math as
+      ::  `%verify-stark` but does not read `last-proved.state`. Read-only.
+      ::
+      [%verify-stark-explicit blob=* subject-jam=* formula-jam=*]
+      ::  Path Y4: offline z-map membership. Cues `acc-jam` into an
+      ::  `nns-accumulator`, checks `root-atom` matches `expected-root`,
+      ::  and that `(get acc name)` is exactly `entry`. Read-only.
+      ::
+      $:  %verify-accumulator-snapshot
+          expected-root=@
+          acc-jam=@
+          name=@t
+          owner=@t
+          tx-hash=@ux
+          claim-height=@ud
+          block-digest=@ux
+      ==
       ::  Phase 1-redo sanity: prove `[42 [0 1]]` (identity) with
       ::  vesl-prover, then verify it with vesl-stark-verifier. Uses
       ::  the exact same shape as vesl/protocol/tests/prove-verify.hoon
@@ -216,15 +223,20 @@
       ::  of our batch-specific subject/formula.
       ::
       [%prove-identity ~]
-      ::  Phase 2: follower advances the anchored-chain tip. `headers`
-      ::  is ordered oldest-first; each must chain to the previous one
-      ::  by parent pointer and the first must chain to the current
-      ::  `tip-digest` (or be `parent=0` when bootstrapping from genesis).
-      ::  Fails hard on any inconsistency — indicates a reorg the
-      ::  follower did not replay cleanly, which would compromise
-      ::  Phase 3's chain-linkage claim.
+      ::  Path Y2: ingest one Nockchain block worth of `nns/v1/claim`
+      ::  candidates. Verifies `parent` links to `last-proved-digest`,
+      ::  `height` is strictly the successor of `last-proved-height`,
+      ::  then folds valid candidates into the accumulator via
+      ::  `+claim-scanner:np`. On success advances the scan cursor to
+      ::  this block's digest and emits `[%scan-block-done ...]`.
       ::
-      [%advance-tip headers=(list anchor-header)]
+      $:  %scan-block
+          parent=@ux
+          height=@ud
+          page-digest=@ux
+          page-tx-ids=(list @ux)
+          candidates=(list nns-claim-candidate:np)
+      ==
       ::  Phase 3 Level A: exercise `chain-links-to:nns-predicates`
       ::  without going through %claim. Read-only — the cause does not
       ::  mutate state, it just runs the predicate and emits the
@@ -295,22 +307,6 @@
       ::  validator execution INSIDE the STARK so the wallet needs
       ::  only to verify the proof — see `docs/PROOF_STORAGE.md`.
       ::
-      $:  %prove-claim
-          name=@t
-          owner=@t
-          fee=@ud
-          tx-hash=@ux
-          claim-block-digest=@ux
-          anchor-headers=(list anchor-header)
-          page-digest=@ux
-          page-tx-ids=(list @ux)
-          anchored-tip=@ux
-          anchored-tip-height=@ud
-          witness-tx-id=@ux
-          witness-spender-pkh=@
-          witness-treasury-amount=@ud
-          witness-output-lock-root=@t    :: v1 output lock root b58 (note_name)
-      ==
       ::  Phase 3c step 3: general-purpose prover primitive. Takes an
       ::  arbitrary `[subject formula]` pair and traces
       ::  `(fink:fock [subject formula])` via `prove-computation:vp`
@@ -364,12 +360,99 @@
           anchored-tip=@ux
           anchored-tip-height=@ud  ::  Phase 7
       ==
+      ::  Y0 recursive-composition spike. Given a previously-emitted
+      ::  STARK (`prev-proof`) bound to `[prev-subject prev-formula]`,
+      ::  build a second [subject formula] pair that runs
+      ::  `verify:vesl-stark-verifier` on those three, then trace it
+      ::  through `prove-computation:vp`. Success = single-artifact
+      ::  recursive rollup is tractable. Trap = Path Y blocked by the
+      ::  same Nock 9/10/11 upstream ask as Phase 3c step 3.
+      ::
+      ::  Emits `[%recursive-step-dry-run-ok product=?]` on dry-run
+      ::  success, followed by either `[%recursive-step-proof product
+      ::  proof]` on prover success or `[%prove-failed trace]` on
+      ::  prover crash. See `y0_recursive_composition_spike` in
+      ::  `tests/prover.rs`.
+      ::
+      [%prove-recursive-step prev-proof-jam=@ prev-subject-jam=@ prev-formula-jam=@]
       ::  nockup:cause
       ::  graft-inject would add `vesl-cause` here on a fresh
       ::  kernel. Already present below; marker is idempotent.
       ::
       vesl-cause
   ==
+::
+::  --- Y0 recursive-composition helpers ---
+::
+::  These build the subject+formula pair that traces
+::  `verify:vesl-stark-verifier(prev-proof, ~, 0, prev-subject, prev-formula)`
+::  under `prove-computation:vp`, using the same subject-bundled-core
+::  encoding `build-validator-trace-inputs:nns-predicates` uses for
+::  Phase 3c step 3. The Y0 spike's only question is whether Vesl's
+::  STARK prover can trace a formula of this shape; a trap here tells
+::  us recursive rollup (Path Y) shares the Phase 3c Nock-9/10/11
+::  blocker and the upstream ask need not be duplicated.
+::
+::  +recursive-verify-arm: local proxy arm that slams `verify:vv`.
+::  We proxy instead of calling `verify:vv` directly from the trace
+::  because `!=(verify:vv)` compiles to
+::
+::      [11 hint [7 <nav-to-vv> [9 <arm> 0 1]]]
+::
+::  — a Nock-7 composition that threads the `vv` subject navigation
+::  before the arm access, which breaks the subject-bundled-core
+::  trick (the `[9 arm 0 3]` slot expects a pure arm access on its
+::  core). Staging the call through a local arm keeps the emitted
+::  Nock shape at `[11 hint [9 <arm> 0 1]]` — the same shape
+::  `validator-arm-axis:nns-predicates` extracts.
+::
+::  The cast `;;(proof:sp prev-proof)` runs at Nock level and the
+::  STARK would have to trace it too; it's cheap and gives us type
+::  safety at the wallet/dry-run boundary.
+::
+++  recursive-verify-arm
+  |=  [prev-proof=* override=(unit (list term)) eny=@ prev-subj=* prev-form=*]
+  ^-  ?
+  =/  prf=proof:sp  ;;(proof:sp prev-proof)
+  (verify:vv prf override eny prev-subj prev-form)
+::
+::  +recursive-verify-arm-axis: compile-time extraction of
+::  `recursive-verify-arm`'s axis inside this core's battery. Same
+::  `!= + strip-%11` idiom as `validator-arm-axis:nns-predicates`.
+::
+++  recursive-verify-arm-axis
+  ^~
+  =/  probe  !=(recursive-verify-arm)
+  =/  inner=*
+    ?.  ?=([%11 * *] probe)  probe
+    +>.probe
+  ?>  ?=([@ @ *] inner)
+  +<.inner
+::
+::  +build-recursive-verify-trace-inputs: produce `[subject formula]`
+::  for `prove-computation:vp` such that `fink:fock [s f]` would slam
+::  `+recursive-verify-arm` on
+::  `[prev-proof ~ 0 prev-subj prev-form]` — i.e. run a full
+::  `verify:vv` inside the STARK.
+::
+::  Subject layout:  `[sample self-core]` where
+::                   `sample = [prev-proof ~ 0 prev-subj prev-form]`
+::                   and `self-core = ..recursive-verify-arm`
+::                   (the enclosing kernel `|%`).
+::  Formula:         `[9 2 10 [6 0 2] 9 <arm-axis> 0 3]`
+::
+::  Same shape as `build-validator-trace-inputs:nns-predicates`,
+::  swapping `validate-claim-bundle-linear` for
+::  `recursive-verify-arm`. When Vesl's prover ships Nock 9/10/11,
+::  this traces cleanly and we've graduated out of Y0.
+::
+++  build-recursive-verify-trace-inputs
+  |=  [prev-proof=* prev-subj=* prev-form=*]
+  ^-  [subject=* formula=*]
+  =/  self-core  ..recursive-verify-arm
+  =/  sample=*  [prev-proof ~ 0 prev-subj prev-form]
+  :-  [sample self-core]
+  [9 2 10 [6 0 2] 9 recursive-verify-arm-axis 0 3]
 ::
 ::  --- domain predicates shared by %claim and nns-gate ---
 ::
@@ -441,128 +524,6 @@
   ?:  (gte slen 5)   32.768.000
   327.680.000
 ::
-::  --- Merkle tree primitives (duplicate-last convention, matches
-::      Rust's nockchain-tip5-rs::MerkleTree) ---
-::
-::  +leaf-chunk: canonical leaf atom for a single registry row.
-::  Jamming the triple is a deterministic encoding: the same
-::  (name, owner, tx-hash) always produces the same atom, and any
-::  drift anywhere in the triple produces a different leaf hash.
-::
-++  leaf-chunk
-  |=  [name=@t e=name-entry]
-  ^-  @
-  (jam [name owner.e tx-hash.e])
-::
-::  +sorted-leaves: all leaf chunks in canonical order.
-::  Sort keys (names) with `aor` so the tree shape is a pure
-::  function of `names` — independent of insertion order, which
-::  is crucial for reproducible Merkle roots across nodes.
-::
-++  sorted-leaves
-  |=  nm=(map @t name-entry)
-  ^-  (list @)
-  =/  keys=(list @t)  (sort ~(tap in ~(key by nm)) aor)
-  %+  turn  keys
-  |=  k=@t
-  (leaf-chunk k (~(got by nm) k))
-::
-::  +next-level: reduce one Merkle level. Odd input: duplicate
-::  the last element so pairing closes cleanly. Matches
-::  nockchain-tip5-rs::MerkleTree::build — do not deviate.
-::
-++  next-level
-  |=  level=(list @)
-  ^-  (list @)
-  ?~  level  ~
-  ?~  t.level
-    ~[(hash-pair i.level i.level)]
-  [(hash-pair i.level i.t.level) $(level t.t.level)]
-::
-::  +compute-root: Merkle root over an already-canonicalized leaf
-::  list. Hashes each chunk with `hash-leaf` at level 0, then
-::  collapses via `next-level` until a single element remains.
-::  Empty registry: root = 0.
-::
-++  compute-root
-  |=  leaves=(list @)
-  ^-  @
-  ?~  leaves  0
-  =/  level  (turn leaves hash-leaf)
-  |-  ^-  @
-  ?:  ?=([@ ~] level)  i.level
-  $(level (next-level level))
-::
-::  +proof-for: Merkle inclusion proof for leaf at index `idx`
-::  (into the sorted leaf list). Side convention mirrors
-::  Rust's MerkleTree::proof:
-::
-::    even idx -> sibling on RIGHT -> side=%.n (false)
-::    odd  idx -> sibling on LEFT  -> side=%.y (true)
-::
-::  When the sibling would run past the level length the current
-::  element duplicates into the sibling slot — same padding
-::  behavior as `next-level` applies during root construction.
-::
-::  +nth: element at index `i` in `lst`. Crashes on out-of-bounds
-::  so we don't silently return a wrong proof node — callers
-::  already range-check.
-::
-++  nth
-  |=  [lst=(list @) i=@ud]
-  ^-  @
-  ?~  lst  ~|('nth: out of bounds' !!)
-  ?:  =(i 0)  i.lst
-  $(lst t.lst, i (dec i))
-::
-++  proof-for
-  |=  [leaves=(list @) idx=@ud]
-  ^-  (list [hash=@ side=?])
-  =/  level=(list @)  (turn leaves hash-leaf)
-  =|  acc=(list [hash=@ side=?])
-  =/  i=@ud  idx
-  |-  ^-  (list [hash=@ side=?])
-  ?:  ?=([@ ~] level)  (flop acc)
-  =/  n=@ud  (lent level)
-  =/  sibling-idx=@ud
-    ?:  =(0 (mod i 2))  +(i)
-    (sub i 1)
-  =/  sib=@
-    ?:  (lth sibling-idx n)  (nth level sibling-idx)
-    (nth level i)
-  =/  side=?  =(1 (mod i 2))
-  %=  $
-    level  (next-level level)
-    i      (div i 2)
-    acc    [[sib side] acc]
-  ==
-::
-::  +index-of: sorted-position of `name` in `names`. Returns
-::  `~` if the name is absent.
-::
-++  index-of
-  |=  [nm=(map @t name-entry) name=@t]
-  ^-  (unit @ud)
-  =/  keys=(list @t)  (sort ~(tap in ~(key by nm)) aor)
-  =|  i=@ud
-  |-  ^-  (unit @ud)
-  ?~  keys  ~
-  ?:  =(name i.keys)  `i
-  $(keys t.keys, i +(i))
-::
-::  +hull-for: hull-id for a given claim-count.
-::
-::    hull(claim-count) = hash-pair(hash-leaf('nns'), hash-leaf(claim-count))
-::
-::  Monotonic `claim-count` guarantees structural uniqueness: we can
-::  never re-register the same hull-id twice, so the graft's
-::  `%vesl-error 'hull already registered'` branch is
-::  unreachable on an honest kernel.
-::
-++  hull-for
-  |=  id=@ud
-  ^-  @
-  (hash-pair (hash-leaf 'nns') (hash-leaf id))
 ::
 ::  +nns-gate: verification gate for %vesl-settle / %vesl-verify.
 ::
@@ -605,106 +566,61 @@
         seen-tx-hashes  (~(put in seen-tx-hashes) tx-hash.i.leaves)
       ==
   ==
---
-|%
-++  moat  (keep versioned-state)
+::
+++  stark-bind
+  |=  state=v0-state
+  ^-  [@ @]
+  :*  (root-atom:na accumulator.state)
+      last-proved-height.state
+  ==
+::
+++  moat  (keep v0-state)
 ::
 ++  inner
-  |_  state=versioned-state
+  |_  state=v0-state
   ::
   ++  load
-    |=  old-state=versioned-state
+    |=  old-state=v0-state
     ^-  _state
     old-state
   ::
-  ::  +peek: registry + graft state
+  ::  +peek: Path Y accumulator + graft state
   ::
-  ::    /owner/<name>      -> (unit name-entry)             {owner, tx-hash, claim-count}
-  ::    /primary/<addr>    -> (unit @t)                     primary name
-  ::    /entries           -> @ud                           total names
-  ::    /claim-count       -> @ud                           current claim-count
-  ::    /last-settled      -> @ud                           last-settled-claim-id
-  ::    /hull              -> @                             current hull-id
-  ::    /root              -> @                             current Merkle root
-  ::    /snapshot          -> [claim-count=@ud hull=@ root=@] all three at once
-  ::    /proof/<name>      -> (unit (list [hash=@ side=?])) proof or ~
-  ::    /pending-batch     -> (list @t)                     names with
-  ::                          entry.claim-count > last-settled-claim-id,
-  ::                          sorted canonically by `aor`
-  ::    /anchor            -> anchored-chain               follower-advanced
-  ::                          chain tip + recent headers
-  ::    [anything else]    -> vesl-peek  (registered / settled / root by hull)
+  ::    /accumulator/<name>  -> (unit nns-accumulator-entry)
+  ::    /accumulator-root    -> @ (lossy atom of Tip5 z-map tip)
+  ::    /accumulator-jam     -> @ (jam of full nns-accumulator noun)
+  ::    /scan-state          -> [height=@ud digest=@ux root=@ size=@ud]
+  ::    /fee-for-name/<n>    -> @ud
+  ::    [anything else]      -> vesl-peek
   ::
   ++  peek
     |=  =path
     ^-  (unit (unit *))
     ?+  path  (vesl-peek vesl.state path)
-        [%owner name=@t ~]
-      =/  key  +<.path
-      ``(~(get by names.state) key)
+        [%accumulator name=@t ~]
+      =/  key=@t  +<.path
+      ``(get:na [accumulator.state key])
         ::
-        [%primary addr=@t ~]
-      =/  key  +<.path
-      ``(~(get by primaries.state) key)
+        [%accumulator-proof name=@t ~]
+      =/  key=@t  +<.path
+      ``(proof-axis:na [accumulator.state key])
         ::
-        [%entries ~]
-      ``~(wyt by names.state)
+        [%accumulator-root ~]
+      ``(root-atom:na accumulator.state)
         ::
-        [%claim-count ~]
-      ``claim-count.state
+        [%accumulator-jam ~]
+      ``(jam accumulator.state)
         ::
-        [%last-settled ~]
-      ``last-settled-claim-id.state
-        ::
-        [%hull ~]
-      ``hull.state
-        ::
-        [%root ~]
-      ``root.state
-        ::
-        [%snapshot ~]
-      ``[claim-count=claim-count.state hull=hull.state root=root.state]
-        ::
-        [%proof name=@t ~]
-      =/  key  +<.path
-      ?~  (~(get by names.state) key)
-        ``~
-      =/  idx  (index-of names.state key)
-      ?~  idx  ``~
-      =/  leaves  (sorted-leaves names.state)
-      ``(proof-for leaves u.idx)
-        ::
-        [%pending-batch ~]
-      =/  keys=(list @t)  (sort ~(tap in ~(key by names.state)) aor)
-      =/  cutoff=@ud  last-settled-claim-id.state
-      =|  out=(list @t)
-      |-  ^-  (unit (unit *))
-      ?~  keys  ``(flop out)
-      =/  e  (~(got by names.state) i.keys)
-      ?:  (gth claim-count.e cutoff)
-        $(keys t.keys, out [i.keys out])
-      $(keys t.keys)
-        ::
-        [%anchor ~]
-      ``anchor.state
-        ::
-        ::  /fee-for-name/<name>  -> @ud
-        ::
-        ::  Phase 3 — shared fee-schedule peek. Identical table to the
-        ::  Rust-side `payment::fee_for_name`; a cross-repo parity
-        ::  test in `tests/phase3_predicates.rs` pins these in lockstep.
-        ::  Exposed as a peek (not just an internal arm) so the gate
-        ::  library and the hull both read from one source of truth.
+        [%scan-state ~]
+      ``[ last-proved-height.state
+            last-proved-digest.state
+            (root-atom:na accumulator.state)
+            (size:na accumulator.state)
+        ]
         ::
         [%fee-for-name name=@t ~]
       =/  key=@t  +<.path
       ``(fee-for-name:np key)
-        ::
-        ::  nockup:peek
-        ::  graft-inject would wire `(vesl-peek vesl.state path)` as
-        ::  the `?+` default arm here on a fresh kernel. Already
-        ::  wired above (the `?+  path  (vesl-peek vesl.state path)`
-        ::  head); marker is idempotent.
         ::
     ==
   ::
@@ -717,74 +633,30 @@
       [~ state]
     ?-  -.u.act
         ::
-        ::  %claim: the hot path. Enforces C1..C4; writes
-        ::  `names` and `tx-hashes`; bumps `claim-count` and
-        ::  auto-registers a fresh hull in the graft.
+        ::  Path Y2: %scan-block — parent link + height monotonicity,
+        ::  then `+claim-scanner:np` over the supplied candidates.
         ::
-        %claim
+        %scan-block
       =/  c  u.act
-      ::  C1/C2 — format and fee: an honest hull never violates
-      ::  these. If it does we crash (unprovable computation)
-      ::  rather than silently accepting bad data.
-      ?>  (is-valid-name name.c)
-      ?>  (gte fee.c (fee-for name.c))
-      ::  C3 — name uniqueness: a user-visible error; emit and
-      ::  leave state untouched.
-      ?:  (~(has by names.state) name.c)
+      =/  boot=?
+        &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
+      ?.  ?|(boot =(parent.c last-proved-digest.state))
         :_  state
-        ~[[%claim-error 'name already registered']]
-      ::  C4 — payment uniqueness: one tx-hash, one registration.
-      ?:  (~(has in tx-hashes.state) tx-hash.c)
+        ~[[%scan-block-error 'parent-mismatch']]
+      ?.  =(height.c +(last-proved-height.state))
         :_  state
-        ~[[%claim-error 'payment already used']]
-      ::  Commit the new row. Each entry records the claim-count at
-      ::  which it was added so %settle-batch can select "everything
-      ::  since the last successful settle" without an auxiliary
-      ::  index.
-      =/  new-claim-count=@ud  +(claim-count.state)
-      =/  entry=name-entry  [owner.c tx-hash.c new-claim-count]
-      =.  names.state      (~(put by names.state) name.c entry)
-      =.  tx-hashes.state  (~(put in tx-hashes.state) tx-hash.c)
-      ::  Compute the fresh snapshot: Merkle root over the updated
-      ::  `names`, hull-id derived from the new claim-count.
-      =/  leaves=(list @)  (sorted-leaves names.state)
-      =/  new-root=@       (compute-root leaves)
-      =/  new-hull=@       (hull-for new-claim-count)
-      ::  Register the fresh hull in the graft. Because `new-hull`
-      ::  is a pure function of a strictly-monotonic `new-claim-count`,
-      ::  it is structurally impossible for it to collide with a
-      ::  previously-registered hull — if the graft ever returned
-      ::  a %vesl-error here our claim-count bookkeeping is broken and
-      ::  we crash rather than emit %claimed with an untracked
-      ::  commitment.
-      =^  reg-efx=(list vesl-effect)  vesl.state
-        (vesl-poke vesl.state [%vesl-register new-hull new-root] nns-gate)
-      ?>  ?=(^ reg-efx)
-      ?>  ?=(%vesl-registered -.i.reg-efx)
-      =.  claim-count.state  new-claim-count
-      =.  root.state   new-root
-      =.  hull.state   new-hull
-      ::  Auto-assign primary on first claim for this owner.
-      =/  first-claim=?  !(~(has by primaries.state) owner.c)
-      =?  primaries.state  first-claim
-        (~(put by primaries.state) owner.c name.c)
-      =/  primary-efx=(list effect)
-        ?:  first-claim
-          ~[[%primary-set owner.c name.c]]
-        ~
+        ~[[%scan-block-error 'height-not-successor']]
+      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
+      =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+      =/  new-acc=nns-accumulator:na
+        (claim-scanner:np accumulator.state pag height.c candidates.c)
+      =/  acc-root=@  (root-atom:na new-acc)
+      =.  accumulator.state  new-acc
+      =.  last-proved-height.state  height.c
+      =.  last-proved-digest.state  digest.pag
       :_  state
-      ;:  weld
-        `(list effect)`~[[%claimed name.c owner.c tx-hash.c]]
-        primary-efx
-        `(list effect)`~[[%claim-count-bumped new-claim-count new-hull new-root]]
-        `(list effect)`reg-efx
-      ==
+      ~[[%scan-block-done height.c digest.pag acc-root]]
       ::
-        ::  %set-primary: owner-gated reverse-lookup update.
-        ::  Enforces P1/P2; writes `primaries`. Does NOT bump
-        ::  `claim-count` — `primaries` is not part of the committed
-        ::  Merkle tree.
-        ::
         ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
         ::  [%prove-identity-result ok=?] so the test can confirm the
         ::  prover/verifier round-trip works at all.
@@ -826,7 +698,7 @@
       =/  proof=proof:four  ;;(proof:four +.cue-res)
       ::  Replay the exact [s f] the prover traced. vesl-stark-verifier
       ::  takes them externally (bypasses puzzle-nock). We cache them
-      ::  in last-proved on every successful %prove-batch.
+      ::  in last-proved on every successful prove poke.
       ::
       ?~  last-proved.state
         :_  state
@@ -837,82 +709,58 @@
       :_  state
       ~[[%verify-stark-result ok]]
       ::
-        ::  %advance-tip: follower-advanced anchor update.
-        ::
-        ::  `headers` is an oldest-first list of anchor-header triples
-        ::  that extend the current tip. Kernel enforces:
-        ::
-        ::    A1. Every header's parent pointer equals the previous
-        ::        header's digest (or the pre-existing tip-digest for
-        ::        the first header; or 0 when bootstrapping from an
-        ::        uninitialised state).
-        ::    A2. Heights are strictly increasing by 1. First header's
-        ::        height must be tip-height+1 (or equal to the sole
-        ::        header's height on bootstrap).
-        ::
-        ::  Violations emit [%anchor-error <msg>] without mutating
-        ::  state. Empty `headers` is a no-op.
-        ::
-        ::  We validate the chain but DO NOT cache intermediate
-        ::  headers. The kernel only remembers `(tip-digest, tip-height)`;
-        ::  per-claim chain linkage is supplied by the claim-note bundle
-        ::  and proved by the gate (see design note on `+$anchored-chain`).
-        ::
-        %advance-tip
-      =/  hs=(list anchor-header)  headers.u.act
-      ?~  hs
+        %verify-stark-explicit
+      ?.  ?=(@ blob.u.act)
         :_  state
-        ~[[%anchor-error 'empty advance']]
-      ::  Validate chain linkage against current tip (or bootstrap).
-      ::
-      ::  Phase 2c bootstrap: when `tip-digest` is `0x0` (fresh
-      ::  kernel, never advanced) the follower MAY seed the anchor
-      ::  with any single header at any height. We accept whatever
-      ::  `parent` and `height` it claims without cross-checking
-      ::  against prior state (there isn't any).
-      ::
-      ::  Trust model: the follower is operator-trusted for the
-      ::  bootstrap seed; wallets later verify `t_nns_digest` +
-      ::  `t_nns_height` in the proof bundle against their own
-      ::  canonical-chain view (Phase 7). If an operator seeds a
-      ::  bogus anchor, wallets detect it via anchor-binding check.
-      ::
-      =/  bootstrapping=?  =(0x0 tip-digest.anchor.state)
-      ::  Bootstrap bypass: when true, accept the first header's
-      ::  parent and height as-is (no cross-check against prior
-      ::  state — there isn't any). Tail-chain walk below still
-      ::  enforces parent-linkage from hs[0] through hs[n-1].
-      ::
-      ?.  ?|  bootstrapping
-              =(parent.i.hs tip-digest.anchor.state)
-          ==
+        ~[[%verify-stark-error 'blob-not-atom']]
+      ?.  ?=(@ subject-jam.u.act)
         :_  state
-        ~[[%anchor-error 'first header parent mismatch']]
-      ?.  ?|  bootstrapping
-              =(height.i.hs +(tip-height.anchor.state))
-          ==
+        ~[[%verify-stark-error 'subject-jam-not-atom']]
+      ?.  ?=(@ formula-jam.u.act)
         :_  state
-        ~[[%anchor-error 'first header height off-by-one']]
-      ::  Walk the rest and find the last header in a single fold.
-      ::  Fails on any parent/height break.
-      ::
-      =/  walk=(unit anchor-header)
-        =/  prev=anchor-header  i.hs
-        =/  rest=(list anchor-header)  t.hs
-        |-  ^-  (unit anchor-header)
-        ?~  rest  `prev
-        ?.  =(parent.i.rest digest.prev)  ~
-        ?.  =(height.i.rest +(height.prev))  ~
-        $(rest t.rest, prev i.rest)
-      ?~  walk
+        ~[[%verify-stark-error 'formula-jam-not-atom']]
+      =/  jammy=@  blob.u.act
+      =/  cue-res  (mule |.((cue jammy)))
+      ?.  -.cue-res
         :_  state
-        ~[[%anchor-error 'header chain mismatch']]
-      =/  tip=anchor-header  u.walk
-      =.  tip-digest.anchor.state  digest.tip
-      =.  tip-height.anchor.state  height.tip
+        ~[[%verify-stark-error 'bad-jam']]
+      =/  proof=proof:four  ;;(proof:four +.cue-res)
+      =/  subject-cue  (mule |.((cue subject-jam.u.act)))
+      ?.  -.subject-cue
+        :_  state
+        ~[[%verify-stark-error 'bad-subject-jam']]
+      =/  formula-cue  (mule |.((cue formula-jam.u.act)))
+      ?.  -.formula-cue
+        :_  state
+        ~[[%verify-stark-error 'bad-formula-jam']]
+      =/  subject=*  p.subject-cue
+      =/  formula=*  p.formula-cue
+      =/  ok=?  (verify:vv proof ~ 0 subject formula)
       :_  state
-      ^-  (list effect)
-      ~[[%anchor-advanced digest.tip height.tip (lent hs)]]
+      ~[[%verify-stark-result ok]]
+      ::
+        %verify-accumulator-snapshot
+      ::  expected-root / acc-jam are already `@` on the $cause mold; do not
+      ::  test `?=(@ ...)` here — mint-vain (dead branch) under current Hoon.
+      ::
+      =/  acc-cue  (mule |.((cue acc-jam.u.act)))
+      ?.  -.acc-cue
+        :_  state
+        ~[[%accumulator-snapshot-verify-error 'bad-acc-jam']]
+      =/  acc=nns-accumulator:na  ;;(nns-accumulator:na +.acc-cue)
+      ?.  =((root-atom:na acc) expected-root.u.act)
+        :_  state
+        ~[[%accumulator-snapshot-verify-result %.n]]
+      =/  entry=nns-accumulator-entry:na
+        :*  owner=owner.u.act
+            tx-hash=tx-hash.u.act
+            claim-height=claim-height.u.act
+            block-digest=block-digest.u.act
+        ==
+      =/  got=(unit nns-accumulator-entry:na)  (get:na [acc name.u.act])
+      =/  ok=?  =(got [~ entry])
+      :_  state
+      ~[[%accumulator-snapshot-verify-result ok]]
       ::
         ::  %verify-chain-link: read-only Phase 3 Level A predicate
         ::  smoke test. Returns `[%chain-link-result ok=?]` without
@@ -984,108 +832,10 @@
         ~[[%validate-claim-error p.res]]
       ==
       ::
-        ::  %prove-claim: validator + STARK in one poke. Reject before
-        ::  proving if any predicate fails; only emit a proof for a
-        ::  bundle the gate accepts. The proof commits to the
-        ::  bundle's belt-digest under the kernel's current
-        ::  (root, hull) registry snapshot — a wallet re-runs the
-        ::  validator locally against the received bundle and checks
-        ::  the hash matches.
-        ::
-        %prove-claim
-      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
-      =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
-      =/  wit=nns-raw-tx-witness:np
-        :*  witness-tx-id.u.act
-            witness-spender-pkh.u.act
-            witness-treasury-amount.u.act
-            witness-output-lock-root.u.act
-        ==
-      =/  bundle=claim-bundle:np
-        :*  name.u.act
-            owner.u.act
-            fee.u.act
-            tx-hash.u.act
-            claim-block-digest.u.act
-            anchor-headers.u.act
-            pag
-            anchored-tip.u.act
-            anchored-tip-height.u.act
-            wit
-        ==
-      ::  Phase 7: bind the proof to the kernel's *current* anchor.
-      ::  The bundle carries the anchor the hull believes the kernel
-      ::  is on; if the hull is stale the proof MUST refuse rather
-      ::  than produce a stale attestation. This is what lets wallets
-      ::  enforce freshness on the proof-time tip height later.
-      ::
-      ?.  %-  matches-current-anchor:np
-          :*  anchored-tip.u.act
-              anchored-tip-height.u.act
-              tip-digest.anchor.state
-              tip-height.anchor.state
-          ==
-        :_  state
-        ^-  (list effect)
-        ~[[%validate-claim-error %anchor-mismatch]]
-      ::  Level C-A: witness must name the canonical NNS treasury lock
-      ::  root (v1 `note_name_b58`), not an arbitrary string.
-      ::
-      ?.  (matches-treasury:np wit)
-        :_  state
-        ^-  (list effect)
-        ~[[%validate-claim-error %witness-wrong-treasury]]
-      =/  v-res=(each ~ validation-error:np)
-        (validate-claim-bundle:np bundle)
-      ?.  ?=(%& -.v-res)
-        :_  state
-        ^-  (list effect)
-        ~[[%validate-claim-error p.v-res]]
-      ::  Bundle passed validation. Compute the commitment we'll
-      ::  embed in the STARK: belt-digest over `(jam bundle)`, same
-      ::  shape as %prove-batch's belt-digest so the Rust side can
-      ::  reuse its decoder.
-      ::
-      =/  bundle-bytes=@  (jam bundle)
-      =/  bundle-digest=@
-        =/  belts=(list @)  (split-to-belts bundle-bytes)
-        =/  p=@  (add (sub (bex 64) (bex 32)) 1)
-        %+  roll  belts
-        |=  [a=@ b=@]
-        (mod (add a b) p)
-      ::  Deterministic Nock formula — 64 nested [4 f] increments,
-      ::  identical to %prove-batch. Keeps trace length bounded and
-      ::  lets us reuse the vesl-prover path unchanged.
-      ::
-      =/  fs-formula=*
-        =/  f=*  [0 1]
-        =|  i=@
-        |-
-        ?:  =(i 64)  f
-        $(f [4 f], i +(i))
-      =/  proof-attempt
-        %-  mule  |.
-        (prove-computation:vp bundle-digest fs-formula root.state hull.state)
-      ?.  ?=(%& -.proof-attempt)
-        :_  state
-        ^-  (list effect)
-        ~[[%prove-failed (jam p.proof-attempt)]]
-      =/  pr  p.proof-attempt
-      ?.  ?=(%& -.pr)
-        :_  state
-        ^-  (list effect)
-        ~[[%prove-failed (jam p.pr)]]
-      =/  the-proof=proof:sp  p.pr
-      ::  Cache for later verification via %verify-stark (Phase 1-redo).
-      ::
-      =.  last-proved.state  `[bundle-digest fs-formula]
-      :_  state
-      ^-  (list effect)
-      ~[[%claim-proof bundle-digest the-proof]]
-      ::
         ::  %prove-arbitrary: trace an arbitrary [subject formula] via
         ::  `prove-computation:vp` and emit a proof bound to
-        ::  `(root, hull)`. No validation — caller is responsible for
+        ::  `+stark-bind` (accumulator root + scan height). No validation
+        ::  — caller is responsible for
         ::  constructing the pair.
         ::
         ::  Emits `[%arbitrary-proof product proof]` on prover
@@ -1108,9 +858,10 @@
         ~[[%prove-failed (jam p.formula-cue)]]
       =/  subj=*  p.subject-cue
       =/  form=*  p.formula-cue
+      =/  [br=@ bh=@]  (stark-bind state)
       =/  attempt
         %-  mule  |.
-        (prove-computation:vp subj form root.state hull.state)
+        (prove-computation:vp subj form br bh)
       ?.  ?=(%& -.attempt)
         :_  state
         ^-  (list effect)
@@ -1170,9 +921,10 @@
         :_  state
         ^-  (list effect)
         ~[[%prove-failed (jam p.dry-run)]]
+      =/  [br2=@ bh2=@]  (stark-bind state)
       =/  attempt
         %-  mule  |.
-        (prove-computation:vp subj form root.state hull.state)
+        (prove-computation:vp subj form br2 bh2)
       ?.  ?=(%& -.attempt)
         :_  state
         ^-  (list effect)
@@ -1189,179 +941,86 @@
       ^-  (list effect)
       ~[[%claim-in-stark-proof product the-proof]]
       ::
-        %set-primary
-      =/  c  u.act
-      =/  existing  (~(get by names.state) name.c)
-      ::  P1 — name must exist.
-      ?~  existing
-        :_  state
-        ~[[%primary-error 'name not registered']]
-      ::  P2 — caller must own the name.
-      ?.  =(owner.u.existing address.c)
-        :_  state
-        ~[[%primary-error 'not the owner']]
-      =.  primaries.state  (~(put by primaries.state) address.c name.c)
-      :_  state
-      ~[[%primary-set address.c name.c]]
-      ::
-        ::  %settle-batch: bundle every name claimed since the last
-        ::  successful settle into a single %vesl-settle poke. One
-        ::  batch = one graft note = one note-id. Replay protection is
-        ::  at the batch level: the exact same leaf set can't be
-        ::  resettled, but the individual names can still be settled
-        ::  as part of a future batch that contains different content.
-        ::  Empty batches emit %batch-error instead of wasting a poke.
+        ::  %prove-recursive-step: Y0 recursive-composition spike.
         ::
-        %settle-batch
-      =/  cutoff=@ud  last-settled-claim-id.state
-      =/  all-keys=(list @t)
-        (sort ~(tap in ~(key by names.state)) aor)
-      =/  leaves=(list @)  (sorted-leaves names.state)
-      =/  batch=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        =|  acc=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        =|  i=@ud
-        =/  ks=(list @t)  all-keys
-        |-  ^-  (list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        ?~  ks  (flop acc)
-        =/  e  (~(got by names.state) i.ks)
-      ?:  (gth claim-count.e cutoff)
-          =/  pf  (proof-for leaves i)
-          $(ks t.ks, i +(i), acc [[i.ks owner.e tx-hash.e pf] acc])
-        $(ks t.ks, i +(i))
-      ?~  batch
+        ::  1. Cue the three JAM atoms (prev-proof, prev-subject,
+        ::     prev-formula). A bad JAM emits %prove-failed with the
+        ::     mule trace and does not run the prover.
+        ::  2. Build `[subject formula]` via
+        ::     `+build-recursive-verify-trace-inputs` — the formula
+        ::     slams `verify:vv` on `(prev-proof, ~, 0, prev-subject,
+        ::     prev-formula)`.
+        ::  3. Dry-run via raw `.*(subj form)`. The raw nockvm supports
+        ::     the full opcode set; we expect this to produce a loobean
+        ::     (ideally `%.y` — a genuinely recursive verify of a
+        ::     correctly-generated inner proof). A dry-run crash means
+        ::     the encoding itself is broken (surface a `%prove-failed`
+        ::     before paying for the prover).
+        ::  4. Emit `[%recursive-step-dry-run-ok product=?]` so the
+        ::     test can assert step (3) independently of step (5).
+        ::  5. Call `prove-computation:vp`. Expected outcome for now:
+        ::     mule-trap inside `common/ztd/eight.hoon::interpret`
+        ::     because `verify:vv`'s body uses Nock-9/10/11 opcodes
+        ::     that Vesl's STARK compute table does not yet model.
+        ::     We emit `%prove-failed` with the captured trace; the
+        ::     Y0 blocker-signal test asserts that shape.
+        ::  6. If the prover unexpectedly succeeds (e.g. Vesl has
+        ::     shipped opcode 9/10/11 support), emit
+        ::     `[%recursive-step-proof product the-proof]` and cache
+        ::     `(subject, formula)` in `last-proved` so a follow-up
+        ::     `%verify-stark` poke can round-trip.
+        ::
+        %prove-recursive-step
+      =/  prev-proof-cue  (mule |.((cue prev-proof-jam.u.act)))
+      ?.  ?=(%& -.prev-proof-cue)
         :_  state
-        ~[[%batch-error 'nothing to settle']]
-      ::  Deterministic batch id over the sorted batch contents. The
-      ::  graft's `settled` set dedupes on this, so two callers racing
-      ::  the same pending window can only produce one settled note.
-      =/  note-id=@  (hash-leaf (jam batch))
-      =/  jammed=@
-        %-  jam
-        :*  [note-id hull.state root.state [%pending ~]]
-            batch
-            root.state
-        ==
-      =^  efx=(list vesl-effect)  vesl.state
-        (vesl-poke vesl.state [%vesl-settle jammed] nns-gate)
-      ?>  ?=(^ efx)
-      ?:  ?=(%vesl-settled -.i.efx)
-        ::  Invariant: every %claim increments claim-count.state and
-        ::  writes entry.claim-count = new claim-count, `names` is
-        ::  append-only, and the batch is non-empty here — so the
-        ::  highest entry.claim-count in the batch equals claim-count.state.
-        =/  settled-at=@ud  claim-count.state
-        =/  count=@ud  (lent batch)
-        =.  last-settled-claim-id.state  settled-at
+        ~[[%prove-failed (jam p.prev-proof-cue)]]
+      =/  prev-subject-cue  (mule |.((cue prev-subject-jam.u.act)))
+      ?.  ?=(%& -.prev-subject-cue)
+        :_  state
+        ~[[%prove-failed (jam p.prev-subject-cue)]]
+      =/  prev-formula-cue  (mule |.((cue prev-formula-jam.u.act)))
+      ?.  ?=(%& -.prev-formula-cue)
+        :_  state
+        ~[[%prove-failed (jam p.prev-formula-cue)]]
+      =/  prev-proof=*  p.prev-proof-cue
+      =/  prev-subj=*   p.prev-subject-cue
+      =/  prev-form=*   p.prev-formula-cue
+      =/  [subj=* form=*]
+        (build-recursive-verify-trace-inputs prev-proof prev-subj prev-form)
+      =/  dry-run
+        %-  mule  |.  .*(subj form)
+      ?.  ?=(%& -.dry-run)
         :_  state
         ^-  (list effect)
-        ;:  weld
-          `(list effect)`~[[%batch-settled settled-at count note-id]]
-          `(list effect)`efx
-        ==
-      ::  %vesl-error — pass through unchanged; state not mutated.
-      :_  state
-      ^-  (list effect)
-      efx
-      ::
-        ::  %prove-batch: same shape as %settle-batch, but additionally
-        ::  runs the STARK prover over the batch content. Emits a
-        ::  [%batch-proof note-id proof] effect carrying the proof noun
-        ::  on success, or [%prove-failed trace] on crash (proving
-        ::  fails closed: settlement is not applied in that case).
-        ::
-        ::  Baseline implementation for Phase 0 — it produces a real
-        ::  STARK over a canonical Nock computation derived from the
-        ::  batch content. The computation itself is the forge-template
-        ::  "64 nested Nock-4 increments over belt-digest" pattern; it
-        ::  does NOT yet re-run the gate's C1-C4 predicates inside the
-        ::  STARK (that is Phase 3 of the payment plan). Phase 0's
-        ::  goal is to have a real STARK artifact flowing end-to-end.
-        ::
-        %prove-batch
-      =/  cutoff=@ud  last-settled-claim-id.state
-      =/  all-keys=(list @t)
-        (sort ~(tap in ~(key by names.state)) aor)
-      =/  leaves=(list @)  (sorted-leaves names.state)
-      =/  batch=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        =|  acc=(list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        =|  i=@ud
-        =/  ks=(list @t)  all-keys
-        |-  ^-  (list [name=@t owner=@t tx-hash=@t proof=(list [hash=@ side=?])])
-        ?~  ks  (flop acc)
-        =/  e  (~(got by names.state) i.ks)
-      ?:  (gth claim-count.e cutoff)
-          =/  pf  (proof-for leaves i)
-          $(ks t.ks, i +(i), acc [[i.ks owner.e tx-hash.e pf] acc])
-        $(ks t.ks, i +(i))
-      ?~  batch
-        :_  state
-        ~[[%batch-error 'nothing to prove']]
-      =/  note-id=@  (hash-leaf (jam batch))
-      ::  Fold every byte of the jammed batch into a single
-      ::  Goldilocks-field belt-digest. This is the subject of the
-      ::  STARK computation.
-      ::
-      =/  batch-bytes=@  (jam batch)
-      =/  belt-digest=@
-        =/  belts=(list @)  (split-to-belts batch-bytes)
-        =/  p=@  (add (sub (bex 64) (bex 32)) 1)
-        %+  roll  belts
-        |=  [a=@ b=@]
-        (mod (add a b) p)
-      ::  Deterministic Nock formula: 64 nested [4 f] increments.
-      ::
-      =/  fs-formula=*
-        =/  f=*  [0 1]
-        =|  i=@
-        |-
-        ?:  =(i 64)  f
-        $(f [4 f], i +(i))
-      =/  proof-attempt
+        ~[[%prove-failed (jam p.dry-run)]]
+      =/  dry-product=*  p.dry-run
+      =/  dry-ok=?  ?=(%.y dry-product)
+      =/  [br3=@ bh3=@]  (stark-bind state)
+      =/  attempt
         %-  mule  |.
-        (prove-computation:vp belt-digest fs-formula root.state hull.state)
-      ?.  ?=(%& -.proof-attempt)
-        ::  Prover crashed — settlement NOT applied.
+        (prove-computation:vp subj form br3 bh3)
+      ?.  ?=(%& -.attempt)
         :_  state
         ^-  (list effect)
-        ~[[%prove-failed (jam p.proof-attempt)]]
-      ::  The outer mule succeeded, but prove-computation itself can
-      ::  return `[%| err]` (e.g. %too-big heights). Unwrap both layers
-      ::  and require the inner `%&` success to emit a usable proof.
-      ::
-      =/  pr  p.proof-attempt
+        :~  [%recursive-step-dry-run-ok dry-ok]
+            [%prove-failed (jam p.attempt)]
+        ==
+      =/  pr  p.attempt
       ?.  ?=(%& -.pr)
         :_  state
         ^-  (list effect)
-        ~[[%prove-failed (jam p.pr)]]
+        :~  [%recursive-step-dry-run-ok dry-ok]
+            [%prove-failed (jam p.pr)]
+        ==
       =/  the-proof=proof:sp  p.pr
-      ::  Proof generated. Still fire the regular %vesl-settle so the
-      ::  graft's `settled` map advances; package both the settlement
-      ::  effect and the proof.
-      ::
-      =/  jammed=@
-        %-  jam
-        :*  [note-id hull.state root.state [%pending ~]]
-            batch
-            root.state
-        ==
-      =^  efx=(list vesl-effect)  vesl.state
-        (vesl-poke vesl.state [%vesl-settle jammed] nns-gate)
-      ?>  ?=(^ efx)
-      ?:  ?=(%vesl-settled -.i.efx)
-        =/  settled-at=@ud  claim-count.state
-        =/  count=@ud  (lent batch)
-        =.  last-settled-claim-id.state  settled-at
-        =.  last-proved.state  `[belt-digest fs-formula]
-        :_  state
-        ^-  (list effect)
-        ;:  weld
-          `(list effect)`~[[%batch-settled settled-at count note-id]]
-          `(list effect)`~[[%batch-proof note-id the-proof]]
-          `(list effect)`efx
-        ==
+      =/  product=*  .*(subj form)
+      =.  last-proved.state  `[subj form]
       :_  state
       ^-  (list effect)
-      efx
+      :~  [%recursive-step-dry-run-ok dry-ok]
+          [%recursive-step-proof product the-proof]
+      ==
       ::
         ::  vesl-cause tags — delegate to the graft with nns-gate.
         ::  %vesl-register is normally driven by %claim above; a

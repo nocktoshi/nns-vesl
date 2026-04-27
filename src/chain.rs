@@ -12,6 +12,7 @@ use nockapp_grpc::pb::public::v2::{
     GetTransactionDetailsRequest, TransactionDetails,
 };
 use nockchain_client_rs::{ChainClient, ChainConfig};
+use nockchain_types::tx_engine::common::Hash as DomainHash;
 
 /// Best-effort chain acceptance check for a base58 tx id.
 pub async fn transaction_is_accepted(
@@ -221,6 +222,27 @@ pub fn atom_bytes_to_hash(bytes: &[u8]) -> Option<Hash> {
     })
 }
 
+/// Decode a Nockchain base58 Tip5 hash into the 40-byte LE-packed atom
+/// representation used by the Hoon kernel.
+pub fn base58_hash_to_atom_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let hash = DomainHash::from_base58(value)
+        .map_err(|e| format!("invalid base58 Tip5 hash {value:?}: {e}"))?;
+    let mut out = Vec::with_capacity(40);
+    for limb in hash.to_array() {
+        out.extend_from_slice(&limb.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Convert the public block proto's base58 tx-id list into kernel atoms.
+pub fn tx_ids_from_block_details(details: &BlockDetails) -> Result<Vec<Vec<u8>>, String> {
+    details
+        .tx_ids
+        .iter()
+        .map(|h| base58_hash_to_atom_bytes(&h.hash))
+        .collect()
+}
+
 /// Connect a `NockchainBlockServiceClient` against `endpoint`.
 async fn connect_block_service(
     endpoint: &str,
@@ -328,6 +350,18 @@ pub async fn fetch_transaction_details(
             "empty transaction details response for {tx_id_base58}"
         )),
     }
+}
+
+/// Fetch transaction details for every tx-id listed in a block.
+pub async fn fetch_block_transaction_details(
+    endpoint: &str,
+    block: &BlockDetails,
+) -> Result<Vec<TransactionDetails>, String> {
+    let mut out = Vec::with_capacity(block.tx_ids.len());
+    for tx_id in &block.tx_ids {
+        out.push(fetch_transaction_details(endpoint, &tx_id.hash).await?);
+    }
+    Ok(out)
 }
 
 /// Composite fetch: given a confirmed tx id, return its containing

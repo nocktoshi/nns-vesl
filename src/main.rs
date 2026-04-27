@@ -148,7 +148,6 @@ struct Raw {
     tx_fee: Option<u64>,
     coinbase_timelock_min: Option<u64>,
     accept_timeout_secs: Option<u64>,
-    payment_address: Option<String>,
 }
 
 fn load_toml(path: &std::path::Path) -> vesl_core::SettlementToml {

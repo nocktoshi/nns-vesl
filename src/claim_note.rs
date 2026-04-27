@@ -1,3 +1,6 @@
+//! NNS claim note encoding for **NoteData on v1 outputs** (Path Y scanner).
+//! Wallet / CLI support is limited today — see `docs/claim-note-wallet-support.md`
+//! and <https://github.com/nockchain/nockchain/pull/85>.
 use nock_noun_rs::{cue_from_bytes, jam_to_bytes, make_cord, new_stack, T};
 use nockchain_client_rs::{
     find_opaque_bytes_entry, jam_opaque_bytes_entry, jam_u64_entry, NoteData,

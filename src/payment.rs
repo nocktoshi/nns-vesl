@@ -93,14 +93,14 @@ pub enum PaymentError {
     Rpc(String),
 }
 
-fn output_amount_nicks(out: &TransactionOutput) -> Option<u64> {
+pub(crate) fn output_amount_nicks(out: &TransactionOutput) -> Option<u64> {
     match &out.amount_required {
         Some(AmountRequired::Amount(n)) => Some(n.value),
         _ => None,
     }
 }
 
-fn sum_treasury_outputs_v1(details: &TransactionDetails) -> u64 {
+pub(crate) fn sum_treasury_outputs_v1(details: &TransactionDetails) -> u64 {
     details
         .outputs
         .iter()

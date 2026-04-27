@@ -35,5 +35,6 @@ pub mod kernel;
 pub mod payment;
 pub mod state;
 pub mod types;
+pub mod wallet_y4;
 
 pub use state::{AppState, SharedState};

@@ -254,6 +254,33 @@ pub struct ProofAnchor {
     pub tip_height: u64,
 }
 
+/// `GET /accumulator/:name` Path Y lookup response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccumulatorLookupResponse {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<AccumulatorValueResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_axis: Option<String>,
+    /// Present when `?wallet_export=1` — hex-encoded `jam(accumulator)` for offline
+    /// `light_verify` (`accumulator_snapshot_jam_hex`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accumulator_snapshot_hex: Option<String>,
+    pub last_proved_height: u64,
+    pub last_proved_digest: String,
+    pub accumulator_root: String,
+    pub accumulator_size: u64,
+}
+
+/// One Path Y accumulator value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccumulatorValueResponse {
+    pub owner: String,
+    pub tx_hash: String,
+    pub claim_height: u64,
+    pub block_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionProofMetadata {
     pub mode: String,

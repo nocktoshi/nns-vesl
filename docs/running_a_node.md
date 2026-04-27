@@ -117,10 +117,23 @@ installed at process start (see `src/main.rs`), which avoids the
 "Could not automatically determine the process-level CryptoProvider"
 panic that rustls 0.23 throws when multiple backends are visible.
 
-With these lines the follower's two loops start doing work —
-anchor advance every 10 s, claim replay every 2 s. Check
-`curl -s localhost:3000/status | jq .follower` after ~30 s to
-confirm `chain_tip_height` is populated.
+With these lines the follower starts scanning blocks into the kernel
+(`%scan-block`). Check `curl -s localhost:3000/status | jq .follower`
+after ~30 s to confirm `chain_tip_height` is populated.
+
+### Nockchain checkout: NoteData on outputs + wallet tooling
+
+Path Y **requires** block/tx RPC responses that include **`note_data` on
+each v1 output**; otherwise the scanner never sees `nns/v1/claim` notes.
+
+- See **[`docs/nockchain-fork-for-nns.md`](nockchain-fork-for-nns.md)** for
+  the **`../nockchain`** contract (note_data on outputs, wallet path).
+- **Wallet limitation:** most wallets do not yet expose arbitrary
+  multi-entry NoteData when building transactions — see
+  **[`docs/claim-note-wallet-support.md`](claim-note-wallet-support.md)**.
+- Upstream wallet CLI work: **[nockchain#85 — `create-tx --memo-data`](https://github.com/nockchain/nockchain/pull/85)**  
+  (in review; may evolve toward recipient-level memo per maintainer feedback).
+- **First-time Path Y validation:** use **[`docs/path-y-integration-test-plan.md`](path-y-integration-test-plan.md)** (manual phases + finality / negative cases).
 
 ## 4. Run
 
@@ -196,7 +209,7 @@ curl -s http://127.0.0.1:3000/status | jq
     "last_error_phase":            null,
     "last_error_at_epoch_ms":      null,
     "finality_depth":              10,
-    "max_advance_batch":           64
+    "max_advance_batch":           1
   }
 }
 ```
@@ -207,25 +220,10 @@ Interpret:
 - `**is_caught_up: false` and growing `anchor_lag_blocks**` → follower
 falling behind. Check chain endpoint health, inspect `last_error`.
 - `**last_advance_age_seconds` > 60** → follower hasn't moved in a
-minute even though the anchor tick runs every 10 s. Probably stuck
-on a Nockchain RPC or the kernel is rejecting advances.
+minute even though the scan tick runs every 2 s. Probably stuck
+on a Nockchain RPC or the kernel is rejecting scans.
 - `**chain_tip_height: null`** → follower has never reached the chain.
 Check `settlement_mode` and `chain_endpoint`.
-
-### `/anchor` — just the anchor surface
-
-```bash
-curl -s http://127.0.0.1:3000/anchor | jq
-```
-
-Same shape as `/status.follower` + `/status.anchor` merged. 503 when
-the node has no kernel anchor peek AND no follower observations
-(completely blind).
-
-```bash
-# Is my node caught up?
-curl -s http://127.0.0.1:3000/anchor | jq .is_caught_up
-```
 
 ### `/health` — cheap liveness probe
 
@@ -248,14 +246,12 @@ RUST_LOG=info,nns_vesl::chain_follower=trace,nns_vesl::chain=debug nns
 Structured fields the follower emits:
 
 ```
-INFO phase=anchor_advance tip_height=120 count=5 chain follower advanced anchor
-WARN phase=anchor_tick err="header chain fetch failed [111..120]: gRPC unreachable" chain follower anchor tick failed
-WARN phase=claim_tick err="chain position lookup failed: ..." chain follower claim tick failed
-TRACE phase=anchor_advance anchor tick no-op
+INFO phase=scan_block height=120 chain follower scanned block
+WARN phase=scan_block err="block details query failed at height 120: ..." chain follower scan tick failed
+TRACE phase=scan_block scan tick no-op
 ```
 
-Grep-friendly — `rg 'phase=anchor_tick.*WARN'` catches anchor-loop
-failures without matching claim-loop noise.
+Grep-friendly — `rg 'phase=scan_block.*WARN'` catches scanner failures.
 
 ### Alerting (suggested)
 
@@ -264,8 +260,8 @@ failures without matching claim-loop noise.
 | --------------------------------------------- | ------------------- | ------------------------------------------- |
 | `follower.is_caught_up == false`              | sustained > 5 min   | investigate chain endpoint                  |
 | `follower.anchor_lag_blocks`                  | > 50                | alert, check `last_error_phase`             |
-| `follower.last_advance_age_seconds`           | > 120 in chain mode | anchor stuck                                |
-| `follower.last_error_phase == "advance_poke"` | any                 | kernel rejected an advance — possible reorg |
+| `follower.last_advance_age_seconds`           | > 120 in chain mode | scanner stuck                               |
+| `follower.last_error_phase == "scan_poke"`    | any                 | kernel rejected a scan — possible reorg     |
 | Process missing                               | n/a                 | supervise with systemd/launchd              |
 
 
@@ -281,72 +277,49 @@ grpcurl -plaintext localhost:5556 list | head -5
 # 2. crank tracing to see what the follower attempts
 RUST_LOG=info,nns_vesl::chain_follower=trace,nns_vesl::chain=debug nns
 
-# 3. force a single advance to bypass the 10s tick
-export NNS_ENABLE_ADMIN=1        # enable admin routes
-nns &                             # or restart the node
-curl -X POST http://127.0.0.1:3000/admin/advance-tip-now
-# → {"advanced": true, "tip_height": 120, "count": 5}
-# or
-# → {"advanced": false, "reason": "no-op (local mode, endpoint missing, or within finality depth)"}
+# 3. watch the scanner move
+watch -n 2 'curl -s http://127.0.0.1:3000/status | jq .scan_state'
 ```
 
-Common causes of `advanced: false`:
+Common causes of no scan progress:
 
 - `**local mode**` — `settlement_mode = "local"` in vesl.toml. Set to `"chain"`.
 - `**endpoint missing**` — `chain_endpoint` not set. Add it.
-- `**within finality depth**` — chain tip < NNS anchor + `finality_depth` (default 10). Wait for chain to advance.
+- `**within finality depth**` — chain tip < NNS scan height + `finality_depth` (default 10). Wait for chain to advance.
 
-Never enable `NNS_ENABLE_ADMIN` on a public-facing node. The admin
-routes aren't authenticated. Scanners see 404 when it's disabled —
-no fingerprinting.
+## 7. Claim lookup flow
 
-## 7. Claim flow
-
-Register a name, claim it, fetch a proof. This is what a real wallet
-does end-to-end against your node.
+Users submit names by publishing tagged `nns/v1/claim` transactions to
+Nockchain. NNS is now a read-only scanner/indexer: it follows finalized
+blocks, folds valid claims into the accumulator, and serves accumulator
+lookups.
 
 ```bash
 HOST=http://127.0.0.1:3000
-ADDR='8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5'
-
-# 1. reserve pending registration (optional)
-curl -s -X POST "$HOST/register" \
-  -H 'content-type: application/json' \
-  -d "{\"address\":\"$ADDR\",\"name\":\"alice.nock\"}"
-
-# 2. claim with a txHash (in local mode, generate a stub;
-#    in chain mode, pass the real payment tx-id)
-curl -s -X POST "$HOST/claim" \
-  -H 'content-type: application/json' \
-  -d "{\"address\":\"$ADDR\",\"name\":\"alice.nock\",\"txHash\":\"stub-$(uuidgen)\"}"
-
-# 3. fetch the Merkle + anchor proof
-curl -s "$HOST/proof?name=alice.nock" | jq
-
-# 4. verify locally (optional)
-curl -s "$HOST/proof?name=alice.nock" \
-  | light_verify --chain-tip $(curl -s "$HOST/status" | jq -r '.follower.chain_tip_height // 0') \
-                 --max-staleness 20
+curl -s "$HOST/accumulator/alice.nock" | jq
 ```
 
-`light_verify` output:
+Example response:
 
+```json
+{
+  "name": "alice.nock",
+  "value": {
+    "owner": "8s29X...",
+    "tx_hash": "42...",
+    "claim_height": 120,
+    "block_digest": "99..."
+  },
+  "last_proved_height": 130,
+  "last_proved_digest": "aa...",
+  "accumulator_root": "bb...",
+  "accumulator_size": 1000
+}
 ```
-verified: alice.nock
-  owner:      8s29X...WPzTT5
-  tx_hash:    stub-ab12...34cd
-  claim_id:   1
-  root:       b4b7e1...5dc10
-  hull:       0a8137...3d05
-  anchor:     height=120 digest=42...
 
-checks:
-  [PASS] merkle inclusion    (3 siblings)
-  [PASS] anchor freshness    (tip 120, lag 10, max 20)
-  [SKIP] anchor binding      (no --chain-tip-digest)
-```
-
-Exit codes are scriptable — see `light_verify --help`.
+In Y2 this is an honest-indexer response. Y3 adds the recursive proof and
+z-map inclusion/non-inclusion proofs needed for offline wallet
+verification.
 
 ## 8. Data layout
 
@@ -377,10 +350,9 @@ If the kernel jam changed between backup and restore, you'll see:
 W checkpoint kernel hash mismatch; loading checkpoint state into current kernel
 ```
 
-That's usually fine (new kernel can read older state as long as the
-`+$state` shape is backwards-compatible), but some peek paths may hit
-deterministic exits on exotic edge cases. The `/proof` handler has a
-mirror-cache fallback for this specifically.
+This branch intentionally breaks old kernel state while Path Y is still
+pre-release. If you hit a checkpoint shape mismatch, wipe `.nns-data/`
+and rescan from chain.
 
 ### Troubleshooting: `nest-fail` during `make install`
 
@@ -416,21 +388,19 @@ chain-ordered claim notes** from the follower:
 rm -rf .nns-data
 nns
 
-# 2. the follower discovers nns/v1/claim notes on chain and pokes
-#    them into the kernel in block order — the kernel re-applies
-#    every claim deterministically.
+# 2. the follower scans finalized blocks and pokes %scan-block into the
+#    kernel. Claims are folded into the accumulator first-writer-wins.
 
 # 3. monitor progress
-watch -n 5 'curl -s http://127.0.0.1:3000/status | jq "{names_count, follower: {anchor_lag_blocks, last_advance_tip_height}}"'
+watch -n 5 'curl -s http://127.0.0.1:3000/status | jq "{scan_state, follower: {anchor_lag_blocks, last_advance_tip_height}}"'
 ```
 
-Replay completes when `anchor_lag_blocks` drops below `finality_depth`
-and `names_count` stops changing.
+Replay catches up when `anchor_lag_blocks` drops below `finality_depth`.
 
 ## 10. Where to look next
 
 - **Trust model + attack surface** — `ARCHITECTURE.md` §5–§7
-- **Freshness / `light_verify`** — `src/bin/light_verify.rs --help`
+- **Path Y4 `light_verify`** (pinned checkpoint, no live chain RPC) — `src/bin/light_verify.rs --help`, `docs/wallet-verification.md`
 - **API reference** — `src/api.rs` (each handler's doc-comment)
 - **Config surface** — `src/config.rs`, `vesl.toml.example`
 - **Roadmap** — `ARCHITECTURE.md` §11

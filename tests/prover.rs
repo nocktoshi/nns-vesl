@@ -17,11 +17,11 @@ use std::time::Instant;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use nns_vesl::kernel::{
-    build_advance_tip_poke, build_prove_arbitrary_poke, build_prove_batch_poke,
-    build_prove_claim_in_stark_poke, build_prove_claim_poke, build_prove_identity_poke,
-    build_verify_stark_poke, first_anchor_advanced, first_arbitrary_proof, first_batch_proof,
-    first_batch_settled, first_claim_in_stark_proof, first_claim_proof, first_prove_failed,
-    first_prove_identity_result, first_validate_claim_result, first_verify_stark_error,
+    build_prove_arbitrary_poke, build_prove_batch_poke, build_prove_claim_in_stark_poke,
+    build_prove_identity_poke, build_prove_recursive_step_poke, build_verify_stark_poke,
+    first_arbitrary_proof, first_batch_proof, first_batch_settled, first_claim_in_stark_proof,
+    first_prove_failed, first_prove_identity_result, first_recursive_step_dry_run_ok,
+    first_recursive_step_proof, first_validate_claim_result, first_verify_stark_error,
     first_verify_stark_result, AnchorHeader, ClaimBundle, ClaimWitness, InStarkValidation,
     ValidateClaimResult,
 };
@@ -333,136 +333,6 @@ async fn phase1_redo_verify_inner_proof_wall_clock() {
     let _ = ok;
 }
 
-/// Phase 3c step 2 acceptance: `%prove-claim` produces a STARK that
-/// commits to a bundle which PASSES the Phase 3c validator, and the
-/// proof round-trips through `%verify-stark` under the kernel's own
-/// `(root, hull)`.
-///
-/// This is the "option B" flow — validator outside the trace, STARK
-/// commits to the validated bundle's hash. A wallet-side equivalent
-/// would re-run `validate_claim_bundle` locally on the received
-/// bundle and match the hash against the proof's committed subject.
-///
-/// Marked `#[ignore]` because it's prover-heavy (~5 s). Run with
-///
-///   cargo test --test prover phase3c_prove_claim_roundtrip \
-///       -- --nocapture --ignored
-#[ignore]
-#[tokio::test]
-async fn phase3c_prove_claim_roundtrip() {
-    let (_tmp, state) = boot_nns_with_prover().await;
-
-    // Build a bundle that passes every Phase 3c validator predicate.
-    // Small 1-byte digests sidestep the z-silt jet edge-case
-    // documented in tests/phase3_predicates.rs.
-    let page_digest = vec![0x42];
-    let tx_hash = vec![0x07];
-    let other_tx = vec![0x08];
-
-    // `%prove-claim` runs `matches-current-anchor` against kernel state; a
-    // fresh kernel starts at tip `(0, 0)`, so seed the anchor to match the
-    // bundle's `anchored_tip` / `anchored_tip_height` (same pattern as
-    // `tests/phase3_predicates.rs::advance_anchor_to`).
-    {
-        let header = AnchorHeader {
-            digest: page_digest.clone(),
-            height: 1,
-            parent: vec![],
-        };
-        let mut k = state.kernel.lock().await;
-        let fx = k
-            .poke(SystemWire.to_wire(), build_advance_tip_poke(&[header]))
-            .await
-            .expect("advance-tip for prove-claim anchor binding");
-        let adv = first_anchor_advanced(&fx).expect("anchor-advanced");
-        assert_eq!(adv.tip_height, 1);
-    }
-
-    let bundle = ClaimBundle {
-        name: "ab.nock".to_string(),
-        owner: "owner-addr".to_string(),
-        fee: 327_680_000,
-        tx_hash: tx_hash.clone(),
-        claim_block_digest: page_digest.clone(),
-        anchor_headers: Vec::<AnchorHeader>::new(),
-        page_digest: page_digest.clone(),
-        page_tx_ids: vec![tx_hash.clone(), other_tx],
-        anchored_tip: page_digest,
-        anchored_tip_height: 1,
-        witness: ClaimWitness {
-            tx_id: tx_hash,
-            spender_pkh: b"owner-addr".to_vec(),
-            treasury_amount: 327_680_000,
-            output_lock_root: DEFAULT_TREASURY_LOCK_ROOT_B58.to_string(),
-        },
-    };
-
-    // Sanity: bundle must validate before we ask for a proof.
-    {
-        let mut k = state.kernel.lock().await;
-        let v = k
-            .poke(
-                SystemWire.to_wire(),
-                nns_vesl::kernel::build_validate_claim_poke(&bundle),
-            )
-            .await
-            .expect("validate poke");
-        assert_eq!(
-            first_validate_claim_result(&v),
-            Some(ValidateClaimResult::Ok),
-            "bundle must validate before attempting to prove"
-        );
-    }
-
-    // Produce the proof. Expected wall-clock: ~5 s (vesl-style trace,
-    // same shape as Phase 0 %prove-batch since the underlying
-    // fs-formula is identical).
-    let t_prove = Instant::now();
-    let effects = {
-        let mut k = state.kernel.lock().await;
-        k.poke(SystemWire.to_wire(), build_prove_claim_poke(&bundle))
-            .await
-            .expect("%prove-claim poke")
-    };
-    let prove_elapsed = t_prove.elapsed();
-
-    if let Some(trace_jam) = first_prove_failed(&effects) {
-        panic!(
-            "prove-computation crashed inside %prove-claim; trace len={} bytes",
-            trace_jam.len()
-        );
-    }
-    let proof = first_claim_proof(&effects).expect("%claim-proof effect");
-    println!(
-        "[phase3c] %prove-claim wall-clock: {:.3?} (bundle-digest {} B, proof jam {} B)",
-        prove_elapsed,
-        proof.bundle_digest.len(),
-        proof.proof_jam.len()
-    );
-    assert!(!proof.proof_jam.is_empty());
-
-    // Round-trip via %verify-stark, same kernel instance (so `root`
-    // and `hull` match what the prover Fiat-Shamir'd).
-    let verify_poke = build_verify_stark_poke(&proof.proof_jam);
-    let t_verify = Instant::now();
-    let vfx = {
-        let mut k = state.kernel.lock().await;
-        k.poke(SystemWire.to_wire(), verify_poke)
-            .await
-            .expect("%verify-stark poke")
-    };
-    let verify_elapsed = t_verify.elapsed();
-    println!("[phase3c] %verify-stark wall-clock: {:.3?}", verify_elapsed);
-    if let Some(msg) = first_verify_stark_error(&vfx) {
-        panic!("verify-stark rejected the claim proof: {msg}");
-    }
-    let ok = first_verify_stark_result(&vfx).expect("%verify-stark-result effect");
-    assert!(
-        ok,
-        "claim proof must round-trip through vesl-verifier on the same kernel",
-    );
-}
-
 /// Phase 3c step 3 spike: prove a caller-constructed Nock formula via
 /// the general-purpose `%prove-arbitrary` cause. This is the
 /// foundational primitive the full validator-in-STARK flow will use
@@ -671,6 +541,219 @@ async fn phase3c_step3_validator_in_stark_blocked_upstream() {
             panic!(
                 "neither %claim-in-stark-proof nor %prove-failed emitted; effects: {}",
                 effects.len()
+            );
+        }
+    }
+}
+
+/// Y0 recursive-composition spike. Path Y ([`stateless_nns_tx_primitive`]
+/// plan) needs a single STARK that proves `verify(prev_proof) && ...`
+/// every block, chaining back to genesis. That primitive is exactly
+/// `prove-computation:vp` applied to a formula calling
+/// `verify:vesl-stark-verifier` on a prior proof.
+///
+/// This spike asks **one question**: can Vesl's STARK prover trace
+/// that formula today, or does it trap on the same upstream opcode
+/// blocker as Phase 3c step 3 (`validator-in-STARK`)?
+///
+/// # Procedure
+///
+/// 1. Prove a non-trivial inner statement via the existing
+///    `%prove-arbitrary` path: `[subject=42 formula=[4 [4 [4 [0 1]]]]]`,
+///    which increments the subject three times and evaluates to 45.
+///    That path is known-green (`phase3c_step3_prove_arbitrary_roundtrip`)
+///    so it isolates "the prover can trace Nock-0..8" from "the
+///    prover can trace recursive-verify".
+///
+/// 2. Poke `%prove-recursive-step` with `(prev_proof, prev_subject,
+///    prev_formula)`. The kernel builds a subject-bundled-core trace
+///    via `+build-recursive-verify-trace-inputs` —
+///    `subject = [[prev_proof ~ 0 prev_subject prev_formula] vv-core]`
+///    and `formula = [9 2 10 [6 0 2] 9 verify-vv-arm-axis 0 3]` —
+///    exactly the shape `+build-validator-trace-inputs:np` uses,
+///    swapping the validator for `verify:vv`.
+///
+/// 3. Assert the dry-run succeeded (`%recursive-step-dry-run-ok
+///    ok=true`). This confirms the *encoding* is correct: the raw
+///    nockvm ran `verify:vv` on a known-good proof and it returned
+///    `%.y`. Dry-run failure means the spike is invalid — either the
+///    arm-axis extraction is wrong, or the sample encoding is wrong,
+///    or the inner proof we jammed isn't actually the same proof the
+///    prover produced. Fix before interpreting the prover result.
+///
+/// 4. Inspect the prover outcome:
+///
+///      - `[%recursive-step-proof ...]` emitted: **unexpectedly green**.
+///        Vesl's `fink:fock` now traces a full `verify:vesl-stark-verifier`
+///        body. Path Y step Y3 is unblocked and we should immediately
+///        benchmark + productionise. This branch flips the assertions.
+///
+///      - `[%prove-failed ...]` emitted: **expected**. Vesl's prover
+///        trapped inside `common/ztd/eight.hoon::interpret` because
+///        `verify:vv` compiles down to Nock 9 (slam) / 10 (edit) / 11
+///        (hint) opcodes that are currently `!!` stubs in the compute
+///        table. This is the **same upstream blocker** Phase 3c step 3
+///        hit — Path Y's recursive step does **not** introduce a new
+///        dependency on Vesl. Filed as part of the Y0 upstream ask
+///        (`ARCHITECTURE.md` §14).
+///
+/// Record wall-clock and trace-size of the failure mode so we can
+/// assert a regression would manifest as a change in shape, not in
+/// silence.
+///
+/// Marked `#[ignore]` because it runs two real STARK proves (inner
+/// arbitrary + outer recursive-step). The outer prove traps early
+/// (on the first Nock-9 dispatch) so the total is typically under
+/// two of the inner prove.
+///
+/// Run explicitly with:
+///
+/// ```text
+/// cargo test --test prover y0_recursive_composition_spike \
+///   -- --nocapture --ignored
+/// ```
+#[ignore]
+#[tokio::test]
+async fn y0_recursive_composition_spike() {
+    use nock_noun_rs::{jam_to_bytes, new_stack, Cell, D};
+
+    let (_tmp, state) = boot_nns_with_prover().await;
+
+    // ---- step 1: prove a non-trivial inner statement ------------------
+    let mut sub_stack = new_stack();
+    let subject_noun = D(42);
+    let subject_jam = jam_to_bytes(&mut sub_stack, subject_noun);
+
+    let mut form_stack = new_stack();
+    let base = Cell::new(&mut form_stack, D(0), D(1)).as_noun(); // [0 1]
+    let inc1 = Cell::new(&mut form_stack, D(4), base).as_noun(); // [4 [0 1]]
+    let inc2 = Cell::new(&mut form_stack, D(4), inc1).as_noun(); // [4 [4 ...]]
+    let formula_noun = Cell::new(&mut form_stack, D(4), inc2).as_noun(); // [4 [4 [4 ...]]]
+    let formula_jam = jam_to_bytes(&mut form_stack, formula_noun);
+
+    let t_inner = Instant::now();
+    let inner_efx = {
+        let mut k = state.kernel.lock().await;
+        k.poke(
+            SystemWire.to_wire(),
+            build_prove_arbitrary_poke(&subject_jam, &formula_jam),
+        )
+        .await
+        .expect("%prove-arbitrary (inner) poke")
+    };
+    let inner_elapsed = t_inner.elapsed();
+
+    if let Some(trace) = first_prove_failed(&inner_efx) {
+        panic!(
+            "[y0] inner %prove-arbitrary trapped ({} bytes); spike depends on a green inner — \
+             fix the baseline prover first before rerunning y0",
+            trace.len()
+        );
+    }
+    let inner_proof = first_arbitrary_proof(&inner_efx).expect("%arbitrary-proof (inner)");
+    println!(
+        "[y0] inner prove: {:.3?} (product {} B, proof jam {} B)",
+        inner_elapsed,
+        inner_proof.product_jam.len(),
+        inner_proof.proof_jam.len()
+    );
+    assert!(
+        !inner_proof.proof_jam.is_empty(),
+        "inner proof jam must be non-empty"
+    );
+
+    // ---- step 2: poke the recursive step with (inner_proof, 42, form) -
+    let t_outer = Instant::now();
+    let outer_efx = {
+        let mut k = state.kernel.lock().await;
+        k.poke(
+            SystemWire.to_wire(),
+            build_prove_recursive_step_poke(&inner_proof.proof_jam, &subject_jam, &formula_jam),
+        )
+        .await
+        .expect("%prove-recursive-step poke")
+    };
+    let outer_elapsed = t_outer.elapsed();
+    println!(
+        "[y0] %prove-recursive-step wall-clock: {:.3?} ({} effects)",
+        outer_elapsed,
+        outer_efx.len()
+    );
+    for (i, e) in outer_efx.iter().enumerate() {
+        println!(
+            "[y0] outer effect {i}: {:?}",
+            nns_vesl::kernel::effect_tag(e)
+        );
+    }
+
+    // ---- step 3: dry-run must have succeeded ---------------------------
+    let dry_ok = first_recursive_step_dry_run_ok(&outer_efx);
+    match dry_ok {
+        Some(true) => {
+            println!(
+                "[y0] dry-run outside STARK: verify:vv(inner_proof, ~, 0, 42, formula) = %.y \u{2713}"
+            );
+        }
+        Some(false) => panic!(
+            "[y0] dry-run returned %.n — encoding is wrong (arm-axis extraction, subject \
+             layout, or inner_proof jam). Fix before interpreting the prover result."
+        ),
+        None => {
+            // Dry-run effect is only omitted if the Hoon-level `mule` on
+            // `.*(subj form)` itself crashed (malformed formula). In that
+            // case %prove-failed should be the only effect.
+            assert!(
+                first_prove_failed(&outer_efx).is_some(),
+                "no %recursive-step-dry-run-ok and no %prove-failed — kernel contract broken"
+            );
+            panic!(
+                "[y0] dry-run itself crashed — encoding doesn't even run on the raw nockvm. \
+                 Inspect the %prove-failed trace to locate the bug (likely arm-axis)."
+            );
+        }
+    }
+
+    // ---- step 4: interpret the prover outcome --------------------------
+    let outer_proof = first_recursive_step_proof(&outer_efx);
+    let prove_failed_trace = first_prove_failed(&outer_efx);
+
+    match (outer_proof, prove_failed_trace) {
+        (Some(p), _) => {
+            // UNEXPECTEDLY GREEN: Vesl has shipped whatever opcode
+            // support `verify:vv` requires, and recursive composition
+            // is proveable today. Path Y step Y3 is unblocked.
+            println!(
+                "[y0] UNEXPECTEDLY GREEN \u{2014} recursive composition proved; \
+                 product {} B, proof jam {} B",
+                p.product_jam.len(),
+                p.proof_jam.len()
+            );
+            assert!(
+                !p.proof_jam.is_empty(),
+                "outer proof jam must be non-empty on green outcome"
+            );
+        }
+        (None, Some(trace)) => {
+            // Expected outcome. Assert the failure *shape* so a
+            // regression would flip the match, not silently pass.
+            println!(
+                "[y0] upstream-blocked as expected \u{2014} prover trapped with {} byte Hoon trace",
+                trace.len()
+            );
+            assert!(
+                !trace.is_empty(),
+                "%prove-failed trace must be non-empty (Hoon stack should contain \
+                 eight.hoon:::interpret's !! arm for Nock-9/10/11)",
+            );
+            // Intentionally a blocker-signal test, not a failure.
+            // When Vesl's prover ships native Nock 9/10/11 support,
+            // this branch stops firing and the %recursive-step-proof
+            // branch fires instead — that's the Y0 go-signal.
+        }
+        (None, None) => {
+            panic!(
+                "[y0] neither %recursive-step-proof nor %prove-failed emitted; effects: {}",
+                outer_efx.len()
             );
         }
     }

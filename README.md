@@ -6,6 +6,10 @@ NNS — the Nockchain Name Service. On-chain `.nock` name registrar,
 ported from the centralized Cloudflare Worker at `api.nocknames.com`
 to a Vesl-grafted NockApp.
 
+**This branch (Path Y):** the hull is a **read-only chain scanner** — `GET /health`, `GET /status`, `GET /accumulator/:name` only. Users register `.nock` names by submitting **`nns/v1/claim`** notes to Nockchain; this HTTP service does **not** expose `POST /claim`. Offline verification is **Path Y4** via **`light_verify`** ([`docs/wallet-verification.md`](docs/wallet-verification.md): pinned checkpoint, headers, recursive STARK, accumulator snapshot — **no** live Nockchain RPC). **On-chain claims** need structured **NoteData** on outputs; see [`docs/claim-note-wallet-support.md`](docs/claim-note-wallet-support.md) and [nockchain#85](https://github.com/nockchain/nockchain/pull/85).
+
+The **Quick start**, **HTTP API**, **Implementation**, and **Settlement** sections below still walk through the **historical Path A** hull (HTTP claim, Merkle `names`, batch settle). They are kept as design context and are **not** what `src/api.rs` on this tree serves — see [`ARCHITECTURE.md`](ARCHITECTURE.md) §1 for the current split.
+
 ## Dependencies
 
 ```bash
@@ -47,66 +51,30 @@ nns
 Once started:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/register \
-  -H 'content-type: application/json' \
-  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock"}'
-
-curl -X POST http://127.0.0.1:3000/claim \
-  -H 'content-type: application/json' \
-  -d '{"address":"8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5","name":"nns.nock","txHash":"<payment-tx-hash>"}'
-
-curl http://127.0.0.1:3000/claim-status?claim_id=<CLAIM_ID> 
-
-curl http://127.0.0.1:3000/resolve?name=nns.nock
-curl http://127.0.0.1:3000/resolve?address=8s29XUK8Do7QWt2MHfPdd1gDSta6db4c3bQrxP1YdJNfXpL3WPzTT5
-curl http://127.0.0.1:3000/status
+curl -s http://127.0.0.1:3000/status | jq .
+curl -s http://127.0.0.1:3000/accumulator/nns.nock | jq .
+# Full `jam(accumulator)` hex for Path Y4 `light_verify` (requires rebuilt kernel JAM — see docs)
+curl -s 'http://127.0.0.1:3000/accumulator/nns.nock?wallet_export=true' | jq .
 ```
 
-## HTTP API
+## HTTP API (Path Y — this branch)
 
-Endpoint names mirror the kernel's pokes (`POST /claim` →
-`%claim`, `POST /primary` → `%set-primary`). This is a breaking
-departure from the legacy Cloudflare worker, which used
-`POST /verify`; migrate clients by renaming the path. CORS is
-open (`*`).
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/health` | `{"status":"ok"}` |
+| GET | `/status` | Settlement mode, chain endpoint, **`scan_state`** (`last_proved_height`, `last_proved_digest`, `accumulator_root`, `accumulator_size`), **`follower`** telemetry (`anchor_lag_blocks` = chain tip minus scan height, etc.) |
+| GET | `/accumulator/:name` | Lookup row + proof-axis material + scan fields. Query **`wallet_export=true`** adds **`accumulator_snapshot_hex`** (`jam(accumulator)`) for [`Path Y4`](docs/wallet-verification.md) |
 
-Terminology note:
+CORS is open (`*`). Naming validation for `:name` matches the kernel’s `.nock` rules.
 
-- `claim_id` in HTTP (`/claim`, `/claim-status`) is the hull-level async
-submission handle for follower tracking.
-- The kernel's monotonic state counter is `claim-count` (historically called
-`claim-id` in older docs/effects).
+### Historical Path A API (not in this `src/api.rs`)
 
-
-| Method | Path                        | Purpose                                                                                                                                                                                                                                                                                                                                                                     |
-| ------ | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/register`                 | Create a pending reservation (`{address, name}`)                                                                                                                                                                                                                                                                                                                            |
-| POST   | `/claim`                    | Submit claim-note + enqueue replay (`{address, name, txHash?}`); `txHash` is required in non-local modes. Returns `{claim_id, status}` and follower applies in chain order when mined                                                                                                                                                                                       |
-| GET    | `/claim-status?claim_id=X`  | Query: `GET http://127.0.0.1:3000/claim-status?claim_id=<id>`. Returns `{claim_id, status, txHash?, registration?, reason?}` where lifecycle statuses are `submitted` (queued), `confirmed` (mined/applying), `finalized` (kernel accepted; includes `registration`), `rejected` (replay failed; includes `reason`). Unknown ids return `404 {"error":"unknown claim_id"}`. |
-| POST   | `/primary`                  | Designate which of caller's names is primary (`{address, name}`), pokes kernel `%set-primary`                                                                                                                                                                                                                                                                               |
-| POST   | `/settle`                   | Produce one batch receipt for every name claimed since the last settle (empty body); pokes kernel `%settle-batch`                                                                                                                                                                                                                                                           |
-| GET    | `/snapshot`                 | Current commitment `{claim_id, hull, root}` (hex-encoded)                                                                                                                                                                                                                                                                                                                   |
-| GET    | `/pending-batch`            | Names waiting to be settled `{count, names[], last_settled_claim_id}`                                                                                                                                                                                                                                                                                                       |
-| GET    | `/pending`                  | All pending entries, newest first                                                                                                                                                                                                                                                                                                                                           |
-| GET    | `/verified`                 | All registered entries, newest first                                                                                                                                                                                                                                                                                                                                        |
-| GET    | `/resolve?name=X`           | `{address}` or 404                                                                                                                                                                                                                                                                                                                                                          |
-| GET    | `/resolve?address=X`        | `{name}` — the address's **primary** — or 404                                                                                                                                                                                                                                                                                                                               |
-| GET    | `/proof?name=X[&address=Y]` | Inclusion bundle + transition anchor `{name, owner, txHash, claim_id, root, hull, proof[], transition, transition_proof?}`. Optional `address` filter returns 404 on owner mismatch.                                                                                                                                                                                        |
-| GET    | `/search?name=X`            | `{name, price, status, owner?, registeredAt?}` — `price` in whole NOCK                                                                                                                                                                                                                                                                                                     |
-| GET    | `/search?address=X`         | `{address, pending[], verified[], primary?}`                                                                                                                                                                                                                                                                                                                                |
-| GET    | `/status`                   | Diagnostic: counts, merkle root, settlement mode                                                                                                                                                                                                                                                                                                                            |
-| GET    | `/health`                   | `{status: "ok"}`                                                                                                                                                                                                                                                                                                                                                            |
-
-
-One address can own any number of names. `/resolve?address=` returns
-the owner's **primary** name (set by the kernel to the first claim
-for that owner, or to whatever the user last sent to `/primary`).
-`/primary` is owner-gated in the kernel — a `%set-primary` whose
-`address` does not match `names[name].owner` is rejected with a
-`%primary-error` and the mirror is not updated.
+The table that used to list `POST /register`, `POST /claim`, `GET /proof`, `POST /settle`, etc. described the **Merkle-registry** hull. That design is still explained in [`ARCHITECTURE.md`](ARCHITECTURE.md) §2–§6 for consensus rationale; this branch’s HTTP surface is the three **GET** routes above.
 
 
 ## Implementation
+
+**Path Y note:** this section describes the **Path A** kernel (`names` map, `%claim`, `%settle-batch`, Vesl batch gate). The Path Y kernel is an **`nns-accumulator`** + **`%scan-block`** scanner; see `hoon/app/app.hoon` and [`ARCHITECTURE.md`](ARCHITECTURE.md) §1.
 
 This follows the `data-registry` pattern from the Vesl templates: a
 small kernel holding the authoritative registry
@@ -263,8 +231,8 @@ surfacing/proving it.
 
 - Submit conflicting or spammy claim transactions (including duplicate
 attempts for the same name).
-- Lie in its API responses (`/resolve`, `/proof`, `/claim-status`) to
-clients that trust that app blindly.
+- Lie in indexer responses (`/accumulator/...`, `/status`) to clients that skip **`light_verify`** / checkpoint checks.
+- *(Path A)* Lie in API responses (`/resolve`, `/proof`, `/claim-status`) to clients that trust that app blindly.
 - Censor or delay forwarding user requests through its own frontend/API.
 - Run a modified follower locally and produce a non-canonical private view.
 
@@ -522,12 +490,13 @@ hoonc --new --arbitrary hoon/tests/names.hoon hoon/
 # Rust unit + handler tests (boots the real kernel per test)
 cargo +nightly test
 
-# Light-client proof verification (reads ProofResponse JSON from stdin)
-curl "http://127.0.0.1:3000/proof?name=nns.nock" | cargo +nightly run --bin light_verify
-
+# Path Y4 offline verifier (JSON bundle on stdin — see docs/wallet-verification.md)
+cargo +nightly run --bin light_verify -- --help
 ```
 
 ## Settlement
+
+**Path Y:** there is no HTTP **`POST /settle`** on this hull; settlement batching below is **Path A** behavior.
 
 Settlement is **batched** and **on** for commitments and
 receipts, **off** for on-chain posting. Every `%claim` bumps
@@ -741,15 +710,16 @@ hoon/
 src/
   main.rs                   entrypoint: boot kernel, load config, serve HTTP
   lib.rs                    module wiring
-  api.rs                    axum router + handlers + poke/verify timeout guard
-  kernel.rs                 NounSlab builders for each poke and peek
-  state.rs                  AppState + mirror persistence
-  payment.rs                chain-aware acceptance check + fee tiers
-  chain.rs                  chain RPC helpers (acceptance + tx block lookup)
-  chain_follower.rs         async replay worker (chain-ordered apply path)
+  api.rs                    Path Y read-only HTTP (`/status`, `/accumulator/...`)
+  kernel.rs                 NounSlab builders for peeks + read-only verify pokes
+  state.rs                  AppState + follower telemetry
+  payment.rs                fee tiers (shared helpers)
+  chain.rs                  chain RPC helpers for the follower
+  chain_follower.rs         block-by-block `%scan-block` driver
   claim_note.rs             canonical claim-note NoteData schema helpers
-  types.rs                  wire-compat types for the legacy JSON shapes
-  bin/light_verify.rs       standalone proof verifier
+  wallet_y4.rs              Path Y4 lookup bundle types + header-chain verify
+  types.rs                  JSON / wire types (accumulator responses, etc.)
+  bin/light_verify.rs       Path Y4 offline verifier (checkpoint + headers + STARK + snapshot)
 scripts/
   parity.py                 legacy vs new API diff tool
 tests/

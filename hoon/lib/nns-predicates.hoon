@@ -48,6 +48,8 @@
 ::  importing the full tx-engine cone; Level C closes the remaining
 ::  "hull derived the page summary honestly" trust gap.
 ::
+/+  na=nns-accumulator
+/+  tw=tx-witness
 /=  *  /common/zoon
 |%
 ::
@@ -304,6 +306,19 @@
   ^-  ?
   =(digest.pag claimed-digest)
 ::
+::  +matches-block-commitment-atom: Level C-B — compare a claimed
+::  block-commitment digest (as a single `@ux`, from e.g. a verified
+::  PoW STARK's public output) against `+block-commitment:tx-witness`
+::  recomputed from the same `+$page-commit-tail:tw` the hull used to
+::  build `nns-page-summary`'s tx-id set. The caller is responsible
+::  for assembling `page-commit-tail` consistently with the full
+::  Nockchain `page` noun (parent, coinbase, timestamp, …).
+::
+++  matches-block-commitment-atom
+  |=  [expect=@ux =page-commit-tail:tw]
+  ^-  ?
+  =(expect (digest-to-ux:tw (block-commitment:tw page-commit-tail)))
+::
 ::  --- Level C-A payment-semantic predicates ---------------------
 ::
 ::  Each is a thin equality/arithmetic check on the
@@ -451,12 +466,9 @@
 ::  should never submit a bundle whose chain isn't sound anyway).
 ::
 ::  Bundle-only checks (all cryptographically bound via the STARK's
-::  bundle-digest commitment). The kernel `%prove-claim` cause adds
-::  one *state-relative* check that isn't here:
-::    - `matches-current-anchor` (Phase 7): bundle anchor == kernel
-::      anchor state.
-::  `matches-treasury` (Level C-A) compares the witness to a fixed
-::  lock root and lives in `%prove-claim` beside the anchor check.
+::  bundle-digest commitment). Path Y removed `%prove-claim`; any
+::  former prove-only witness checks must live here so `%validate-claim`
+::  and `%scan-block`'s `+valid-claim-candidate` stay aligned.
 ::
 ::  Predicates NOT yet enforced (Level C-B, future):
 ::    - `compute-id:raw-tx:t` inside the kernel (would eliminate the
@@ -493,6 +505,9 @@
   ::  the chain tx's treasury flow is falsifiable.
   ?.  (pays-amount witness.bundle (fee-for-name name.bundle))
     [%| %witness-underpaid]
+  ::  Level C-A — witness lock root is the canonical NNS treasury.
+  ?.  (matches-treasury witness.bundle)
+    [%| %witness-wrong-treasury]
   ::  Level B — claim-block-digest matches page.digest.
   ?.  (matches-block-digest page.bundle claim-block-digest.bundle)
     [%| %page-digest-mismatch]
@@ -757,4 +772,136 @@
   =/  np-core  ..validate-claim-bundle-linear
   :-  [bundle np-core]
   [9 2 10 [6 0 2] 9 validator-arm-axis 0 3]
+::
+::  --- Path Y claim-scanner (Y1) ---------------------------------
+::
+::  The Path Y recursive-rollup (see `/.cursor/plans/stateless_nns_tx_primitive_3db35132.plan.md`)
+::  replaces per-claim `%claim` / `%prove-claim` submission with a
+::  block-by-block scan: the follower fetches every block, filters
+::  for `nns/v1/claim` transactions, extracts their claim candidates,
+::  and pokes a single `%scan-block`. The kernel then folds those
+::  candidates over the accumulator, enforcing Level A/B/C-A
+::  predicates and first-writer-wins semantics.
+::
+::  +$nns-claim-candidate: what a Rust follower ships to the kernel
+::  for each transaction it believes is an `nns/v1/claim` in the
+::  current page. The follower's extraction is not trusted — every
+::  field is re-checked by `+valid-claim-candidate` before anything
+::  enters the accumulator.
+::
+::  Fields:
+::    name, owner, fee, tx-hash
+::        the claim tuple (matching the on-chain note data of the
+::        `nns/v1/claim` tx).
+::    witness
+::        Level C-A payment witness (same `+$nns-raw-tx-witness` the
+::        kernel's `%prove-claim` path consumes). Enables treasury /
+::        sender / amount checks without a full tx-engine cone.
+::
++$  nns-claim-candidate
+  $:  name=@t
+      owner=@t
+      fee=@ud
+      tx-hash=@ux
+      witness=nns-raw-tx-witness
+  ==
+::
+::  +valid-claim-candidate: predicate bundle the scanner applies to
+::  every incoming candidate. Returns %.y iff *all* of the following
+::  hold:
+::
+::    G1   — `is-valid-name name`                  (format)
+::    C2   — `fee >= fee-for-name name`            (fee schedule)
+::    B    — `has-tx-in-page page tx-hash`         (on-chain inclusion)
+::    C-A1 — `matches-tx-id witness tx-hash`       (witness ties to claim)
+::    C-A2 — `sender-is-owner witness owner`       (signature ownership)
+::    C-A3 — `pays-amount witness fee`             (treasury received fee)
+::    C-A4 — `matches-treasury witness`            (canonical lock root)
+::
+::  Not checked here:
+::    - Chain linkage. The scanner operates PER BLOCK — candidates
+::      are already tied to a specific `page` whose digest is an
+::      input to the recursive step. The recursive-step STARK
+::      (Y3 `y3-recursive-step`) asserts `page.parent == prev_digest`
+::      from the kernel state, which replaces `chain-links-to`.
+::    - Name uniqueness / exclusivity. That's the accumulator's job —
+::      `+insert:nns-accumulator` is first-writer-wins. We intentionally
+::      do NOT reject a candidate whose name is already present; the
+::      scanner silently drops it. This matches the Path Y semantics:
+::      later duplicate claims are valid transactions that just don't
+::      bind the name.
+::
+::  Ordering: cheap-to-expensive (format → fee → inclusion →
+::  witness atom-equalities → witness amount compare). Short-circuits
+::  on first failure. No error tags emitted at this layer — Rust-side
+::  observability can surface dropped candidates via follower logs.
+::
+++  valid-claim-candidate
+  |=  [pag=nns-page-summary c=nns-claim-candidate]
+  ^-  ?
+  ?&  (is-valid-name name.c)
+      (gte fee.c (fee-for-name name.c))
+      (has-tx-in-page pag tx-hash.c)
+      (matches-tx-id witness.c tx-hash.c)
+      (sender-is-owner witness.c owner.c)
+      (pays-amount witness.c fee.c)
+      (matches-treasury witness.c)
+  ==
+::
+::  +claim-scanner: fold every valid candidate into the accumulator,
+::  first-writer-wins, returning the new accumulator.
+::
+::  Inputs:
+::    old-acc
+::        the prior accumulator (kernel state at `last-proved-height`).
+::    pag
+::        the page summary for the block being scanned. Carries
+::        `digest` (written into new entries as `block-digest`) and
+::        `tx-ids` (consulted by `has-tx-in-page`).
+::    height
+::        the block's height; stored in each new entry's `claim-height`.
+::    candidates
+::        Rust-provided list of parsed `nns/v1/claim` transactions
+::        from this block. Order preserves on-chain tx order; since
+::        `insert` is first-writer-wins, the scanner's output depends
+::        on this ordering when two candidates in the same block
+::        claim the same name. Nockchain's block production already
+::        gives us a stable total order over tx-ids, so the follower
+::        emits candidates in `page.tx-ids` order.
+::
+::  Complexity: O(k log n) where k = |candidates|, n = |old-acc|.
+::  The recursive-step STARK (Y3) will trace this arm directly —
+::  the loop body is pure Hoon, no Nock-9 on anything but the
+::  predicate gate itself. Once Vesl ships opcode 9/10/11 support,
+::  this compiles into a single-block-prove trace.
+::
+::  `tx-witness` scope:
+::    - The scanner intentionally does not rebuild spends/outputs or
+::      re-execute Nockchain transactions. Nockchain owns transaction
+::      validity.
+::    - `tx-witness` should stay limited to commitment and membership
+::      checks: block/page commitment, tx-id membership, and optional
+::      raw-tx -> tx-id hashing if the recursive proof needs that
+::      binding. See ARCHITECTURE.md §9.3.
+::
+++  claim-scanner
+  |=  $:  old-acc=nns-accumulator:na
+          pag=nns-page-summary
+          height=@ud
+          candidates=(list nns-claim-candidate)
+      ==
+  ^-  nns-accumulator:na
+  =/  acc  old-acc
+  |-  ^-  nns-accumulator:na
+  ?~  candidates  acc
+  =/  c=nns-claim-candidate  i.candidates
+  =?  acc  (valid-claim-candidate pag c)
+    =/  entry=nns-accumulator-entry:na
+      :*  owner=owner.c
+          tx-hash=tx-hash.c
+          claim-height=height
+          block-digest=digest.pag
+      ==
+    (insert:na acc name.c entry)
+  $(candidates t.candidates)
 --

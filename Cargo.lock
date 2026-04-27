@@ -3615,6 +3615,7 @@ dependencies = [
  "nockapp-grpc",
  "nockchain-client-rs",
  "nockchain-tip5-rs",
+ "nockchain-types",
  "nockvm",
  "nockvm_macros",
  "rustls",

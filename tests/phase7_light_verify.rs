@@ -1,26 +1,20 @@
-//! Phase 7 `light_verify` CLI integration test.
+//! Path Y4 `light_verify` CLI integration tests.
 //!
-//! Drives the `light_verify` binary with crafted `ProofResponse`
-//! JSON on stdin and asserts the expected exit code for each
-//! freshness / anchor-binding scenario.
-//!
-//! Merkle inclusion is exercised implicitly but not the focus —
-//! these tests pipe minimal proof envelopes whose Merkle portion
-//! is trivially valid (empty proof list, root == leaf hash) or
-//! deliberately invalid. The point is the Phase 7 freshness logic.
+//! Drives the `light_verify` binary with [`PathY4LookupBundle`](nns_vesl::wallet_y4::PathY4LookupBundle)
+//! JSON on stdin and pinned `--checkpoint-*` flags.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-
-use nns_vesl::types::{ProofAnchor, ProofResponse, TransitionProofMetadata};
 
 fn binary() -> String {
     std::env::var("CARGO_BIN_EXE_light_verify")
         .unwrap_or_else(|_| "target/debug/light_verify".to_string())
 }
 
-/// Run the binary with `args`, feeding `stdin_json` on stdin.
-/// Returns (exit_code, stdout, stderr).
+fn hex40(seed: u8) -> String {
+    vec![seed; 40].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn run(args: &[&str], stdin_json: &str) -> (i32, String, String) {
     let mut child = Command::new(binary())
         .args(args)
@@ -42,175 +36,193 @@ fn run(args: &[&str], stdin_json: &str) -> (i32, String, String) {
     (code, out, err)
 }
 
-/// Minimal proof envelope — Merkle verification will fail on any
-/// realistic hash, which is fine for tests that exercise earlier
-/// (exit-code-2-and-up) or later (exit-code-0) paths.
-fn synthetic_proof(anchor: Option<ProofAnchor>) -> String {
-    let p = ProofResponse {
-        name: "alice.nock".into(),
-        owner: "alice-owner".into(),
-        tx_hash: "aa".into(),
-        claim_id: 1,
-        root: "00".into(),
-        hull: "00".into(),
-        proof: vec![],
-        transition: TransitionProofMetadata {
-            mode: "x".into(),
-            settled_claim_id: 0,
-        },
-        transition_proof: None,
-        anchor,
-    };
-    serde_json::to_string(&p).unwrap()
+fn checkpoint_args(height: u64, digest_seed: u8) -> Vec<String> {
+    vec![
+        "--checkpoint-height".into(),
+        height.to_string(),
+        "--checkpoint-digest-hex".into(),
+        hex40(digest_seed),
+    ]
+}
+
+/// Bundle: last proved equals checkpoint (no intermediate headers).
+fn bundle_same_as_checkpoint(name: &str, height: u64, digest_seed: u8) -> String {
+    format!(
+        r#"{{
+  "name": "{name}",
+  "value": null,
+  "last_proved_height": {height},
+  "last_proved_digest_hex": "{dig}",
+  "accumulator_root_hex": "{dig}",
+  "recursive_proof_hex": "",
+  "headers_to_checkpoint": []
+}}"#,
+        dig = hex40(digest_seed)
+    )
 }
 
 #[test]
-fn rejects_stale_proof_with_exit_2() {
-    // Proof anchored at height 100, wallet sees tip 130, staleness=20.
-    // Lag 30 > 20 → reject with "freshness check failed" (exit 2).
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "42".into(),
-        tip_height: 100,
-    }));
-    let (code, _out, err) = run(&["--chain-tip", "130", "--max-staleness", "20"], &body);
-    assert_eq!(code, 2, "stale proof must exit 2 (stderr: {err})");
+fn y4_same_height_chain_passes_with_y2_dev() {
+    let cp = 100u64;
+    let seed = 7u8;
+    let mut args: Vec<String> = checkpoint_args(cp, seed);
+    args.push("--path-y2-dev".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = bundle_same_as_checkpoint("alice.nock", cp, seed);
+    let (code, out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(out.contains("verified: alice.nock"), "stdout: {out}");
+}
+
+#[test]
+fn y4_strict_rejects_empty_recursive_without_path_y2_dev() {
+    let cp = 5u64;
+    let seed = 3u8;
+    let args = checkpoint_args(cp, seed);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = bundle_same_as_checkpoint("x.nock", cp, seed);
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 8, "expected exit 8, stderr: {err}");
     assert!(
-        err.contains("freshness check failed"),
-        "stderr should name the failure: {err}"
+        err.contains("path-y2-dev") || err.contains("--path-y2-dev"),
+        "stderr: {err}"
     );
 }
 
 #[test]
-fn accepts_at_exact_freshness_boundary() {
-    // Proof at 100, wallet at 120, staleness=20 → lag exactly 20 → OK.
-    // Merkle still fails (synthetic proof) but freshness passes first.
-    // Exit code 1 (merkle fail) confirms we got past the freshness gate.
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "42".into(),
-        tip_height: 100,
-    }));
-    let (code, _out, err) = run(&["--chain-tip", "120", "--max-staleness", "20"], &body);
-    assert_eq!(
-        code, 1,
-        "at-boundary should pass freshness, then fail on synthetic merkle \
-         (stderr: {err})"
+fn y4_rejects_bad_header_chain() {
+    let cp_h = 1u64;
+    let d1 = hex40(1);
+    let d2 = hex40(2);
+    let d3 = hex40(3);
+    let bad_parent = hex40(0xee);
+    let body = format!(
+        r#"{{
+  "name": "a.nock",
+  "last_proved_height": 3,
+  "last_proved_digest_hex": "{d3}",
+  "accumulator_root_hex": "{d3}",
+  "recursive_proof_hex": "",
+  "headers_to_checkpoint": [
+    {{"height":3,"digest_hex":"{d3}","parent_hex":"{bad_parent}"}},
+    {{"height":2,"digest_hex":"{d2}","parent_hex":"{d1}"}},
+    {{"height":1,"digest_hex":"{d1}","parent_hex":"00000000000000000000000000000000000000000000000000000000000000000000000000000000"}}
+  ]
+}}"#
     );
+    let mut args = checkpoint_args(cp_h, 1);
+    args.push("--path-y2-dev".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 1, "expected header failure exit 1, stderr: {err}");
+}
+
+#[test]
+fn y4_value_without_z_in_requires_allow_missing_z() {
+    let cp = 2u64;
+    let seed = 9u8;
+    let mut args = checkpoint_args(cp, seed);
+    args.push("--allow-empty-recursive-proof".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = format!(
+        r#"{{
+  "name": "b.nock",
+  "value": {{"owner":"o","tx_hash_hex":"{}","claim_height":2,"block_digest_hex":"{}"}},
+  "last_proved_height": {cp},
+  "last_proved_digest_hex": "{dig}",
+  "accumulator_root_hex": "{dig}",
+  "recursive_proof_hex": "",
+  "headers_to_checkpoint": []
+}}"#,
+        hex40(8),
+        hex40(8),
+        dig = hex40(seed)
+    );
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 9, "stderr: {err}");
     assert!(
-        err.contains("merkle"),
-        "stderr should indicate merkle failure: {err}"
+        err.contains("accumulator_snapshot_jam_hex"),
+        "stderr: {err}"
     );
 }
 
 #[test]
-fn rejects_missing_anchor_metadata_with_exit_4() {
-    // Old NNS server omitting anchor field. Reject unless --no-freshness.
-    let body = synthetic_proof(None);
-    let (code, _out, err) = run(&["--chain-tip", "100"], &body);
-    assert_eq!(
-        code, 4,
-        "missing anchor must exit 4 when freshness required (stderr: {err})"
+fn y4_non_empty_recursive_missing_sf_jams_exits_7() {
+    let cp = 1u64;
+    let seed = 4u8;
+    let mut args = checkpoint_args(cp, seed);
+    args.push("--path-y2-dev".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = format!(
+        r#"{{
+  "name": "c.nock",
+  "last_proved_height": {cp},
+  "last_proved_digest_hex": "{dig}",
+  "accumulator_root_hex": "{dig}",
+  "recursive_proof_hex": "cafe00",
+  "headers_to_checkpoint": []
+}}"#,
+        dig = hex40(seed)
     );
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 7, "stderr: {err}");
     assert!(
-        err.contains("anchor metadata"),
-        "stderr should name missing anchor: {err}"
+        err.contains("recursive_subject_jam_hex") || err.contains("recursive_formula_jam_hex"),
+        "stderr: {err}"
     );
 }
 
 #[test]
-fn no_freshness_flag_skips_anchor_check() {
-    // --no-freshness lets legacy proofs through. Merkle still runs.
-    let body = synthetic_proof(None);
-    let (code, _out, err) = run(&["--no-freshness"], &body);
-    // Merkle fails on synthetic input — we expect exit 1, not 4.
-    assert_eq!(
-        code, 1,
-        "--no-freshness should skip to merkle, not bail on missing anchor \
-         (stderr: {err})"
+fn y4_non_empty_recursive_bad_subject_hex_exits_2() {
+    let cp = 1u64;
+    let seed = 4u8;
+    let mut args = checkpoint_args(cp, seed);
+    args.push("--path-y2-dev".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = format!(
+        r#"{{
+  "name": "c2.nock",
+  "last_proved_height": {cp},
+  "last_proved_digest_hex": "{dig}",
+  "accumulator_root_hex": "{dig}",
+  "recursive_proof_hex": "cafe00",
+  "recursive_subject_jam_hex": "gg",
+  "recursive_formula_jam_hex": "00",
+  "headers_to_checkpoint": []
+}}"#,
+        dig = hex40(seed)
     );
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 2, "stderr: {err}");
 }
 
 #[test]
-fn rejects_mismatched_anchor_digest_with_exit_3() {
-    // Proof's anchor digest differs from wallet's view at that height.
-    // This is the fork-attack check.
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "aa".into(),
-        tip_height: 100,
-    }));
-    let (code, _out, err) = run(&["--chain-tip", "100", "--chain-tip-digest", "bb"], &body);
-    assert_eq!(
-        code, 3,
-        "mismatched anchor digest must exit 3 (stderr: {err})"
+fn y4_deprecated_non_empty_z_in_proof_exits_2() {
+    let cp = 1u64;
+    let seed = 2u8;
+    let mut args = checkpoint_args(cp, seed);
+    args.push("--path-y2-dev".into());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let body = format!(
+        r#"{{
+  "name": "d.nock",
+  "last_proved_height": {cp},
+  "last_proved_digest_hex": "{dig}",
+  "accumulator_root_hex": "{dig}",
+  "recursive_proof_hex": "",
+  "z_in_proof": [{{"hash":"00","side":"left"}}],
+  "headers_to_checkpoint": []
+}}"#,
+        dig = hex40(seed)
     );
-    assert!(
-        err.contains("anchor binding"),
-        "stderr should name anchor binding failure: {err}"
-    );
+    let (code, _out, err) = run(&arg_refs, &body);
+    assert_eq!(code, 2, "stderr: {err}");
+    assert!(err.contains("deprecated"), "stderr: {err}");
 }
 
 #[test]
-fn accepts_matching_anchor_digest() {
-    // Digests match; freshness ok → freshness gate passes.
-    // Exit 1 from synthetic merkle is the expected post-freshness outcome.
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "aa".into(),
-        tip_height: 100,
-    }));
-    let (code, _out, err) = run(&["--chain-tip", "100", "--chain-tip-digest", "aa"], &body);
-    assert_eq!(
-        code, 1,
-        "matching anchor should pass freshness+binding, then fail merkle \
-         (stderr: {err})"
-    );
-}
-
-#[test]
-fn requires_chain_tip_without_no_freshness() {
-    // Caller forgot --chain-tip; --no-freshness not set.
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "aa".into(),
-        tip_height: 100,
-    }));
-    let (code, _out, err) = run(&[], &body);
-    assert_eq!(code, 5, "missing --chain-tip must exit 5 (stderr: {err})");
-}
-
-#[test]
-fn surfaces_server_error_body_with_exit_6() {
-    // When the server returns an ErrorBody JSON (e.g. 404/500)
-    // instead of a ProofResponse, `light_verify` should print the
-    // error message cleanly and exit 6 — not drop a cryptic serde
-    // trace on the user.
-    let body = r#"{"error":"name not registered"}"#;
-    let (code, _out, err) = run(&["--chain-tip", "100"], body);
-    assert_eq!(code, 6, "ErrorBody body must exit 6 (stderr: {err})");
-    assert!(
-        err.contains("name not registered"),
-        "stderr should surface the server's error message: {err}"
-    );
-}
-
-#[test]
-fn surfaces_unparseable_body_with_exit_6() {
-    // Neither ProofResponse nor ErrorBody shape — print raw body so
-    // the user can see what the server actually sent.
-    let body = "this is not json";
-    let (code, _out, err) = run(&["--chain-tip", "100"], body);
-    assert_eq!(code, 6, "unparseable body must exit 6 (stderr: {err})");
-    assert!(
-        err.contains("raw body"),
-        "stderr should include raw body dump: {err}"
-    );
-}
-
-#[test]
-fn rejects_proof_one_block_past_boundary() {
-    // Proof at 99, wallet at 120, staleness 20 → lag 21 → exactly one
-    // block past boundary → reject.
-    let body = synthetic_proof(Some(ProofAnchor {
-        tip_digest: "42".into(),
-        tip_height: 99,
-    }));
-    let (code, _out, err) = run(&["--chain-tip", "120", "--max-staleness", "20"], &body);
-    assert_eq!(code, 2, "one-past-boundary must reject (stderr: {err})");
+fn y4_missing_checkpoint_flags_exit_5() {
+    let body = bundle_same_as_checkpoint("z.nock", 1, 1);
+    let (code, _out, err) = run(&["--path-y2-dev"], &body);
+    assert_eq!(code, 5, "stderr: {err}");
 }
