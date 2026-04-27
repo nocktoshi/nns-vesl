@@ -634,58 +634,51 @@
     =/  boot=?
       &(=(0 last-proved-height.state) =(0 last-proved-digest.state))
     ?.  ?|(boot =(parent.c last-proved-digest.state))
-      :_  state
-      ~[[%scan-block-error 'parent-mismatch']]
+      :-  ~[[%scan-block-error 'parent-mismatch']]
+      state
     ?.  =(height.c +(last-proved-height.state))
-      :_  state
-      ~[[%scan-block-error 'height-not-successor']]
-    ::  Progress on stderr (level 2). Pair with hull `RUST_LOG` / follower
-    ::  logs when debugging scans.
+      :-  ~[[%scan-block-error 'height-not-successor']]
+      state
+    ::  Progress on stderr (level 2).
     ::
-    =/  slog-enter=@t
-      %+  crip
-      ;:  weld
-        "nns: scan-block start height="
-        (trip (scot %ud height.c))
-        " prev_height="
-        (trip (scot %ud last-proved-height.state))
-        " page_tx_ids="
-        (trip (scot %ud (lent page-tx-ids.c)))
-        " candidates="
-        (trip (scot %ud (lent candidates.c)))
-        ""
-      ==
+    =/  enter-tape=tape
+      %+  weld  "nns: scan-block start height="
+      %+  weld  (trip (scot %ud height.c))
+      %+  weld  " prev_height="
+      %+  weld  (trip (scot %ud last-proved-height.state))
+      %+  weld  " page_tx_ids="
+      %+  weld  (trip (scot %ud (lent page-tx-ids.c)))
+      %+  weld  " candidates="
+      %+  weld  (trip (scot %ud (lent candidates.c)))
+      ""
+    =/  slog-enter=@t  (crip enter-tape)
     ~>  %slog.[2 slog-enter]
     =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
     =/  pag=nns-page-summary:np  [page-digest.c tx-set]
     =/  n-tx-set=@ud  ~(wyt z-in tx-set)
-    =/  slog-page=@t
-      %+  crip
-      ;:  weld
-        "nns: scan-block page summary built z_set_size="
-        (trip (scot %ud n-tx-set))
-        " block_id="
-        (trip (scot %ux page-digest.c))
-        ""
-      ==
+    =/  page-tape=tape
+      %+  weld  "nns: scan-block page summary built z_set_size="
+      %+  weld  (trip (scot %ud n-tx-set))
+      %+  weld  " block_id="
+      %+  weld  (trip (scot %ux page-digest.c))
+      ""
+    =/  slog-page=@t  (crip page-tape)
     ~>  %slog.[2 slog-page]
     =/  new-acc=nns-accumulator:na
       (claim-scanner:np accumulator.state pag height.c candidates.c)
     =/  acc-root=@  (root-atom:na new-acc)
     =/  acc-sz=@ud  (size:na new-acc)
-    =/  slog-done=@t
-      %+  crip
-      ;:  weld
-        "nns: scan-block done height="
-        (trip (scot %ud height.c))
-        " acc_root="
-        (trip (scot %ux acc-root))
-        " acc_size="
-        (trip (scot %ud acc-sz))
-        " block_digest="
-        (trip (scot %ux digest.pag))
-        ""
-      ==
+    =/  done-tape=tape
+      %+  weld  "nns: scan-block done height="
+      %+  weld  (trip (scot %ud height.c))
+      %+  weld  " acc_root="
+      %+  weld  (trip (scot %ux acc-root))
+      %+  weld  " acc_size="
+      %+  weld  (trip (scot %ud acc-sz))
+      %+  weld  " block_digest="
+      %+  weld  (trip (scot %ux digest.pag))
+      ""
+    =/  slog-done=@t  (crip done-tape)
     ~>  %slog.[2 slog-done]
     =.  accumulator.state  new-acc
     =.  last-proved-height.state  height.c
