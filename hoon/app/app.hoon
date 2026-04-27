@@ -646,16 +646,28 @@
       ?.  =(height.c +(last-proved-height.state))
         :_  state
         ~[[%scan-block-error 'height-not-successor']]
-      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
-      =/  pag=nns-page-summary:np  [page-digest.c tx-set]
-      =/  new-acc=nns-accumulator:na
-        (claim-scanner:np accumulator.state pag height.c candidates.c)
-      =/  acc-root=@  (root-atom:na new-acc)
+      ::  Traps inside `z-silt` / z-in `gas`→`put` (see /common/zoon.hoon)
+      ::  or `claim-scanner` surface as an empty hull effect list unless
+      ::  caught — wrap so operators get `%scan-block-error` instead.
+      ::
+      =/  res
+        %-  mule
+        |.
+        =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
+        =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+        =/  new-acc=nns-accumulator:na
+          (claim-scanner:np accumulator.state pag height.c candidates.c)
+        =/  acc-root=@  (root-atom:na new-acc)
+        [new-acc acc-root digest.pag]
+      ?.  ?=(%& -.res)
+        :_  state
+        ~[[%scan-block-error 'scan-trapped']]
+      =/  [new-acc=nns-accumulator:na acc-root=@ digest-h=@ux]  p.res
       =.  accumulator.state  new-acc
       =.  last-proved-height.state  height.c
-      =.  last-proved-digest.state  digest.pag
+      =.  last-proved-digest.state  digest-h
       :_  state
-      ~[[%scan-block-done height.c digest.pag acc-root]]
+      ~[[%scan-block-done height.c digest-h acc-root]]
       ::
         ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
         ::  [%prove-identity-result ok=?] so the test can confirm the

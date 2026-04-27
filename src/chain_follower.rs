@@ -19,6 +19,52 @@ use crate::kernel::{
 use crate::payment::{fee_for_name, sum_treasury_outputs_v1, TREASURY_LOCK_ROOT_B58};
 use crate::state::SharedState;
 
+/// Hex prefix for Tip5 atoms in logs (`RUST_LOG=nns_vesl::chain_follower=debug`).
+fn atom_hex_preview(bytes: &[u8], prefix_len: usize) -> String {
+    let n = prefix_len.min(bytes.len());
+    let hex: String = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
+    if bytes.len() > n {
+        format!("{hex}…({}B)", bytes.len())
+    } else {
+        format!("{hex}({}B)", bytes.len())
+    }
+}
+
+fn format_tx_id_previews(ids: &[Vec<u8>], max: usize) -> String {
+    let mut out = Vec::new();
+    for id in ids.iter().take(max) {
+        out.push(atom_hex_preview(id, 8));
+    }
+    let suffix = if ids.len() > max {
+        format!(" …(+{} more)", ids.len() - max)
+    } else {
+        String::new()
+    };
+    format!("[{}]{suffix}", out.join(", "))
+}
+
+fn format_candidates_for_log(candidates: &[ClaimCandidate]) -> String {
+    const MAX: usize = 12;
+    let mut parts = Vec::new();
+    for c in candidates.iter().take(MAX) {
+        parts.push(format!(
+            "(name={:?} owner={:?} fee={} tx_hash={} wit.tx={} wit.spender={} wit.amt={} wit.treas={:?})",
+            c.name,
+            c.owner,
+            c.fee,
+            atom_hex_preview(&c.tx_hash, 6),
+            atom_hex_preview(&c.witness.tx_id, 6),
+            atom_hex_preview(&c.witness.spender_pkh, 6),
+            c.witness.treasury_amount,
+            c.witness.output_lock_root,
+        ));
+    }
+    if candidates.len() > MAX {
+        parts.push(format!("…(+{} more candidates)", candidates.len() - MAX));
+    }
+    parts.join(" ")
+}
+
 /// Sleep between ticks **only** when there is nothing to scan (caught up
 /// within finality) or after an error — avoids gRPC busy-loops. While a
 /// finalized backlog exists, consecutive `%scan-block` steps run back-to-back.
@@ -141,6 +187,14 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
         }
     };
 
+    tracing::debug!(
+        last_proved_height = scan_state.last_proved_height,
+        last_proved_digest = %atom_hex_preview(&scan_state.last_proved_digest, 16),
+        accumulator_root = %atom_hex_preview(&scan_state.accumulator_root, 16),
+        accumulator_size = scan_state.accumulator_size,
+        "chain_follower: /scan-state peek"
+    );
+
     let current_chain_tip = match fetch_current_tip_height(&endpoint).await {
         Ok(p) => p,
         Err(e) => {
@@ -180,6 +234,30 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
     let page_tx_ids = tx_ids_from_block_details(&details)?;
     let tx_details = fetch_block_transaction_details(&endpoint, &details).await?;
     let candidates = extract_claim_candidates(&tx_details)?;
+
+    if details.height != next_height {
+        tracing::warn!(
+            details_height = details.height,
+            next_height,
+            "chain_follower: RPC block height differs from expected next scan height"
+        );
+    }
+
+    let parent_links_cursor = parent.as_slice() == scan_state.last_proved_digest.as_slice();
+    tracing::debug!(
+        chain_tip = current_chain_tip,
+        finalized_height,
+        next_height,
+        details_height = details.height,
+        parent = %atom_hex_preview(&parent, 16),
+        page_digest = %atom_hex_preview(&page_digest, 16),
+        parent_links_last_proved = parent_links_cursor,
+        page_tx_count = page_tx_ids.len(),
+        page_tx_ids_preview = %format_tx_id_previews(&page_tx_ids, 8),
+        claim_candidates_count = candidates.len(),
+        claim_candidates = %format_candidates_for_log(&candidates),
+        "chain_follower: %scan-block poke payload (Tip5 atoms are LE 40B; compare with kernel last_proved_digest)"
+    );
 
     let poke_result = {
         let mut k = state.kernel.lock().await;
@@ -241,6 +319,13 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
         h.follower.record_advance(done.height, 1, now);
     }
     state.persist_all().await;
+
+    tracing::debug!(
+        height = done.height,
+        block_digest = %atom_hex_preview(&done.digest, 16),
+        accumulator_root = %atom_hex_preview(&done.accumulator_root, 16),
+        "chain_follower: %scan-block-done"
+    );
 
     Ok(Some(ScanBlockOutcome {
         height: done.height,
