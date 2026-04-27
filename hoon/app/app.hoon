@@ -652,7 +652,9 @@
     =/  ent5  (weld ent4 " candidates=")
     =/  ent6
       (weld ent5 (trip (scot %ud (lent candidates.c))))
-    =/  slog-enter=@t  (crip ent6)
+    =/  slog-enter=@t
+      %+  crip
+      ent6
     ~>  %slog.[2 slog-enter]
     =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
     =/  pag=nns-page-summary:np  [page-digest.c tx-set]
@@ -661,7 +663,9 @@
       (weld "nns: scan-block page summary built z_set_size=" (trip (scot %ud n-tx-set)))
     =/  pg1  (weld pg0 " block_id=")
     =/  pg2  (weld pg1 (trip (scot %ux page-digest.c)))
-    =/  slog-page=@t  (crip pg2)
+    =/  slog-page=@t
+      %+  crip
+      pg2
     ~>  %slog.[2 slog-page]
     =/  new-acc=nns-accumulator:na
       (claim-scanner:np accumulator.state pag height.c candidates.c)
@@ -675,7 +679,9 @@
     =/  dn4  (weld dn3 (trip (scot %ud acc-sz)))
     =/  dn5  (weld dn4 " block_digest=")
     =/  dn6  (weld dn5 (trip (scot %ux digest.pag)))
-    =/  slog-done=@t  (crip dn6)
+    =/  slog-done=@t
+      %+  crip
+      dn6
     ~>  %slog.[2 slog-done]
     =.  accumulator.state  new-acc
     =.  last-proved-height.state  height.c
