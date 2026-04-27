@@ -630,7 +630,8 @@
     =/  act  ((soft cause) cause.input.ovum)
     ?~  act
       ~>  %slog.[3 'nns: invalid cause']
-      [~ state]
+      :_  state
+      ~[[%invalid-cause ~]]
     ?-  -.u.act
         ::
         ::  Path Y2: %scan-block — parent link + height monotonicity,

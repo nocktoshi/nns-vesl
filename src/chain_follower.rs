@@ -13,8 +13,8 @@ use crate::chain::{
 use crate::claim_note::ClaimNoteV1;
 use crate::kernel::{
     build_scan_block_poke, build_scan_state_peek, decode_scan_state, first_error_message,
-    first_scan_block_done, first_scan_block_error, format_effect_tags, ClaimCandidate,
-    ClaimWitness,
+    first_scan_block_done, first_scan_block_error, format_effect_tags, has_effect,
+    ClaimCandidate, ClaimWitness,
 };
 use crate::payment::{fee_for_name, sum_treasury_outputs_v1, TREASURY_LOCK_ROOT_B58};
 use crate::state::SharedState;
@@ -299,8 +299,14 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
     }
     let Some(done) = first_scan_block_done(&effects) else {
         let tags = format_effect_tags(&effects);
-        let msg = if effects.is_empty() {
-            "kernel did not emit %scan-block-done (empty effects — poke likely failed soft cause mold; rebuild out.jam from current hoon or check stderr for nns: invalid cause)"
+        let msg = if has_effect(&effects, "invalid-cause") {
+            "%invalid-cause from kernel — `(soft cause)` failed (mold mismatch). \
+             Rebuild out.jam from current hoon/app/app.hoon so `+$cause` includes `%scan-block`, \
+             point NNS_KERNEL_JAM at it, redeploy."
+                .to_string()
+        } else if effects.is_empty() {
+            "kernel did not emit %scan-block-done (empty effects — wrapper/nockapp returned no effects; \
+             if stderr shows `nns: invalid cause`, rebuild out.jam; otherwise check nockapp poke wiring)"
                 .to_string()
         } else {
             format!(
