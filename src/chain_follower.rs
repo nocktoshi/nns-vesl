@@ -13,7 +13,8 @@ use crate::chain::{
 use crate::claim_note::ClaimNoteV1;
 use crate::kernel::{
     build_scan_block_poke, build_scan_state_peek, decode_scan_state, first_error_message,
-    first_scan_block_done, first_scan_block_error, ClaimCandidate, ClaimWitness,
+    first_scan_block_done, first_scan_block_error, format_effect_tags, ClaimCandidate,
+    ClaimWitness,
 };
 use crate::payment::{fee_for_name, sum_treasury_outputs_v1, TREASURY_LOCK_ROOT_B58};
 use crate::state::SharedState;
@@ -219,7 +220,15 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
         return Err(msg);
     }
     let Some(done) = first_scan_block_done(&effects) else {
-        let msg = "kernel did not emit %scan-block-done".to_string();
+        let tags = format_effect_tags(&effects);
+        let msg = if effects.is_empty() {
+            "kernel did not emit %scan-block-done (empty effects — poke likely failed soft cause mold; rebuild out.jam from current hoon or check stderr for nns: invalid cause)"
+                .to_string()
+        } else {
+            format!(
+                "kernel did not emit %scan-block-done (effect tags: {tags}; check kernel JAM vs hull or scan-block-done noun shape)"
+            )
+        };
         let ts = crate::state::AppState::now_epoch_ms();
         let mut h = state.hull.lock().await;
         h.follower.record_error("scan_poke", msg.clone(), ts);

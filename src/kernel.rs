@@ -2074,6 +2074,17 @@ pub fn has_effect(effects: &[NounSlab], tag: &str) -> bool {
     effects.iter().filter_map(effect_tag).any(|t| t == tag)
 }
 
+/// Comma-separated domain effect tags (for diagnostics when a poke
+/// returns an unexpected mix).
+pub fn format_effect_tags(effects: &[NounSlab]) -> String {
+    let tags: Vec<String> = effects.iter().filter_map(effect_tag).collect();
+    if tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        tags.join(", ")
+    }
+}
+
 /// Returns the first error message across `effects` (from a
 /// `%claim-error`, `%primary-error`, `%batch-error`, or
 /// `%vesl-error`), if any.
