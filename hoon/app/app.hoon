@@ -639,50 +639,11 @@
     ?.  =(height.c +(last-proved-height.state))
       :-  ~[[%scan-block-error 'height-not-successor']]
       state
-    ::  Progress on stderr (level 2).
-    ::
-    =/  ent0
-      (weld "nns: scan-block start height=" (trip (scot %ud height.c)))
-    =/  ent1  (weld ent0 " prev_height=")
-    =/  ent2
-      (weld ent1 (trip (scot %ud last-proved-height.state)))
-    =/  ent3  (weld ent2 " page_tx_ids=")
-    =/  ent4
-      (weld ent3 (trip (scot %ud (lent page-tx-ids.c))))
-    =/  ent5  (weld ent4 " candidates=")
-    =/  ent6
-      (weld ent5 (trip (scot %ud (lent candidates.c))))
-    =/  slog-enter=@t
-      %+  crip
-      ent6
-    ~>  %slog.[2 slog-enter]
     =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
     =/  pag=nns-page-summary:np  [page-digest.c tx-set]
-    =/  n-tx-set=@ud  ~(wyt z-in tx-set)
-    =/  pg0
-      (weld "nns: scan-block page summary built z_set_size=" (trip (scot %ud n-tx-set)))
-    =/  pg1  (weld pg0 " block_id=")
-    =/  pg2  (weld pg1 (trip (scot %ux page-digest.c)))
-    =/  slog-page=@t
-      %+  crip
-      pg2
-    ~>  %slog.[2 slog-page]
     =/  new-acc=nns-accumulator:na
       (claim-scanner:np accumulator.state pag height.c candidates.c)
     =/  acc-root=@  (root-atom:na new-acc)
-    =/  acc-sz=@ud  (size:na new-acc)
-    =/  dn0
-      (weld "nns: scan-block done height=" (trip (scot %ud height.c)))
-    =/  dn1  (weld dn0 " acc_root=")
-    =/  dn2  (weld dn1 (trip (scot %ux acc-root)))
-    =/  dn3  (weld dn2 " acc_size=")
-    =/  dn4  (weld dn3 (trip (scot %ud acc-sz)))
-    =/  dn5  (weld dn4 " block_digest=")
-    =/  dn6  (weld dn5 (trip (scot %ux digest.pag)))
-    =/  slog-done=@t
-      %+  crip
-      dn6
-    ~>  %slog.[2 slog-done]
     =.  accumulator.state  new-acc
     =.  last-proved-height.state  height.c
     =.  last-proved-digest.state  digest.pag
