@@ -322,13 +322,16 @@ pub async fn fetch_block_proof_bytes(
     Ok(pow.raw_proof)
 }
 
-/// Transaction-level structured details from the node. Phase 3 will
-/// reshape this into the `raw-tx:t` noun the circuit consumes; for now
-/// the hull just round-trips the proto and caches it in the claim note.
-pub async fn fetch_transaction_details(
+enum TxDetailsOutcome {
+    Ready(TransactionDetails),
+    Pending,
+}
+
+/// One `get_transaction_details` round-trip (no retry).
+async fn fetch_transaction_details_outcome(
     endpoint: &str,
     tx_id_base58: &str,
-) -> Result<TransactionDetails, String> {
+) -> Result<TxDetailsOutcome, String> {
     let mut client = connect_block_service(endpoint).await?;
     let req = GetTransactionDetailsRequest {
         tx_id: Some(Base58Hash {
@@ -341,10 +344,8 @@ pub async fn fetch_transaction_details(
         .map_err(|e| format!("transaction details query failed for {tx_id_base58}: {e}"))?
         .into_inner();
     match res.result {
-        Some(get_transaction_details_response::Result::Details(d)) => Ok(d),
-        Some(get_transaction_details_response::Result::Pending(_)) => {
-            Err(format!("tx {tx_id_base58} is pending; no block yet"))
-        }
+        Some(get_transaction_details_response::Result::Details(d)) => Ok(TxDetailsOutcome::Ready(d)),
+        Some(get_transaction_details_response::Result::Pending(_)) => Ok(TxDetailsOutcome::Pending),
         Some(get_transaction_details_response::Result::Error(err)) => Err(format!(
             "transaction details error for {tx_id_base58}: {}",
             err.message
@@ -355,14 +356,74 @@ pub async fn fetch_transaction_details(
     }
 }
 
+/// Transaction-level structured details from the node. Phase 3 will
+/// reshape this into the `raw-tx:t` noun the circuit consumes; for now
+/// the hull just round-trips the proto and caches it in the claim note.
+///
+/// Returns `Err` immediately if the node reports `Pending` (still in mempool).
+/// Block scanning uses [`fetch_block_transaction_details`] instead, which
+/// retries `Pending` to absorb index lag vs finalized blocks.
+pub async fn fetch_transaction_details(
+    endpoint: &str,
+    tx_id_base58: &str,
+) -> Result<TransactionDetails, String> {
+    match fetch_transaction_details_outcome(endpoint, tx_id_base58).await? {
+        TxDetailsOutcome::Ready(d) => Ok(d),
+        TxDetailsOutcome::Pending => Err(format!(
+            "tx {tx_id_base58} is pending; no block yet"
+        )),
+    }
+}
+
 /// Fetch transaction details for every tx-id listed in a block.
+///
+/// Retries when the node returns `Pending` for a tx-id that already appears
+/// in `block.tx_ids` — common transient lag between block headers and the
+/// transaction index on busy nodes.
 pub async fn fetch_block_transaction_details(
     endpoint: &str,
     block: &BlockDetails,
 ) -> Result<Vec<TransactionDetails>, String> {
+    // Retries per tx before failing (bounded wait ~15–25s worst case).
+    const MAX_ATTEMPTS: u32 = 24;
+    const INITIAL_DELAY_MS: u64 = 80;
+    const MAX_DELAY_MS: u64 = 1_500;
+
     let mut out = Vec::with_capacity(block.tx_ids.len());
     for tx_id in &block.tx_ids {
-        out.push(fetch_transaction_details(endpoint, &tx_id.hash).await?);
+        let hash = &tx_id.hash;
+        let mut delay_ms = INITIAL_DELAY_MS;
+        let mut details = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match fetch_transaction_details_outcome(endpoint, hash).await? {
+                TxDetailsOutcome::Ready(d) => {
+                    details = Some(d);
+                    break;
+                }
+                TxDetailsOutcome::Pending => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(format!(
+                            "tx {hash} still Pending after {MAX_ATTEMPTS} get_transaction_details attempts; \
+                             node tx index lags block header or tx left mempool — retry later"
+                        ));
+                    }
+                    tracing::debug!(
+                        tx_id = %hash,
+                        attempt,
+                        delay_ms,
+                        "chain: transaction details Pending while scanning block; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    delay_ms = (delay_ms.saturating_mul(3) / 2).min(MAX_DELAY_MS);
+                }
+            }
+        }
+        let Some(d) = details else {
+            return Err(format!(
+                "internal error: missing transaction details for {hash} after retries"
+            ));
+        };
+        out.push(d);
     }
     Ok(out)
 }
