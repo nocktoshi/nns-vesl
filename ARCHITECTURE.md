@@ -1648,22 +1648,7 @@ DEFAULT_FINALITY_DEPTH = 10
 DEFAULT_MAX_ADVANCE_BATCH = 64
 ```
 ### Claim note schema
-`ClaimNoteV1` extended with optional:
-```rust
-ClaimChainBundle {
-    raw_tx_jam,
-    page_jam,
-    block_proof_jam,
-    header_chain_jam,
-}
-```
-Wire keys:
-- `nns/v1/raw-tx`
-- `nns/v1/page`
-- `nns/v1/block-proof`
-- `nns/v1/header-chain`
-Missing fields decode as `None`.
-`chain_bundle.is_complete()` used by strict future modes.
+Path Y: `ClaimNoteV1` is **`name`, `owner`, `tx_hash`** decoded only from wallet-packed **`blob`** note-data (`src/claim_note.rs`). Chain evidence (raw tx, page, inclusion, witness) comes from **RPC-fetched** `TransactionDetails` / block APIs in **`chain_follower`**, not from optional note-data blobs (not trusted).
 ### Tests
 `tests/phase2_anchor.rs` covers:
 - bootstrap,
@@ -1675,10 +1660,7 @@ Missing fields decode as `None`.
 - address one-shot bind,
 - pre-claim re-bind,
 - post-claim freeze.
-Claim-note unit tests:
-- chain-bundle roundtrip,
-- backward compatibility,
-- optional field behavior.
+Claim-note unit tests: `blob` packed roundtrip (`src/claim_note.rs`).
 ## 11.5 Slim-anchor refactor
 Status: **shipped**.
 Changed kernel anchor from:

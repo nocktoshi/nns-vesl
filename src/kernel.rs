@@ -1628,10 +1628,9 @@ pub fn decode_proof(result: &NounSlab) -> Result<Vec<ProofNode>, String> {
 ///
 /// `tip_digest` is the raw LE bytes of a 5-felt Tip5 hash (all-zero
 /// when uninitialised). The kernel intentionally does not cache
-/// historical headers — per-claim chain linkage is supplied by the
-/// claim-note's `ClaimChainBundle.header_chain_jam` and proved by
-/// the gate. See the `+$anchored-chain` comment in
-/// `hoon/app/app.hoon` for the design rationale.
+/// historical headers — Phase 3 wallet proofs carry header chains from a
+/// pinned checkpoint (see `docs/wallet-verification.md`), not claim-note
+/// attachments. See `+$anchored-chain` in `hoon/app/app.hoon`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorView {
     pub tip_digest: Vec<u8>,

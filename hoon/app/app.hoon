@@ -152,10 +152,9 @@
 ::  trimmed to the minimum a zkRollup-style design needs.
 ::
 ::  We store ONLY the current follower-anchored tip. Per-claim chain
-::  linkage is proved by the gate against headers carried in the
-::  claim-note's `ClaimChainBundle.header_chain_jam` (Phase 2d) — the
-::  kernel is not a Nockchain-replica and does not cache the
-::  canonical chain.
+::  linkage for proofs is wallet-side from a pinned checkpoint (Path Y4),
+::  not extra note-data on claims — the hull re-fetches txs/blocks from RPC.
+::  The kernel is not a Nockchain-replica and does not cache the full chain.
 ::
 ::  Analog: Optimism stores a state root on L1, not L1's headers. The
 ::  wallet independently trusts Nockchain (for UTXOs anyway); all we

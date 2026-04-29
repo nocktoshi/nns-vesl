@@ -33,6 +33,7 @@ pub mod claim_note;
 pub mod freshness;
 pub mod kernel;
 pub mod payment;
+mod packed_blob;
 pub mod state;
 pub mod types;
 pub mod wallet_y4;
