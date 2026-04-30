@@ -646,16 +646,30 @@
       ?.  =(height.c +(last-proved-height.state))
         :_  state
         ~[[%scan-block-error 'height-not-successor']]
-      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
-      =/  pag=nns-page-summary:np  [page-digest.c tx-set]
-      =/  new-acc=nns-accumulator:na
-        (claim-scanner:np accumulator.state pag height.c candidates.c)
-      =/  acc-root=@  (root-atom:na new-acc)
-      =.  accumulator.state  new-acc
+      ::  Claim-scanner + Tip5 root walk z-maps/z-sets (zoon). On pathological
+      ::  inputs or VM limits, that stack can bail — without `mule`, nockapp
+      ::  returns **no effects** and the hull only sees “empty effects”.
+      ::
+      =/  scan-run
+        %-  mule
+        |.
+        =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
+        =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+        =/  new-acc=nns-accumulator:na
+          (claim-scanner:np accumulator.state pag height.c candidates.c)
+        =/  acc-root=@  (root-atom:na new-acc)
+        [new-acc acc-root]
+      ?.  ?=(%& -.scan-run)
+        ::  Trap tang is `+.scan-run`; hull sees `%scan-block-error` below.
+        ~>  %slog.[2 'nns: %scan-block evaluation trapped (see claim-scanner-bail)']
+        :_  state
+        ~[[%scan-block-error 'claim-scanner-bail']]
+      =/  pr  p.scan-run
+      =.  accumulator.state  -.pr
       =.  last-proved-height.state  height.c
-      =.  last-proved-digest.state  digest.pag
+      =.  last-proved-digest.state  page-digest.c
       :_  state
-      ~[[%scan-block-done height.c digest.pag acc-root]]
+      ~[[%scan-block-done height.c page-digest.c +.pr]]
       ::
         ::  Sanity-check arm: prove `[42 [0 1]]` then verify. Emits
         ::  [%prove-identity-result ok=?] so the test can confirm the
