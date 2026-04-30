@@ -262,6 +262,7 @@ async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
             "last_error_at_epoch_ms":          follower.last_error_at_epoch_ms,
             "finality_depth":                  crate::chain_follower::DEFAULT_FINALITY_DEPTH,
             "max_advance_batch":               crate::chain_follower::DEFAULT_MAX_ADVANCE_BATCH,
+            "scan_batch_blocks_default":       crate::chain_follower::DEFAULT_SCAN_BATCH_BLOCKS,
         }),
     }))
 }

@@ -7,8 +7,8 @@ use nockchain_client_rs::{NoteData, NoteDataEntry};
 use tokio::task::JoinHandle;
 
 use crate::chain::{
-    base58_hash_to_atom_bytes, fetch_block_details_by_height, fetch_block_transaction_details,
-    fetch_current_tip_height, tx_ids_from_block_details,
+    base58_hash_to_atom_bytes, fetch_current_tip_height, prefetch_scan_blocks_for_heights,
+    validate_scan_block_chain,
 };
 use crate::claim_note::ClaimNoteV1;
 use crate::kernel::{
@@ -76,20 +76,35 @@ const FOLLOWER_POLL: Duration = Duration::from_secs(2);
 pub const DEFAULT_FINALITY_DEPTH: u64 = 10;
 
 /// Transitional compatibility for status/admin JSON while the API is renamed
-/// from "anchor advance" to "block scan". Path Y scans one block per tick.
+/// from "anchor advance" to "block scan".
 pub const DEFAULT_MAX_ADVANCE_BATCH: u64 = 1;
 
-/// Spawn the Path Y block scanner. It advances the kernel one finalized
-/// Nockchain block at a time with `%scan-block`.
+/// How many consecutive finalized blocks to prefetch and `%scan-block` apply
+/// per idle tick when catching up. Override with `NNS_FOLLOWER_BATCH_BLOCKS`.
+pub const DEFAULT_SCAN_BATCH_BLOCKS: u64 = 16;
+
+fn follower_scan_batch_blocks() -> u64 {
+    match std::env::var("NNS_FOLLOWER_BATCH_BLOCKS") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => DEFAULT_SCAN_BATCH_BLOCKS,
+        },
+        Err(_) => DEFAULT_SCAN_BATCH_BLOCKS,
+    }
+}
+
+/// Spawn the Path Y block scanner. It advances the kernel with `%scan-block`,
+/// prefetching a batch of blocks in parallel when behind finality.
 pub fn spawn(state: SharedState) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let idle = match scan_once(&state).await {
                 Ok(Some(scanned)) => {
                     tracing::info!(
-                        height = scanned.height,
+                        height_end = scanned.height,
+                        blocks = scanned.blocks_applied,
                         phase = "scan_block",
-                        "chain follower scanned block"
+                        "chain follower scanned blocks"
                     );
                     false
                 }
@@ -123,12 +138,14 @@ pub async fn process_once(state: &SharedState) -> Result<(), String> {
     scan_once(state).await.map(|_| ())
 }
 
-/// Outcome of one block-scan pass.
+/// Outcome of one block-scan pass (last block in the batch).
 #[derive(Debug, Clone)]
 pub struct ScanBlockOutcome {
     pub height: u64,
     pub digest: Vec<u8>,
     pub accumulator_root: Vec<u8>,
+    /// Finalized blocks applied this tick (`1` when only one `%scan-block` ran).
+    pub blocks_applied: u64,
 }
 
 /// Backwards-compatible shape used by the existing admin handler.
@@ -147,7 +164,7 @@ pub async fn advance_anchor_once(
     Ok(scan_once(state).await?.map(|out| AnchorAdvanceOutcome {
         tip_height: out.height,
         tip_digest: out.digest,
-        count: 1,
+        count: out.blocks_applied,
     }))
 }
 
@@ -220,123 +237,128 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
         return Ok(None);
     }
 
-    let details = fetch_block_details_by_height(&endpoint, next_height).await?;
-    let page_digest = details
-        .block_id
-        .as_ref()
-        .ok_or_else(|| format!("block {next_height} missing block_id"))?;
-    let parent = details
-        .parent
-        .as_ref()
-        .ok_or_else(|| format!("block {next_height} missing parent"))?;
-    let page_digest = crate::chain::hash_to_atom_bytes(page_digest);
-    let parent = crate::chain::hash_to_atom_bytes(parent);
-    let page_tx_ids = tx_ids_from_block_details(&details)?;
-    let tx_details = fetch_block_transaction_details(&endpoint, &details).await?;
-    let candidates = extract_claim_candidates(&tx_details)?;
+    let batch_max = follower_scan_batch_blocks();
+    let batch_end = next_height
+        .saturating_add(batch_max.saturating_sub(1))
+        .min(finalized_height);
+    let heights: Vec<u64> = (next_height..=batch_end).collect();
 
-    if details.height != next_height {
-        tracing::warn!(
-            details_height = details.height,
-            next_height,
-            "chain_follower: RPC block height differs from expected next scan height"
+    let prefetched = prefetch_scan_blocks_for_heights(&endpoint, &heights).await?;
+    validate_scan_block_chain(scan_state.last_proved_digest.as_slice(), &prefetched)?;
+
+    let batch_lo = prefetched
+        .first()
+        .map(|b| b.height)
+        .unwrap_or(next_height);
+    let blocks_applied = prefetched.len() as u64;
+
+    let mut last_done = None;
+
+    for block in &prefetched {
+        let candidates = extract_claim_candidates(&block.tx_details)?;
+
+        tracing::debug!(
+            chain_tip = current_chain_tip,
+            finalized_height,
+            batch_lo,
+            batch_end,
+            height = block.height,
+            parent = %atom_hex_preview(&block.parent, 16),
+            page_digest = %atom_hex_preview(&block.page_digest, 16),
+            page_tx_count = block.page_tx_ids.len(),
+            page_tx_ids_preview = %format_tx_id_previews(&block.page_tx_ids, 8),
+            claim_candidates_count = candidates.len(),
+            claim_candidates = %format_candidates_for_log(&candidates),
+            "chain_follower: %scan-block poke payload (Tip5 atoms are LE 40B; compare with kernel last_proved_digest)"
         );
-    }
 
-    let parent_links_cursor = parent.as_slice() == scan_state.last_proved_digest.as_slice();
-    tracing::debug!(
-        chain_tip = current_chain_tip,
-        finalized_height,
-        next_height,
-        details_height = details.height,
-        parent = %atom_hex_preview(&parent, 16),
-        page_digest = %atom_hex_preview(&page_digest, 16),
-        parent_links_last_proved = parent_links_cursor,
-        page_tx_count = page_tx_ids.len(),
-        page_tx_ids_preview = %format_tx_id_previews(&page_tx_ids, 8),
-        claim_candidates_count = candidates.len(),
-        claim_candidates = %format_candidates_for_log(&candidates),
-        "chain_follower: %scan-block poke payload (Tip5 atoms are LE 40B; compare with kernel last_proved_digest)"
-    );
-
-    let poke_result = {
-        let mut k = state.kernel.lock().await;
-        k.poke(
-            SystemWire.to_wire(),
-            build_scan_block_poke(
-                &parent,
-                next_height,
-                &page_digest,
-                &page_tx_ids,
-                &candidates,
-            ),
-        )
-        .await
-    };
-
-    let effects = poke_result.map_err(|e| {
-        let msg = format!("scan-block poke failed: {e:?}");
-        let ts = crate::state::AppState::now_epoch_ms();
-        if let Ok(mut h) = state.hull.try_lock() {
-            h.follower.record_error("scan_poke", msg.clone(), ts);
-        }
-        msg
-    })?;
-
-    if let Some(err) = first_scan_block_error(&effects) {
-        let msg = format!("kernel rejected %scan-block: {err}");
-        let ts = crate::state::AppState::now_epoch_ms();
-        let mut h = state.hull.lock().await;
-        h.follower.record_error("scan_poke", msg.clone(), ts);
-        return Err(msg);
-    }
-    if let Some(err) = first_error_message(&effects) {
-        let msg = format!("kernel rejected %scan-block: {err}");
-        let ts = crate::state::AppState::now_epoch_ms();
-        let mut h = state.hull.lock().await;
-        h.follower.record_error("scan_poke", msg.clone(), ts);
-        return Err(msg);
-    }
-    let Some(done) = first_scan_block_done(&effects) else {
-        let tags = format_effect_tags(&effects);
-        let msg = if has_effect(&effects, "invalid-cause") {
-            "%invalid-cause from kernel — `(soft cause)` failed (mold mismatch). \
-             Rebuild out.jam from current hoon/app/app.hoon so `+$cause` includes `%scan-block`, \
-             point NNS_KERNEL_JAM at it, redeploy."
-                .to_string()
-        } else if effects.is_empty() {
-            "kernel did not emit %scan-block-done (empty effects — wrapper/nockapp returned no effects; \
-             if stderr shows `nns: invalid cause`, rebuild out.jam; otherwise check nockapp poke wiring)"
-                .to_string()
-        } else {
-            format!(
-                "kernel did not emit %scan-block-done (effect tags: {tags}; check kernel JAM vs hull or scan-block-done noun shape)"
+        let poke_result = {
+            let mut k = state.kernel.lock().await;
+            k.poke(
+                SystemWire.to_wire(),
+                build_scan_block_poke(
+                    &block.parent,
+                    block.height,
+                    &block.page_digest,
+                    &block.page_tx_ids,
+                    &candidates,
+                ),
             )
+            .await
         };
-        let ts = crate::state::AppState::now_epoch_ms();
-        let mut h = state.hull.lock().await;
-        h.follower.record_error("scan_poke", msg.clone(), ts);
-        return Err(msg);
+
+        let effects = poke_result.map_err(|e| {
+            let msg = format!("scan-block poke failed: {e:?}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            if let Ok(mut h) = state.hull.try_lock() {
+                h.follower.record_error("scan_poke", msg.clone(), ts);
+            }
+            msg
+        })?;
+
+        if let Some(err) = first_scan_block_error(&effects) {
+            let msg = format!("kernel rejected %scan-block: {err}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            let mut h = state.hull.lock().await;
+            h.follower.record_error("scan_poke", msg.clone(), ts);
+            return Err(msg);
+        }
+        if let Some(err) = first_error_message(&effects) {
+            let msg = format!("kernel rejected %scan-block: {err}");
+            let ts = crate::state::AppState::now_epoch_ms();
+            let mut h = state.hull.lock().await;
+            h.follower.record_error("scan_poke", msg.clone(), ts);
+            return Err(msg);
+        }
+        let Some(done) = first_scan_block_done(&effects) else {
+            let tags = format_effect_tags(&effects);
+            let msg = if has_effect(&effects, "invalid-cause") {
+                "%invalid-cause from kernel — `(soft cause)` failed (mold mismatch). \
+                 Rebuild out.jam from current hoon/app/app.hoon so `+$cause` includes `%scan-block`, \
+                 point NNS_KERNEL_JAM at it, redeploy."
+                    .to_string()
+            } else if effects.is_empty() {
+                "kernel did not emit %scan-block-done (empty effects — wrapper/nockapp returned no effects; \
+                 if stderr shows `nns: invalid cause`, rebuild out.jam; otherwise check nockapp poke wiring)"
+                    .to_string()
+            } else {
+                format!(
+                    "kernel did not emit %scan-block-done (effect tags: {tags}; check kernel JAM vs hull or scan-block-done noun shape)"
+                )
+            };
+            let ts = crate::state::AppState::now_epoch_ms();
+            let mut h = state.hull.lock().await;
+            h.follower.record_error("scan_poke", msg.clone(), ts);
+            return Err(msg);
+        };
+
+        state.maybe_persist_after_follower_scan().await;
+
+        tracing::debug!(
+            height = done.height,
+            block_digest = %atom_hex_preview(&done.digest, 16),
+            accumulator_root = %atom_hex_preview(&done.accumulator_root, 16),
+            "chain_follower: %scan-block-done"
+        );
+
+        last_done = Some(done);
+    }
+
+    let Some(done) = last_done else {
+        return Err("prefetch produced no blocks (internal error)".into());
     };
 
     let now = crate::state::AppState::now_epoch_ms();
     {
         let mut h = state.hull.lock().await;
-        h.follower.record_advance(done.height, 1, now);
+        h.follower.record_advance(done.height, blocks_applied, now);
     }
-    state.maybe_persist_after_follower_scan().await;
-
-    tracing::debug!(
-        height = done.height,
-        block_digest = %atom_hex_preview(&done.digest, 16),
-        accumulator_root = %atom_hex_preview(&done.accumulator_root, 16),
-        "chain_follower: %scan-block-done"
-    );
 
     Ok(Some(ScanBlockOutcome {
         height: done.height,
         digest: done.digest,
         accumulator_root: done.accumulator_root,
+        blocks_applied,
     }))
 }
 

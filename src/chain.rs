@@ -462,6 +462,115 @@ pub async fn fetch_block_transaction_details(
     Ok(indexed.into_iter().map(|(_, d)| d).collect())
 }
 
+/// RPC bundle for one `%scan-block`: digests, tx-id atom list, and full tx
+/// bodies for claim extraction.
+#[derive(Debug, Clone)]
+pub struct ScanBlockFetch {
+    pub height: u64,
+    pub page_digest: Vec<u8>,
+    pub parent: Vec<u8>,
+    pub page_tx_ids: Vec<Vec<u8>>,
+    pub tx_details: Vec<TransactionDetails>,
+}
+
+/// Fetch everything needed for one `%scan-block` poke at `height`.
+pub async fn fetch_scan_block_inputs(endpoint: &str, height: u64) -> Result<ScanBlockFetch, String> {
+    let details = fetch_block_details_by_height(endpoint, height).await?;
+    let dh = details.height;
+    if dh != height {
+        tracing::warn!(
+            details_height = dh,
+            requested = height,
+            "chain: GetBlockDetails height differs from selector"
+        );
+    }
+    let page_digest_atom = details
+        .block_id
+        .as_ref()
+        .ok_or_else(|| format!("block {height} missing block_id"))?;
+    let parent_atom = details
+        .parent
+        .as_ref()
+        .ok_or_else(|| format!("block {height} missing parent"))?;
+    let page_digest = hash_to_atom_bytes(page_digest_atom);
+    let parent = hash_to_atom_bytes(parent_atom);
+    let page_tx_ids = tx_ids_from_block_details(&details)?;
+    let tx_details = fetch_block_transaction_details(endpoint, &details).await?;
+    Ok(ScanBlockFetch {
+        height: dh,
+        page_digest,
+        parent,
+        page_tx_ids,
+        tx_details,
+    })
+}
+
+/// Prefetch several blocks in parallel (bounded concurrency). Returned
+/// slice is sorted by ascending height; callers must still poke `%scan-block`
+/// strictly in order.
+async fn prefetch_scan_blocks_for_heights_inner(
+    endpoint: &str,
+    heights: &[u64],
+    max_concurrent_blocks: usize,
+) -> Result<Vec<ScanBlockFetch>, String> {
+    if heights.is_empty() {
+        return Ok(Vec::new());
+    }
+    let endpoint = endpoint.to_string();
+    let sem = Arc::new(Semaphore::new(max_concurrent_blocks.max(1)));
+    let mut handles = Vec::with_capacity(heights.len());
+    for &h in heights {
+        let ep = endpoint.clone();
+        let permit = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = permit
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("semaphore: {e}"))?;
+            fetch_scan_block_inputs(&ep, h).await
+        }));
+    }
+    let mut out = Vec::with_capacity(handles.len());
+    for j in handles {
+        out.push(
+            j.await
+                .map_err(|e| format!("prefetch scan block task join: {e}"))??,
+        );
+    }
+    out.sort_by_key(|b| b.height);
+    Ok(out)
+}
+
+/// Parallel prefetch for follower catch-up ([`crate::chain_follower`]).
+///
+/// Uses at most [`SCAN_BLOCK_PREFETCH_CONCURRENCY`] concurrent block pulls;
+/// each block still fans out to parallel tx-detail RPCs internally.
+pub async fn prefetch_scan_blocks_for_heights(
+    endpoint: &str,
+    heights: &[u64],
+) -> Result<Vec<ScanBlockFetch>, String> {
+    prefetch_scan_blocks_for_heights_inner(endpoint, heights, SCAN_BLOCK_PREFETCH_CONCURRENCY).await
+}
+
+/// Max concurrent `GetBlockDetails`+tx pulls while prefetching a batch.
+pub const SCAN_BLOCK_PREFETCH_CONCURRENCY: usize = 16;
+
+/// Verify prefetched headers link: first parent matches `expected_parent`,
+/// then each block's parent equals the previous block digest.
+pub fn validate_scan_block_chain(expected_parent: &[u8], blocks: &[ScanBlockFetch]) -> Result<(), String> {
+    let mut exp = expected_parent.to_vec();
+    for b in blocks {
+        if b.parent.as_slice() != exp.as_slice() {
+            return Err(format!(
+                "prefetched scan batch parent mismatch at height {} (RPC skew or fork)",
+                b.height
+            ));
+        }
+        exp.clone_from(&b.page_digest);
+    }
+    Ok(())
+}
+
 /// Composite fetch: given a confirmed tx id, return its containing
 /// block's `BlockDetails` plus that block's PoW proof bytes (if any).
 /// This is the per-claim bundle Phase 4's follower will embed into the
