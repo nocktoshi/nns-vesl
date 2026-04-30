@@ -129,7 +129,7 @@ impl AppState {
     /// After a successful chain-follower `%scan-block`, maybe write a
     /// checkpoint. Full `save_blocking` of the NockApp state is large
     /// (~tens of MB) and was dominating per-block latency; by default we
-    /// only flush every `NNS_FOLLOWER_PERSIST_EVERY` blocks (default 20).
+    /// only flush every `NNS_FOLLOWER_PERSIST_EVERY` blocks (default 1000).
     /// Set the env var to `1` to checkpoint every block (safest, slowest).
     /// Shutdown in `main` still calls [`Self::persist_all`], so the last
     /// few in-memory blocks are flushed on SIGINT/SIGTERM.
@@ -165,9 +165,9 @@ fn follower_persist_stride_blocks() -> u64 {
     match std::env::var("NNS_FOLLOWER_PERSIST_EVERY") {
         Ok(s) => match s.parse::<u64>() {
             Ok(n) if n >= 1 => n,
-            _ => 50,
+            _ => 1000,
         },
-        Err(_) => 50,
+        Err(_) => 1000,
     }
 }
 
