@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::claim_note::ClaimNoteV1;
@@ -13,6 +14,7 @@ use nockapp_grpc::pb::public::v2::{
 };
 use nockchain_client_rs::{ChainClient, ChainConfig};
 use nockchain_types::tx_engine::common::Hash as DomainHash;
+use tokio::sync::Semaphore;
 
 /// Best-effort chain acceptance check for a base58 tx id.
 pub async fn transaction_is_accepted(
@@ -327,12 +329,12 @@ enum TxDetailsOutcome {
     Pending,
 }
 
-/// One `get_transaction_details` round-trip (no retry).
-async fn fetch_transaction_details_outcome(
-    endpoint: &str,
+/// One `get_transaction_details` round-trip (no retry). Reuses an existing
+/// client so block scans do not open a new gRPC connection per tx.
+async fn fetch_transaction_details_outcome_client(
+    client: &mut NockchainBlockServiceClient<tonic::transport::Channel>,
     tx_id_base58: &str,
 ) -> Result<TxDetailsOutcome, String> {
-    let mut client = connect_block_service(endpoint).await?;
     let req = GetTransactionDetailsRequest {
         tx_id: Some(Base58Hash {
             hash: tx_id_base58.to_string(),
@@ -354,6 +356,15 @@ async fn fetch_transaction_details_outcome(
             "empty transaction details response for {tx_id_base58}"
         )),
     }
+}
+
+/// One `get_transaction_details` round-trip (no retry), with a fresh connection.
+async fn fetch_transaction_details_outcome(
+    endpoint: &str,
+    tx_id_base58: &str,
+) -> Result<TxDetailsOutcome, String> {
+    let mut client = connect_block_service(endpoint).await?;
+    fetch_transaction_details_outcome_client(&mut client, tx_id_base58).await
 }
 
 /// Transaction-level structured details from the node. Phase 3 will
@@ -380,6 +391,11 @@ pub async fn fetch_transaction_details(
 /// Retries when the node returns `Pending` for a tx-id that already appears
 /// in `block.tx_ids` — common transient lag between block headers and the
 /// transaction index on busy nodes.
+///
+/// **Concurrency:** one gRPC client is shared (cloned per in-flight tx).
+/// Fetches run in parallel up to [`MAX_CONCURRENT_TX_FETCHES`] so wide blocks
+/// are not serialized one RPC at a time (the dominant follower cost when
+/// `%scan-block` does not run the STARK prover).
 pub async fn fetch_block_transaction_details(
     endpoint: &str,
     block: &BlockDetails,
@@ -388,44 +404,62 @@ pub async fn fetch_block_transaction_details(
     const MAX_ATTEMPTS: u32 = 24;
     const INITIAL_DELAY_MS: u64 = 80;
     const MAX_DELAY_MS: u64 = 1_500;
+    const MAX_CONCURRENT_TX_FETCHES: usize = 32;
 
-    let mut out = Vec::with_capacity(block.tx_ids.len());
-    for tx_id in &block.tx_ids {
-        let hash = &tx_id.hash;
-        let mut delay_ms = INITIAL_DELAY_MS;
-        let mut details = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match fetch_transaction_details_outcome(endpoint, hash).await? {
-                TxDetailsOutcome::Ready(d) => {
-                    details = Some(d);
-                    break;
-                }
-                TxDetailsOutcome::Pending => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(format!(
-                            "tx {hash} still Pending after {MAX_ATTEMPTS} get_transaction_details attempts; \
-                             node tx index lags block header or tx left mempool — retry later"
-                        ));
+    if block.tx_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let root_client = connect_block_service(endpoint).await?;
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_TX_FETCHES));
+    let mut handles = Vec::with_capacity(block.tx_ids.len());
+
+    for (idx, tx_id) in block.tx_ids.iter().enumerate() {
+        let hash = tx_id.hash.clone();
+        let mut c = root_client.clone();
+        let permit = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("semaphore closed: {e}"))?;
+            let mut delay_ms = INITIAL_DELAY_MS;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match fetch_transaction_details_outcome_client(&mut c, &hash).await? {
+                    TxDetailsOutcome::Ready(d) => return Ok((idx, d)),
+                    TxDetailsOutcome::Pending => {
+                        if attempt >= MAX_ATTEMPTS {
+                            return Err(format!(
+                                "tx {hash} still Pending after {MAX_ATTEMPTS} get_transaction_details attempts; \
+                                 node tx index lags block header or tx left mempool — retry later"
+                            ));
+                        }
+                        tracing::debug!(
+                            tx_id = %hash,
+                            attempt,
+                            delay_ms,
+                            "chain: transaction details Pending while scanning block; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms.saturating_mul(3) / 2).min(MAX_DELAY_MS);
                     }
-                    tracing::debug!(
-                        tx_id = %hash,
-                        attempt,
-                        delay_ms,
-                        "chain: transaction details Pending while scanning block; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    delay_ms = (delay_ms.saturating_mul(3) / 2).min(MAX_DELAY_MS);
                 }
             }
-        }
-        let Some(d) = details else {
-            return Err(format!(
+            Err(format!(
                 "internal error: missing transaction details for {hash} after retries"
-            ));
-        };
-        out.push(d);
+            ))
+        }));
     }
-    Ok(out)
+
+    let mut indexed: Vec<(usize, TransactionDetails)> = Vec::with_capacity(handles.len());
+    for h in handles {
+        indexed.push(
+            h.await
+                .map_err(|e| format!("transaction-details fetch task join: {e}"))??,
+        );
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    Ok(indexed.into_iter().map(|(_, d)| d).collect())
 }
 
 /// Composite fetch: given a confirmed tx id, return its containing
