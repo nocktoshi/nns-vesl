@@ -103,18 +103,14 @@ async fn status_exposes_scan_state_and_follower() {
 }
 
 #[tokio::test]
-async fn accumulator_lookup_returns_absent_value_for_unknown_name() {
+async fn accumulator_lookup_404_for_unregistered_name() {
     let (_tmp, state) = setup().await;
     let router = api::router(state);
 
     let (status, body) = request_json(router, "GET", "/accumulator/alice.nock", None).await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["name"], "alice.nock");
-    assert!(body.get("value").is_none());
-    assert!(body.get("proof_axis").is_none());
-    assert_eq!(body["last_proved_height"], 0);
-    assert_eq!(body["accumulator_size"], 0);
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "not registered");
 }
 
 #[tokio::test]
@@ -129,7 +125,7 @@ async fn accumulator_lookup_rejects_invalid_name() {
 }
 
 #[tokio::test]
-async fn accumulator_wallet_export_includes_snapshot_hex() {
+async fn accumulator_wallet_export_404_when_unregistered() {
     let (_tmp, state) = setup().await;
     let router = api::router(state);
     let (status, body) = request_json(
@@ -139,9 +135,6 @@ async fn accumulator_wallet_export_includes_snapshot_hex() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    let snap = body["accumulator_snapshot_hex"]
-        .as_str()
-        .expect("accumulator_snapshot_hex");
-    assert!(!snap.is_empty());
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "not registered");
 }

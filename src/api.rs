@@ -8,7 +8,8 @@
 //!
 //!   GET /health
 //!   GET /status
-//!   GET /accumulator/:name (`?wallet_export=true` adds `accumulator_snapshot_hex`)
+//!   GET /accumulator/:name — registered names only (`404` if absent);
+//!     `?wallet_export=true` adds `accumulator_snapshot_hex`
 //!
 //! CORS is open (`*`) to match legacy behavior.
 
@@ -83,6 +84,13 @@ fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+fn not_found(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody { error: msg.into() }),
+    )
+}
+
 fn server_error(msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -140,16 +148,21 @@ async fn accumulator_handler(
         return Err(bad_request("invalid name"));
     }
 
-    let (entry, proof_axis, scan_state, accumulator_snapshot_hex) = {
-        let mut k = state.kernel.lock().await;
-        let entry = k
-            .peek(build_accumulator_peek(&name))
-            .await
-            .map_err(|e| server_error(format!("kernel accumulator peek failed: {e:?}")))
-            .and_then(|slab| {
-                decode_accumulator_entry(&slab)
-                    .map_err(|e| server_error(format!("decode accumulator failed: {e}")))
-            })?;
+    let mut k = state.kernel.lock().await;
+    let entry = k
+        .peek(build_accumulator_peek(&name))
+        .await
+        .map_err(|e| server_error(format!("kernel accumulator peek failed: {e:?}")))
+        .and_then(|slab| {
+            decode_accumulator_entry(&slab)
+                .map_err(|e| server_error(format!("decode accumulator failed: {e}")))
+        })?;
+
+    let Some(entry) = entry else {
+        return Err(not_found("not registered"));
+    };
+
+    let (proof_axis, scan_state, accumulator_snapshot_hex) = {
         let proof_axis = k
             .peek(build_accumulator_proof_peek(&name))
             .await
@@ -179,14 +192,15 @@ async fn accumulator_handler(
         } else {
             None
         };
-        (entry, proof_axis, scan_state, snap)
+        (proof_axis, scan_state, snap)
     };
+    drop(k);
 
-    let value = entry.map(|e| AccumulatorValueResponse {
-        owner: e.owner,
-        tx_hash: hex_encode(&e.tx_hash),
-        claim_height: e.claim_height,
-        block_digest: hex_encode(&e.block_digest),
+    let value = Some(AccumulatorValueResponse {
+        owner: entry.owner,
+        tx_hash: hex_encode(&entry.tx_hash),
+        claim_height: entry.claim_height,
+        block_digest: hex_encode(&entry.block_digest),
     });
 
     Ok(Json(AccumulatorLookupResponse {
