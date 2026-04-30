@@ -33,7 +33,7 @@ install-wrappers:
 	chmod 755 "$(DESTDIR)$(WRAPPER)"
 	ln -sf "nns" "$(DESTDIR)$(ALT_WRAPPER)"
 	@touch "$(SHELL_RC)"
-	@rg -qxF '$(PATH_LINE)' "$(SHELL_RC)" || printf '\n%s\n' '$(PATH_LINE)' >> "$(SHELL_RC)"
+	@grep -qxF '$(PATH_LINE)' "$(SHELL_RC)" 2>/dev/null || printf '\n%s\n' '$(PATH_LINE)' >> "$(SHELL_RC)"
 	@hash -r 2>/dev/null || true
 	@printf '\nInstalled nns-vesl CLI:\n'
 	@printf '  %s\n' "$(DESTDIR)$(WRAPPER)"
