@@ -68,7 +68,7 @@ fn format_candidates_for_log(candidates: &[ClaimCandidate]) -> String {
 /// Sleep between ticks **only** when there is nothing to scan (caught up
 /// within finality) or after an error — avoids gRPC busy-loops. While a
 /// finalized backlog exists, consecutive `%scan-block` steps run back-to-back.
-const FOLLOWER_POLL: Duration = Duration::from_secs(2);
+const FOLLOWER_POLL: Duration = Duration::from_secs(10);
 
 /// How far behind the chain tip the follower waits before committing a
 /// block to the kernel scan cursor. Keeps Path Y scans free of short
@@ -81,7 +81,7 @@ pub const DEFAULT_MAX_ADVANCE_BATCH: u64 = 1;
 
 /// How many consecutive finalized blocks to prefetch and `%scan-block` apply
 /// per idle tick when catching up. Override with `NNS_FOLLOWER_BATCH_BLOCKS`.
-pub const DEFAULT_SCAN_BATCH_BLOCKS: u64 = 16;
+pub const DEFAULT_SCAN_BATCH_BLOCKS: u64 = 32;
 
 fn follower_scan_batch_blocks() -> u64 {
     match std::env::var("NNS_FOLLOWER_BATCH_BLOCKS") {
