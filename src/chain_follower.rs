@@ -324,7 +324,7 @@ pub async fn scan_once(state: &SharedState) -> Result<Option<ScanBlockOutcome>, 
         let mut h = state.hull.lock().await;
         h.follower.record_advance(done.height, 1, now);
     }
-    state.persist_all().await;
+    state.maybe_persist_after_follower_scan().await;
 
     tracing::debug!(
         height = done.height,

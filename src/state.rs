@@ -5,6 +5,7 @@
 //! `NockApp`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nockapp::NockApp;
@@ -84,6 +85,9 @@ impl FollowerObservability {
 pub struct AppState {
     pub kernel: Mutex<NockApp>,
     pub hull: Mutex<HullState>,
+    /// Count of successful follower `%scan-block` steps since the last
+    /// on-disk kernel checkpoint (used to batch `save_blocking`).
+    follower_scans_since_checkpoint: AtomicU64,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -97,6 +101,7 @@ impl AppState {
                 settlement,
                 follower: FollowerObservability::default(),
             }),
+            follower_scans_since_checkpoint: AtomicU64::new(0),
         }
     }
 
@@ -119,6 +124,50 @@ impl AppState {
         if let Err(e) = self.kernel.lock().await.save_blocking().await {
             tracing::error!("failed to save kernel checkpoint: {e:?}");
         }
+    }
+
+    /// After a successful chain-follower `%scan-block`, maybe write a
+    /// checkpoint. Full `save_blocking` of the NockApp state is large
+    /// (~tens of MB) and was dominating per-block latency; by default we
+    /// only flush every `NNS_FOLLOWER_PERSIST_EVERY` blocks (default 20).
+    /// Set the env var to `1` to checkpoint every block (safest, slowest).
+    /// Shutdown in `main` still calls [`Self::persist_all`], so the last
+    /// few in-memory blocks are flushed on SIGINT/SIGTERM.
+    pub async fn maybe_persist_after_follower_scan(&self) {
+        let stride = follower_persist_stride_blocks();
+        let prev = self
+            .follower_scans_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed);
+        let n = prev + 1;
+        if stride > 1 && n < stride {
+            tracing::trace!(
+                n,
+                stride,
+                "follower: skipping kernel checkpoint this block (batched persist)"
+            );
+            return;
+        }
+        match self.kernel.lock().await.save_blocking().await {
+            Ok(()) => {
+                self.follower_scans_since_checkpoint
+                    .store(0, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::error!("failed to save kernel checkpoint: {e:?}");
+            }
+        }
+    }
+}
+
+/// Blocks between on-disk kernel checkpoints during follower catch-up.
+/// `1` = same as checkpointing every block (legacy behaviour).
+fn follower_persist_stride_blocks() -> u64 {
+    match std::env::var("NNS_FOLLOWER_PERSIST_EVERY") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(n) if n >= 1 => n,
+            _ => 50,
+        },
+        Err(_) => 50,
     }
 }
 

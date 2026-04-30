@@ -8,15 +8,26 @@ KERNEL := $(LIBDIR)/out.jam
 SHELL_RC ?= $(HOME)/.zshrc
 PATH_LINE := export PATH="$$HOME/.local/bin:$$PATH"
 
-.PHONY: install uninstall
+.PHONY: install install-rust uninstall kernel-jam install-bin-lib install-wrappers
 
-install:
+# Full install: compile Hoon kernel (out.jam) then Rust release binary + wrappers.
+install: kernel-jam install-bin-lib install-wrappers
+
+# Rust only: skip setup-hoon-tree + hoonc. Uses existing ./out.jam (run `make kernel-jam`
+# or full `make install` when the kernel changes).
+install-rust: install-bin-lib install-wrappers
+
+kernel-jam:
 	bash scripts/setup-hoon-tree.sh
 	hoonc --new hoon/app/app.hoon hoon/
+	install -m 644 "out.jam" "$(DESTDIR)$(KERNEL)"
+
+install-bin-lib:
 	cargo +nightly build --release
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)"
 	install -m 755 "target/release/nns-vesl" "$(DESTDIR)$(BIN)"
-	install -m 644 "out.jam" "$(DESTDIR)$(KERNEL)"
+
+install-wrappers:
 	printf '#!/usr/bin/env sh\nexport NNS_KERNEL_JAM=%s/out.jam\nexec %s/nns-vesl "$$@"\n' \
 	  "$(LIBDIR)" "$(LIBDIR)" > "$(DESTDIR)$(WRAPPER)"
 	chmod 755 "$(DESTDIR)$(WRAPPER)"

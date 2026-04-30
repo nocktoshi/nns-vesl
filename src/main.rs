@@ -84,13 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // periodic save tick and save-on-exit paths never fire. We
     // compensate in two places:
     //
-    //   1. Every handler that pokes calls `AppState::persist_all`
-    //      to force a kernel checkpoint + mirror write inline.
-    //   2. Here — race `api::serve` against SIGINT/SIGTERM and
-    //      flush once more on shutdown. This covers the case where
-    //      a save between handlers raced with the signal, and
-    //      guarantees the on-disk state matches the last committed
-    //      poke even if the signal lands mid-millisecond.
+    //   1. HTTP handlers that poke call `AppState::persist_all` inline.
+    //      The chain follower uses `maybe_persist_after_follower_scan`
+    //      instead (batched full checkpoints — see `NNS_FOLLOWER_PERSIST_EVERY`).
+    //   2. Here — race `api::serve` against SIGINT/SIGTERM and flush
+    //      once more on shutdown so any follower batches since the last
+    //      checkpoint are written before exit.
     //
     // Errors from the final flush are logged but swallowed: the
     // signal already committed us to exiting, and any prior
