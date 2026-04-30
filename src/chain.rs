@@ -553,7 +553,7 @@ pub async fn prefetch_scan_blocks_for_heights(
 }
 
 /// Max concurrent `GetBlockDetails`+tx pulls while prefetching a batch.
-pub const SCAN_BLOCK_PREFETCH_CONCURRENCY: usize = 16;
+pub const SCAN_BLOCK_PREFETCH_CONCURRENCY: usize = 32;
 
 /// Verify prefetched headers link: first parent matches `expected_parent`,
 /// then each block's parent equals the previous block digest.
