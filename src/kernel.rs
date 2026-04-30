@@ -476,14 +476,11 @@ pub fn first_chain_link_result(effects: &[NounSlab]) -> Option<bool> {
 }
 
 /// Build a `[%verify-tx-in-page digest=@ux tx-ids=(list @ux) claimed-tx-id=@ux]`
-/// poke slab. Read-only — the kernel builds the canonical
-/// `(z-set @ux)` via `z-silt` (so `gor-tip` ordering is correct),
-/// then runs `has-tx-in-page:nns-predicates` and emits
-/// `[%tx-in-page-result ok=?]` without mutating state.
+/// poke slab. Read-only — the kernel runs `has-tx-in-page` (list scan)
+/// and emits `[%tx-in-page-result ok=?]` without mutating state.
 ///
 /// `page_digest` is the 40-byte LE-packed Tip5 block digest.
-/// `tx_ids` is the flat list of 40-byte Tip5 tx-ids the block
-/// included; order doesn't matter (kernel canonicalises).
+/// `tx_ids` is the flat list of 40-byte Tip5 tx-ids the block included.
 /// `claimed_tx_id` is the tx-id we're checking membership for.
 pub fn build_verify_tx_in_page_poke(
     page_digest: &[u8],

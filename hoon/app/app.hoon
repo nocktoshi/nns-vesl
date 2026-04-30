@@ -246,14 +246,10 @@
       [%verify-chain-link claim-digest=@ux headers=(list anchor-header) anchored-tip=@ux]
       ::  Phase 3 Level B: drive `has-tx-in-page:nns-predicates`.
       ::  Read-only; emits `[%tx-in-page-result ok=?]` iff
-      ::  `claimed-tx-id ∈ page.tx-ids`. Takes a flat list of tx-ids
-      ::  so the kernel can build the canonical `(z-set @ux)` via
-      ::  `z-silt` — z-in's `has` uses `gor-tip` (Tip5) ordering for
-      ::  BST descent, so the caller cannot hand us a tree directly.
-      ::  The page summary is hull-provided today (Phase 2c
-      ::  `fetch_page_for_tx`); Level C will recompute its
-      ::  block-commitment from the full page noun so the hull can't
-      ::  lie about `tx-ids`.
+      ::  `claimed-tx-id` appears in the flat `tx-ids` list (linear
+      ::  scan — no `z-silt`). The page summary is hull-provided
+      ::  (Phase 2c `fetch_page_for_tx`); Level C will recompute the
+      ::  block-commitment from the full page noun.
       ::
       [%verify-tx-in-page digest=@ux tx-ids=(list @ux) claimed-tx-id=@ux]
       ::  Phase 3c: compose all Level A + Level B + G1/C2 predicates
@@ -264,9 +260,8 @@
       ::  early rejection + structured error tag before committing a
       ::  claim that would only be rejected during chain replay.
       ::
-      ::  `tx-ids` is a flat list (kernel canonicalises into a
-      ::  `(z-set @ux)` via `z-silt` — see `%verify-tx-in-page` for
-      ::  why the caller can't ship a tree directly).
+      ::  `page-tx-ids` is a flat list; inclusion is a list walk in
+      ::  `+has-tx-in-page:np` (same as `%verify-tx-in-page`).
       ::
       $:  %validate-claim
           name=@t
@@ -646,15 +641,14 @@
       ?.  =(height.c +(last-proved-height.state))
         :_  state
         ~[[%scan-block-error 'height-not-successor']]
-      ::  Claim-scanner + Tip5 root walk z-maps/z-sets (zoon). On pathological
-      ::  inputs or VM limits, that stack can bail — without `mule`, nockapp
-      ::  returns **no effects** and the hull only sees “empty effects”.
+      ::  Claim-scanner + accumulator Tip5 root. Page summary uses a flat
+      ::  tx-id list (see `has-tx-in-page:np`) — no `z-silt` / `gor-tip`
+      ::  path (jet edge case with 3+ 40-byte atoms in z-sets).
       ::
       =/  scan-run
         %-  mule
         |.
-        =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.c)
-        =/  pag=nns-page-summary:np  [page-digest.c tx-set]
+        =/  pag=nns-page-summary:np  [page-digest.c page-tx-ids.c]
         =/  new-acc=nns-accumulator:na
           (claim-scanner:np accumulator.state pag height.c candidates.c)
         =/  acc-root=@  (root-atom:na new-acc)
@@ -792,14 +786,11 @@
       ~[[%chain-link-result ok]]
       ::
         ::  %verify-tx-in-page: read-only Phase 3 Level B predicate
-        ::  smoke test. Builds a canonical `(z-set @ux)` from the
-        ::  provided tx-id list via `z-silt`, then runs
-        ::  `has-tx-in-page:np`. Returns `[%tx-in-page-result ok=?]`
-        ::  without mutating state.
+        ::  smoke test. Runs `has-tx-in-page:np` on `[digest tx-ids]`.
+        ::  Returns `[%tx-in-page-result ok=?]` without mutating state.
         ::
         %verify-tx-in-page
-      =/  tx-set=(z-set @ux)  (z-silt tx-ids.u.act)
-      =/  pag=nns-page-summary:np  [digest.u.act tx-set]
+      =/  pag=nns-page-summary:np  [digest.u.act tx-ids.u.act]
       =/  ok=?  (has-tx-in-page:np pag claimed-tx-id.u.act)
       :_  state
       ^-  (list effect)
@@ -812,8 +803,7 @@
         ::  first predicate that rejected. State is not mutated.
         ::
         %validate-claim
-      =/  tx-set=(z-set @ux)  (z-silt page-tx-ids.u.act)
-      =/  pag=nns-page-summary:np  [page-digest.u.act tx-set]
+      =/  pag=nns-page-summary:np  [page-digest.u.act page-tx-ids.u.act]
       =/  wit=nns-raw-tx-witness:np
         :*  witness-tx-id.u.act
             witness-spender-pkh.u.act

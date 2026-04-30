@@ -72,13 +72,15 @@
 ::  tx-engine is to feed `hashable-block-commitment` — and that check
 ::  is Level C's job (see `matches-block-commitment`).
 ::
-::  `tx-ids` is a `(z-set @ux)` = balanced BST keyed by Tip5 hash,
-::  ordering matching Nockchain's `tx-ids.page` bit-for-bit. `has:z-in`
-::  walks it in O(log n).
+::  `tx-ids` is a flat `(list @ux)` in canonical block order (same as
+::  GetBlockDetails.tx_ids). Membership uses `has-tx-in-list` (pure
+::  equality walk). We intentionally do NOT build `(z-set @ux)` via
+::  `z-silt` here: `gas:z-in` + `put:z-in` + `gor-tip` hits a zkvm-jetpack
+::  edge case with 3+ full 40-byte atoms (see tests/phase3_predicates.rs).
 ::
 +$  nns-page-summary
   $:  digest=@ux               :: block-id
-      tx-ids=(z-set @ux)       :: ordered set of tx-ids in this block
+      tx-ids=(list @ux)        :: tx-ids in this block (block order)
   ==
 ::
 ::  +$claim-bundle: the complete per-claim input the Phase 3c gate
@@ -112,12 +114,9 @@
 ::  @ux)`. Lets the validator check tx-inclusion via `has-tx-in-list`
 ::  (pure Nock) rather than `has:z-in` (needs Tip5 jets).
 ::
-::  Semantically equivalent to `claim-bundle` when the list contains
-::  the same elements as the z-set. The hull converts between the two
-::  shapes at poke-build time — for `%validate-claim` / `%prove-claim`
-::  we use the z-set form (z-silt-canonicalized on the kernel side);
-::  for `%prove-claim-in-stark` (step 3) we pass the list through
-::  unchanged so the trace stays Tip5-free.
+::  Semantically equivalent to `claim-bundle` when the page's tx-id list
+::  matches. `%validate-claim` now canonicalises membership via the same
+::  flat list as `%prove-claim-in-stark` (no `z-silt` on the hot path).
 ::
 +$  claim-bundle-linear
   $:  name=@t
@@ -271,19 +270,27 @@
   ?.  =(height.i.rest +(height.prev))  %.n
   $(rest t.rest, prev i.rest)
 ::
+::  +has-tx-in-list: flat list membership for tx-ids (used by
+::  `+has-tx-in-page` and Phase 3c linear validators).
+::
+::  O(n) linear walk over a flat `(list @ux)`, no Tip5 hashing.
+::
+++  has-tx-in-list
+  |=  [tx-ids=(list @ux) claimed-tx-id=@ux]
+  ^-  ?
+  |-  ^-  ?
+  ?~  tx-ids  %.n
+  ?:  =(i.tx-ids claimed-tx-id)  %.y
+  $(tx-ids t.tx-ids)
+::
 ::  +has-tx-in-page: is `claimed-tx-id` a member of `page.tx-ids`?
 ::
-::  Uses zoon's `has:z-in` directly — O(log n) BST walk, same
-::  ordering the real `tx-ids.page` is built with on the Nockchain
-::  side. Level C's `matches-block-commitment` will eventually bind
-::  the page summary to the block-proof's committed commitment; for
-::  now the hull is trusted to have populated `tx-ids` from
-::  `BlockDetails.tx_ids` without tampering.
+::  Delegates to `+has-tx-in-list` — O(n), no `z-silt` / Tip5 jets.
 ::
 ++  has-tx-in-page
   |=  [pag=nns-page-summary claimed-tx-id=@ux]
   ^-  ?
-  (~(has z-in tx-ids.pag) claimed-tx-id)
+  (has-tx-in-list tx-ids.pag claimed-tx-id)
 ::
 ::  +matches-block-digest: does the claimed block's digest equal the
 ::  on-chain page's digest? Trivial equality check on two @ux atoms.
@@ -390,27 +397,6 @@
   ?&  =(bundle-tip state-tip)
       =(bundle-height state-height)
   ==
-::
-::  +has-tx-in-list: Phase 3c step 3 variant of `has-tx-in-page`.
-::
-::  O(n) linear walk over a flat `(list @ux)`, no Tip5 hashing. Trades
-::  `has:z-in`'s O(log n) BST for a simpler Nock trace that stays
-::  inside `fink:fock` without any jet calls. Use when the validator
-::  needs to run INSIDE the STARK (Phase 3c step 3) — the extra CPU
-::  vs z-in is negligible for block sizes ≤ 1000 tx-ids (typical
-::  Nockchain blocks) and the reduced trace cost pays for itself.
-::
-::  Semantics identical to `has-tx-in-page` when the list contains
-::  exactly `page.tx-ids` with no duplicates: returns `%.y` iff
-::  `claimed-tx-id ∈ list`.
-::
-++  has-tx-in-list
-  |=  [tx-ids=(list @ux) claimed-tx-id=@ux]
-  ^-  ?
-  |-  ^-  ?
-  ?~  tx-ids  %.n
-  ?:  =(i.tx-ids claimed-tx-id)  %.y
-  $(tx-ids t.tx-ids)
 ::
 ::  --- G1 format helpers (duplicated from app.hoon so the gate
 ::      library is self-contained — keep them in sync) ---
@@ -529,8 +515,8 @@
 ::  predicate replaced by a Tip5-jet-free alternative so the function
 ::  can run INSIDE the STARK trace without needing jet support:
 ::
-::    - `has-tx-in-list` (O(n) list walk) replaces `has-tx-in-page`
-::      (O(log n) z-in `has` that calls `gor-tip` → `hash-noun-varlen`).
+::    - `has-tx-in-list` matches `%validate-claim`'s inclusion check (also
+::      a flat list walk since the z-silt jet bug was avoided).
 ::    - All other predicates (`is-valid-name`, `fee-for-name`,
 ::      `matches-block-digest`-as-atom-equality, `chain-links-to`)
 ::      are already pure Nock.

@@ -264,22 +264,10 @@ async fn run_tx_in_page(
     first_tx_in_page_result(&effects).expect("tx-in-page-result effect")
 }
 
-// NOTE — Level B's `has-tx-in-page` predicate goes through
-// zoon's `z-silt` → `gas:z-in` → `put:z-in` → `gor-tip` → `tip:tip5`
-// chain. `tip` calls `hash-noun-varlen`, which is jetted in
-// `zkvm-jetpack`. The following tests pass on inputs of up to
-// 2 elements OR up to 8-byte atoms. With 3+ 40-byte atoms the
-// poke returns zero effects and the kernel crash-traces through
-// `zoon.hoon:469` (`gor-tip b n.a`). We've confirmed jets are
-// loaded (single-element 40-byte works) so the crash is an
-// edge-case in either `hash-noun-varlen_jet`'s atom-size handling
-// or `mor-tip`'s double-hash path. Predicate semantics are
-// proven by the small-vector cases and the insertion-order
-// invariant test; real production tx-ids from Nockchain will
-// deviate from the handcrafted-vectors pattern that triggers
-// this, and Phase 3c's end-to-end test with real chain data
-// will exercise the full path. Upstream issue tracked at
-// `docs/ROADMAP.md`.
+// Level B's `has-tx-in-page` is a flat list scan (`has-tx-in-list` in
+// Hoon) — no `z-silt` / `gor-tip` / Tip5 on the membership path. (An
+// older z-set build hit a jet edge case with 3+ 40-byte atoms; see
+// commit history / `docs/ROADMAP.md` if you need the archaeology.)
 
 /// Minimal probe: single tx-id, direct-atom-sized values.
 #[tokio::test]
@@ -347,8 +335,23 @@ async fn tx_in_page_forty_byte_single() {
     assert!(!run_tx_in_page(&state, &digest(1), &[mk(1)], &mk(2)).await);
 }
 
-/// Two 40-byte atoms — exercises `put:z-in`'s first `gor-tip`
-/// comparison. Upper bound for the stable-with-40-byte-atoms range.
+/// Three 40-byte atoms — membership with realistic tx-id size (the
+/// case that used to crash when the kernel built a z-set via `z-silt`).
+#[tokio::test]
+async fn tx_in_page_forty_byte_three() {
+    let (_tmp, state) = boot_kernel().await;
+    let mk = |seed: u8| -> Vec<u8> {
+        let mut v = vec![0u8; 40];
+        v[0] = seed;
+        v
+    };
+    let ids = vec![mk(1), mk(2), mk(3)];
+    assert!(run_tx_in_page(&state, &digest(1), &ids, &mk(2)).await);
+    assert!(run_tx_in_page(&state, &digest(1), &ids, &mk(1)).await);
+    assert!(!run_tx_in_page(&state, &digest(1), &ids, &mk(99)).await);
+}
+
+/// Two 40-byte atoms — regression guard for multi-insert Tip5 paths.
 #[tokio::test]
 async fn tx_in_page_forty_byte_two() {
     let (_tmp, state) = boot_kernel().await;
@@ -370,9 +373,7 @@ async fn tx_in_page_forty_byte_two() {
 /// input). Individual tests mutate one field at a time to trigger
 /// the specific rejection they're exercising.
 fn good_bundle() -> ClaimBundle {
-    // 2-digit stem @ 327_680_000 nicks fee. Shortest stable-atom inputs for
-    // the z-silt code path (see the tx_in_page_* note at the top of
-    // the file about jet edge cases with 3+ 40-byte atoms).
+    // 2-digit stem @ 327_680_000 nicks fee. Small atom tx-ids for cheap tests.
     let page_digest = vec![0x42];
     let tx_hash = vec![0x07];
     let other_tx = vec![0x08];
